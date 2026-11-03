@@ -6,10 +6,8 @@
 //! Dual toolchain:
 //! - Modern CUDA 12+: default fat binary Ampere (sm_86 / RTX 3060), Ada (sm_89),
 //!   Blackwell GeForce laptop (sm_120). Kepler is filtered out.
-//! - CUDA ≤11.x (driver 470, Kepler): include `sm_35` (Quadro K6000) and `sm_37`
-//!   (Tesla K80) when the toolkit still accepts them
-//!   (`scripts/fetch-cuda-toolkit.sh` → cuda-11.4). A `sm_37` binary does not
-//!   run on `sm_35`, so neither stands in for the other.
+//! - CUDA ≤11.x (driver 470 / Tesla K80): include `sm_37` when the toolkit still
+//!   accepts it (`scripts/fetch-cuda-toolkit.sh` → cuda-11.4).
 
 #![allow(dead_code)] // lib links this for tests; build.rs uses the same file via #[path]
 
@@ -23,12 +21,10 @@ pub fn default_cuda_arches() -> Vec<String> {
 }
 
 /// Default arches for a toolkit major version. CUDA 12+ drops Kepler; ≤11 keeps
-/// `sm_35` and `sm_37` ahead of the modern fat list so Kepler boxes build a
-/// usable binary.
+/// `sm_37` ahead of the modern fat list so K80 boxes build a usable binary.
 pub fn default_cuda_arches_for_toolkit(major: Option<u32>) -> Vec<String> {
     let mut out = Vec::new();
     if toolkit_supports_kepler(major) {
-        out.push("sm_35".into());
         out.push("sm_37".into());
     }
     for sm in default_cuda_arches() {
@@ -40,7 +36,7 @@ pub fn default_cuda_arches_for_toolkit(major: Option<u32>) -> Vec<String> {
     filter_arches_for_toolkit(out, major)
 }
 
-/// CUDA 12 removed sm_35 and sm_37; CUDA 11 cannot target Blackwell sm_120.
+/// CUDA 12 removed sm_37; CUDA 11 cannot target Blackwell sm_120.
 pub fn toolkit_supports_kepler(major: Option<u32>) -> bool {
     match major {
         Some(m) => m < 12,
@@ -63,7 +59,7 @@ fn arch_ok_for_toolkit(sm: &str, major: Option<u32>) -> bool {
         return false;
     };
     match major {
-        // CUDA 12+ dropped Kepler (sm_35, sm_37) and older.
+        // CUDA 12+ dropped Kepler (sm_37) and older.
         Some(m) if m >= 12 && n < 50 => false,
         // CUDA 11.x tops out around sm_86; sm_89/sm_120 need newer toolkits.
         Some(m) if m < 12 && n >= 89 => false,
@@ -211,7 +207,6 @@ mod tests {
     #[test]
     fn toolkit_11_includes_kepler_drops_blackwell() {
         let arches = default_cuda_arches_for_toolkit(Some(11));
-        assert!(arches.iter().any(|a| a == "sm_35"));
         assert!(arches.iter().any(|a| a == "sm_37"));
         assert!(arches.iter().any(|a| a == "sm_86"));
         assert!(!arches.iter().any(|a| a == "sm_120"));
@@ -221,7 +216,7 @@ mod tests {
     #[test]
     fn toolkit_12_drops_kepler_keeps_blackwell() {
         let arches = default_cuda_arches_for_toolkit(Some(12));
-        assert!(!arches.iter().any(|a| a == "sm_35" || a == "sm_37"));
+        assert!(!arches.iter().any(|a| a == "sm_37"));
         assert_eq!(
             arches,
             vec![
