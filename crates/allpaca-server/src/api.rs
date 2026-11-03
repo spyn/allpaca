@@ -108,6 +108,8 @@ struct StatusBody {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/responses", post(openai_responses))
         .route(
             "/v1/tools/calls",
             post(crate::security::api::create_tool_call),
@@ -383,17 +385,34 @@ fn finish_name(reason: FinishReason) -> &'static str {
     }
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Response {
-    let Some(engine) = state.engine().filter(|e| e.has_model()) else {
-        return engine_unavailable(&state);
-    };
-    let messages = req.messages.clone();
-    let served = Arc::clone(&engine);
-    let engine = served.clone();
-    let (prompt, images) = match tokio::task::spawn_blocking(move || {
+fn anthropic_stop(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "end_turn",
+        FinishReason::Length => "max_tokens",
+    }
+}
+
+fn join_error(err: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": {"message": err.to_string(), "type": "fatal"}})),
+    )
+        .into_response()
+}
+
+struct GeneratedText {
+    text: String,
+    finish: FinishReason,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+async fn format_checkpoint_prompt(
+    engine: &Arc<Engine>,
+    messages: Vec<ChatMessage>,
+) -> Result<(ChatPrompt, Vec<ImageInput>), Response> {
+    let engine = Arc::clone(engine);
+    match tokio::task::spawn_blocking(move || {
         let (turns, images) = flatten_chat_messages(&messages, engine.image_marker())?;
         let pairs: Vec<(&str, &str)> = turns
             .iter()
@@ -403,33 +422,22 @@ async fn chat_completions(
     })
     .await
     {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return error_response(e),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": {"message": e.to_string(), "type": "fatal"}})),
-            )
-                .into_response();
-        }
-    };
-    let params = params_from_request(&req, &state.config);
-    let model = req.model.clone().unwrap_or_else(|| served.model_id());
-    let id = format!("chatcmpl-{}", now_secs());
-    let created = now_secs();
-    tracing::info!("chat completion model={model} stream={}", req.stream);
-
-    if req.stream {
-        return stream_completion(state, served, prompt, images, params, model, id, created)
-            .into_response();
+        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Err(err)) => Err(error_response(err)),
+        Err(err) => Err(join_error(err)),
     }
+}
 
+async fn generate_blocking(
+    state: &AppState,
+    engine: Arc<Engine>,
+    prompt: ChatPrompt,
+    images: Vec<ImageInput>,
+    params: GenerationParams,
+) -> Result<GeneratedText, Response> {
     if state.config.engine.max_active_requests > 1 {
-        let mut stream = Box::pin(served.generate_stream_multimodal_with_checkpoints(
-            prompt.clone(),
-            images,
-            params,
-        ));
+        let mut stream =
+            Box::pin(engine.generate_stream_multimodal_with_checkpoints(prompt, images, params));
         let mut text = String::new();
         let mut completion_tokens = 0usize;
         let mut finish = FinishReason::Stop;
@@ -443,63 +451,396 @@ async fn chat_completions(
                         break;
                     }
                 }
-                Err(e) => return error_response(e),
+                Err(err) => return Err(error_response(err)),
             }
         }
-        return Json(ChatCompletionResponse {
-            id,
-            object: "chat.completion",
-            created,
-            model,
-            choices: vec![Choice {
-                index: 0,
-                message: ChatMessageOut {
-                    role: "assistant",
-                    content: text,
-                },
-                finish_reason: Some(finish_name(finish).into()),
-            }],
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens,
-                total_tokens: completion_tokens,
-            },
-        })
-        .into_response();
+        return Ok(GeneratedText {
+            text,
+            finish,
+            prompt_tokens: 0,
+            completion_tokens,
+        });
     }
 
-    let engine = Arc::clone(&served);
     match tokio::task::spawn_blocking(move || {
         engine.generate_multimodal_with_checkpoints(&prompt, &images, params)
     })
     .await
     {
-        Ok(Ok(out)) => Json(ChatCompletionResponse {
-            id,
-            object: "chat.completion",
-            created,
+        Ok(Ok(out)) => Ok(GeneratedText {
+            text: out.text,
+            finish: out.finish_reason,
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+        }),
+        Ok(Err(err)) => Err(error_response(err)),
+        Err(err) => Err(join_error(err)),
+    }
+}
+
+fn chat_response(id: String, created: u64, model: String, out: GeneratedText) -> Response {
+    Json(ChatCompletionResponse {
+        id,
+        object: "chat.completion",
+        created,
+        model,
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessageOut {
+                role: "assistant",
+                content: out.text,
+            },
+            finish_reason: Some(finish_name(out.finish).into()),
+        }],
+        usage: Usage {
+            prompt_tokens: out.prompt_tokens,
+            completion_tokens: out.completion_tokens,
+            total_tokens: out.prompt_tokens + out.completion_tokens,
+        },
+    })
+    .into_response()
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Response {
+    let Some(engine) = state.engine().filter(|e| e.has_model()) else {
+        return engine_unavailable(&state);
+    };
+    let params = params_from_request(&req, &state.config);
+    let (prompt, images) = match format_checkpoint_prompt(&engine, req.messages).await {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
+    let model = req.model.clone().unwrap_or_else(|| engine.model_id());
+    let id = format!("chatcmpl-{}", now_secs());
+    let created = now_secs();
+    #[cfg(test)]
+    keep_chat_log_callsite_enabled();
+    tracing::info!("chat completion model={model} stream={}", req.stream);
+
+    if req.stream {
+        return stream_completion(state, engine, prompt, images, params, model, id, created)
+            .into_response();
+    }
+
+    match generate_blocking(&state, engine, prompt, images, params).await {
+        Ok(out) => chat_response(id, created, model, out),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SystemPrompt {
+    Text(String),
+    Blocks(Vec<ContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesTurn {
+    role: String,
+    content: MessagesContentIn,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessagesContentIn {
+    Text(String),
+    Blocks(Vec<MessagesBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum MessagesBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesRequest {
+    model: Option<String>,
+    #[serde(default)]
+    system: Option<SystemPrompt>,
+    messages: Vec<MessagesTurn>,
+    #[serde(default)]
+    stream: bool,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+}
+
+fn bad_request(err: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": err.to_string()}
+        })),
+    )
+        .into_response()
+}
+
+fn render_block(block: MessagesBlock) -> Result<String, Response> {
+    match block {
+        MessagesBlock::Text { text } => Ok(text),
+        MessagesBlock::ToolUse { id, name, input } => {
+            let input = serde_json::to_string(&input).map_err(bad_request)?;
+            Ok(format!("tool_use {name} id={id} {input}"))
+        }
+        MessagesBlock::ToolResult {
+            tool_use_id,
+            content,
+        } => Ok(format!("tool_result {tool_use_id} {content}")),
+    }
+}
+
+fn render_message_turns(turns: Vec<MessagesTurn>) -> Result<Vec<ChatMessage>, Response> {
+    let mut messages = Vec::with_capacity(turns.len());
+    for turn in turns {
+        let text = match turn.content {
+            MessagesContentIn::Text(text) => text,
+            MessagesContentIn::Blocks(blocks) => {
+                let mut parts = Vec::with_capacity(blocks.len());
+                for block in blocks {
+                    parts.push(render_block(block)?);
+                }
+                parts.join("\n")
+            }
+        };
+        messages.push(ChatMessage {
+            role: turn.role,
+            content: MessageContent::Text(text),
+        });
+    }
+    Ok(messages)
+}
+
+fn messages_with_system(
+    system: Option<SystemPrompt>,
+    messages: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let Some(system) = system else {
+        return messages;
+    };
+    let content = match system {
+        SystemPrompt::Text(text) => MessageContent::Text(text),
+        SystemPrompt::Blocks(parts) => MessageContent::Parts(parts),
+    };
+    let mut turns = Vec::with_capacity(messages.len() + 1);
+    turns.push(ChatMessage {
+        role: "system".to_string(),
+        content,
+    });
+    turns.extend(messages);
+    turns
+}
+
+#[derive(Debug, Serialize)]
+struct MessagesResponse {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    model: String,
+    content: Vec<MessagesText>,
+    stop_reason: &'static str,
+    stop_sequence: Option<String>,
+    usage: MessagesUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct MessagesText {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MessagesUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+fn messages_sampling(req: &MessagesRequest) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: req.model.clone(),
+        messages: Vec::new(),
+        stream: req.stream,
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+        response_format: None,
+    }
+}
+
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    Json(req): Json<MessagesRequest>,
+) -> Response {
+    let Some(engine) = state.engine().filter(|e| e.has_model()) else {
+        return engine_unavailable(&state);
+    };
+    let sampling = messages_sampling(&req);
+    let stream = sampling.stream;
+    let rendered = match render_message_turns(req.messages) {
+        Ok(turns) => turns,
+        Err(resp) => return resp,
+    };
+    let messages = messages_with_system(req.system, rendered);
+    let (prompt, images) = match format_checkpoint_prompt(&engine, messages).await {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
+    let params = params_from_request(&sampling, &state.config);
+    let model = sampling.model.unwrap_or_else(|| engine.model_id());
+    if stream {
+        return stream_messages(state, engine, prompt, images, params, model).into_response();
+    }
+    match generate_blocking(&state, engine, prompt, images, params).await {
+        Ok(out) => Json(MessagesResponse {
+            id: format!("msg_{}", now_secs()),
+            kind: "message",
+            role: "assistant",
             model,
-            choices: vec![Choice {
-                index: 0,
-                message: ChatMessageOut {
-                    role: "assistant",
-                    content: out.text,
-                },
-                finish_reason: Some(finish_name(out.finish_reason).into()),
+            content: vec![MessagesText {
+                kind: "text",
+                text: out.text,
             }],
-            usage: Usage {
-                prompt_tokens: out.prompt_tokens,
-                completion_tokens: out.completion_tokens,
-                total_tokens: out.prompt_tokens + out.completion_tokens,
+            stop_reason: anthropic_stop(out.finish),
+            stop_sequence: None,
+            usage: MessagesUsage {
+                input_tokens: out.prompt_tokens,
+                output_tokens: out.completion_tokens,
             },
         })
         .into_response(),
-        Ok(Err(e)) => error_response(e),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": {"message": e.to_string(), "type": "fatal"}})),
-        )
-            .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+fn responses_status(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "completed",
+        FinishReason::Length => "incomplete",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesRequest {
+    model: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    input: String,
+    #[serde(default)]
+    stream: bool,
+    max_output_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesBody {
+    id: String,
+    object: &'static str,
+    status: &'static str,
+    model: String,
+    output: Vec<ResponsesItem>,
+    usage: MessagesUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesItem {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    content: Vec<ResponsesText>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesText {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+}
+
+async fn openai_responses(
+    State(state): State<AppState>,
+    Json(req): Json<ResponsesRequest>,
+) -> Response {
+    let Some(engine) = state.engine().filter(|e| e.has_model()) else {
+        return engine_unavailable(&state);
+    };
+    let sampling = ChatCompletionRequest {
+        model: req.model.clone(),
+        messages: Vec::new(),
+        stream: false,
+        max_tokens: req.max_output_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+        response_format: None,
+    };
+    let mut messages = Vec::with_capacity(2);
+    if let Some(instructions) = req.instructions {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: MessageContent::Text(instructions),
+        });
+    }
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: MessageContent::Text(req.input),
+    });
+    let (prompt, images) = match format_checkpoint_prompt(&engine, messages).await {
+        Ok(prepared) => prepared,
+        Err(resp) => return resp,
+    };
+    let params = params_from_request(&sampling, &state.config);
+    let model = sampling.model.unwrap_or_else(|| engine.model_id());
+    if req.stream {
+        return stream_responses(state, engine, prompt, images, params, model).into_response();
+    }
+    match generate_blocking(&state, engine, prompt, images, params).await {
+        Ok(out) => Json(ResponsesBody {
+            id: format!("resp_{}", now_secs()),
+            object: "response",
+            status: responses_status(out.finish),
+            model,
+            output: vec![ResponsesItem {
+                kind: "message",
+                role: "assistant",
+                content: vec![ResponsesText {
+                    kind: "output_text",
+                    text: out.text,
+                }],
+            }],
+            usage: MessagesUsage {
+                input_tokens: out.prompt_tokens,
+                output_tokens: out.completion_tokens,
+            },
+        })
+        .into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -551,6 +892,95 @@ impl Drop for DoneLog {
     }
 }
 
+type SseTx = mpsc::Sender<Result<Event, std::convert::Infallible>>;
+
+fn sse_data(name: &str, body: serde_json::Value) -> Event {
+    Event::default().event(name).data(body.to_string())
+}
+
+async fn drive_generation(
+    engine: Arc<Engine>,
+    prompt: ChatPrompt,
+    images: Vec<ImageInput>,
+    params: GenerationParams,
+    id: String,
+    tx: SseTx,
+    start: Vec<Event>,
+    mut on_token: impl FnMut(String, Option<FinishReason>) -> Event,
+    mut on_finish: impl FnMut(Option<FinishReason>, usize) -> Vec<Event>,
+) {
+    let mut stream =
+        Box::pin(engine.generate_stream_multimodal_with_checkpoints(prompt, images, params));
+    let mut done = DoneLog::new(&id);
+    for event in start {
+        let _ = tx.send(Ok(event)).await;
+    }
+    let mut last_finish = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(ev) => {
+                done.token(ev.finish_reason);
+                if ev.finish_reason.is_some() {
+                    last_finish = ev.finish_reason;
+                }
+                if tx
+                    .send(Ok(on_token(ev.text, ev.finish_reason)))
+                    .await
+                    .is_err()
+                {
+                    done.client_gone = true;
+                    break;
+                }
+            }
+            Err(err) => {
+                done.error = Some(err.to_string());
+                let body = serde_json::json!({"error": {"message": err.to_string()}});
+                let _ = tx.send(Ok(Event::default().data(body.to_string()))).await;
+                break;
+            }
+        }
+    }
+    for event in on_finish(last_finish, done.tokens) {
+        let _ = tx.send(Ok(event)).await;
+    }
+}
+
+fn spawn_drive(
+    state: AppState,
+    engine: Arc<Engine>,
+    prompt: ChatPrompt,
+    images: Vec<ImageInput>,
+    params: GenerationParams,
+    id: String,
+    start: Vec<Event>,
+    on_token: impl FnMut(String, Option<FinishReason>) -> Event + Send + 'static,
+    on_finish: impl FnMut(Option<FinishReason>, usize) -> Vec<Event> + Send + 'static,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let (tx, mut rx) = mpsc::channel(16);
+    let use_async_poll = state.config.engine.max_active_requests > 1;
+    if use_async_poll {
+        tokio::spawn(async move {
+            drive_generation(
+                engine, prompt, images, params, id, tx, start, on_token, on_finish,
+            )
+            .await;
+        });
+    } else {
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _ = &state;
+            rt.block_on(drive_generation(
+                engine, prompt, images, params, id, tx, start, on_token, on_finish,
+            ));
+        });
+    }
+    Sse::new(async_stream::stream! {
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_completion(
     state: AppState,
@@ -562,115 +992,157 @@ fn stream_completion(
     id: String,
     created: u64,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(16);
-    let use_async_poll = state.config.engine.max_active_requests > 1;
-    if use_async_poll {
-        tokio::spawn(async move {
-            let mut stream = Box::pin(
-                engine.generate_stream_multimodal_with_checkpoints(prompt, images, params),
-            );
-            let mut done = DoneLog::new(&id);
-            let first = serde_json::json!({
-                "id": id,
+    let role = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+    });
+    let chunk_id = id.clone();
+    let chunk_model = model.clone();
+    spawn_drive(
+        state,
+        engine,
+        prompt,
+        images,
+        params,
+        id,
+        vec![Event::default().data(role.to_string())],
+        move |text, finish| {
+            let chunk = serde_json::json!({
+                "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                "model": chunk_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": finish.map(finish_name)
+                }]
             });
-            let _ = tx.send(Ok(Event::default().data(first.to_string()))).await;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(ev) => {
-                        done.token(ev.finish_reason);
-                        let chunk = serde_json::json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": ev.text},
-                                "finish_reason": ev.finish_reason.map(finish_name)
-                            }]
-                        });
-                        if tx
-                            .send(Ok(Event::default().data(chunk.to_string())))
-                            .await
-                            .is_err()
-                        {
-                            done.client_gone = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        done.error = Some(e.to_string());
-                        let err = serde_json::json!({"error": {"message": e.to_string()}});
-                        let _ = tx.send(Ok(Event::default().data(err.to_string()))).await;
-                        break;
-                    }
-                }
-            }
-            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-        });
-    } else {
-        let rt = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let _ = &state;
-            let mut stream = Box::pin(
-                engine.generate_stream_multimodal_with_checkpoints(prompt, images, params),
-            );
-            let mut done = DoneLog::new(&id);
-            rt.block_on(async {
-                let first = serde_json::json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
-                });
-                let _ = tx.send(Ok(Event::default().data(first.to_string()))).await;
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(ev) => {
-                            done.token(ev.finish_reason);
-                            let chunk = serde_json::json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": ev.text},
-                                    "finish_reason": ev.finish_reason.map(finish_name)
-                                }]
-                            });
-                            if tx
-                                .send(Ok(Event::default().data(chunk.to_string())))
-                                .await
-                                .is_err()
-                            {
-                                done.client_gone = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            done.error = Some(e.to_string());
-                            let err = serde_json::json!({"error": {"message": e.to_string()}});
-                            let _ = tx.send(Ok(Event::default().data(err.to_string()))).await;
-                            break;
-                        }
-                    }
-                }
-                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-            });
-        });
-    }
-    Sse::new(async_stream::stream! {
-        let mut rx = rx;
-        while let Some(item) = rx.recv().await {
-            yield item;
+            Event::default().data(chunk.to_string())
+        },
+        |_finish, _tokens| vec![Event::default().data("[DONE]")],
+    )
+}
+
+fn stream_messages(
+    state: AppState,
+    engine: Arc<Engine>,
+    prompt: ChatPrompt,
+    images: Vec<ImageInput>,
+    params: GenerationParams,
+    model: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let id = format!("msg_{}", now_secs());
+    let start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
         }
-    })
+    });
+    spawn_drive(
+        state,
+        engine,
+        prompt,
+        images,
+        params,
+        id,
+        vec![
+            sse_data("message_start", start),
+            sse_data(
+                "content_block_start",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ),
+        ],
+        |text, _finish| {
+            sse_data(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text}
+                }),
+            )
+        },
+        |finish, tokens| {
+            let stop_reason = finish.map(anthropic_stop).unwrap_or("end_turn");
+            vec![
+                sse_data(
+                    "content_block_stop",
+                    serde_json::json!({"type": "content_block_stop", "index": 0}),
+                ),
+                sse_data(
+                    "message_delta",
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                        "usage": {"output_tokens": tokens}
+                    }),
+                ),
+                sse_data("message_stop", serde_json::json!({"type": "message_stop"})),
+            ]
+        },
+    )
+}
+
+fn stream_responses(
+    state: AppState,
+    engine: Arc<Engine>,
+    prompt: ChatPrompt,
+    images: Vec<ImageInput>,
+    params: GenerationParams,
+    model: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let id = format!("resp_{}", now_secs());
+    let completed_id = id.clone();
+    let completed_model = model.clone();
+    spawn_drive(
+        state,
+        engine,
+        prompt,
+        images,
+        params,
+        id,
+        Vec::new(),
+        |text, _finish| {
+            sse_data(
+                "response.output_text.delta",
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": text
+                }),
+            )
+        },
+        move |finish, tokens| {
+            let status = finish.map(responses_status).unwrap_or("completed");
+            vec![sse_data(
+                "response.completed",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": completed_id,
+                        "object": "response",
+                        "status": status,
+                        "model": completed_model,
+                        "usage": {"output_tokens": tokens}
+                    }
+                }),
+            )]
+        },
+    )
 }
 
 async fn list_models(State(state): State<AppState>) -> Response {
@@ -865,6 +1337,20 @@ pub(crate) fn error_response(e: allpaca_types::AllpacaError) -> Response {
         .into_response()
 }
 
+/// The chat-completion info event is cached for the whole process. The first
+/// test to reach it installs a subscriber that keeps the callsite enabled, so
+/// a later test can still record that line on its own log ring.
+#[cfg(test)]
+fn keep_chat_log_callsite_enabled() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .try_init();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +1374,23 @@ mod tests {
             AuthState::from_password(None),
             LogRing::new(64),
         )
+    }
+
+    async fn post_json(state: AppState, uri: &str, body: serde_json::Value) -> serde_json::Value {
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     fn ffmpeg_on_path() -> bool {
@@ -1616,6 +2119,289 @@ mod tests {
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].is_string());
         assert!(json["usage"]["completion_tokens"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_returns_the_same_text_as_chat_completions() {
+        let body = serde_json::json!({
+            "model": "synthetic",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let chat = post_json(test_state(), "/v1/chat/completions", body.clone()).await;
+        let msg = post_json(test_state(), "/v1/messages", body).await;
+        assert_eq!(msg["stop_reason"], "max_tokens");
+        assert!(msg["usage"]["output_tokens"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            msg["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_stream_matches_chat_text() {
+        let chat = post_json(
+            test_state(),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "synthetic",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "synthetic",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": true,
+                            "max_tokens": 4,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut assembled = String::new();
+        let mut saw_stop = false;
+        let mut saw_message_stop = false;
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match event["type"].as_str() {
+                Some("content_block_delta") => {
+                    assembled.push_str(event["delta"]["text"].as_str().unwrap_or(""));
+                }
+                Some("message_delta") => {
+                    assert!(event["delta"]["stop_reason"].is_string(), "{event}");
+                    saw_stop = true;
+                }
+                Some("message_stop") => saw_message_stop = true,
+                _ => {}
+            }
+        }
+        assert_eq!(assembled, chat["choices"][0]["message"]["content"]);
+        assert!(saw_stop, "stream must send a stop reason: {text}");
+        assert!(
+            saw_message_stop,
+            "stream must end with message_stop: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_includes_the_system_prompt() {
+        let sampling = serde_json::json!({
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let mut chat_body = sampling.clone();
+        chat_body["model"] = serde_json::json!("synthetic");
+        chat_body["messages"] = serde_json::json!([
+            {"role": "system", "content": "speak like a pirate"},
+            {"role": "user", "content": "hello"}
+        ]);
+        let mut msg_body = sampling;
+        msg_body["model"] = serde_json::json!("synthetic");
+        msg_body["system"] = serde_json::json!("speak like a pirate");
+        msg_body["messages"] = serde_json::json!([{"role": "user", "content": "hello"}]);
+        let chat = post_json(test_state(), "/v1/chat/completions", chat_body).await;
+        let msg = post_json(test_state(), "/v1/messages", msg_body).await;
+        assert_eq!(
+            msg["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_round_trip_matches_the_rendered_chat() {
+        let sampling = serde_json::json!({
+            "model": "synthetic",
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let mut chat_body = sampling.clone();
+        chat_body["messages"] = serde_json::json!([
+            {"role": "user", "content": "what is the weather"},
+            {"role": "assistant", "content": "I will check.\ntool_use weather id=call_1 {\"city\":\"Perth\"}"},
+            {"role": "user", "content": "tool_result call_1 22C"}
+        ]);
+        let mut msg_body = sampling;
+        msg_body["messages"] = serde_json::json!([
+            {"role": "user", "content": "what is the weather"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "I will check."},
+                {"type": "tool_use", "id": "call_1", "name": "weather", "input": {"city": "Perth"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "22C"}
+            ]}
+        ]);
+        let chat = post_json(test_state(), "/v1/chat/completions", chat_body).await;
+        let msg = post_json(test_state(), "/v1/messages", msg_body).await;
+        assert_eq!(
+            msg["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_responses_returns_the_same_text_as_chat_completions() {
+        let chat = post_json(
+            test_state(),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "synthetic",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        let resp = post_json(
+            test_state(),
+            "/v1/responses",
+            serde_json::json!({
+                "model": "synthetic",
+                "input": "hello",
+                "max_output_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        let expected_status = match chat["choices"][0]["finish_reason"].as_str() {
+            Some("length") => "incomplete",
+            Some("stop") => "completed",
+            other => panic!("unexpected finish reason {other:?}"),
+        };
+        assert_eq!(resp["object"], "response");
+        assert_eq!(resp["status"], expected_status);
+        assert!(resp["usage"]["output_tokens"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            resp["output"][0]["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_responses_includes_instructions() {
+        let chat = post_json(
+            test_state(),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "synthetic",
+                "messages": [
+                    {"role": "system", "content": "speak like a pirate"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "max_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        let resp = post_json(
+            test_state(),
+            "/v1/responses",
+            serde_json::json!({
+                "model": "synthetic",
+                "instructions": "speak like a pirate",
+                "input": "hello",
+                "max_output_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp["output"][0]["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_responses_stream_matches_chat_text() {
+        let chat = post_json(
+            test_state(),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "synthetic",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "synthetic",
+                            "input": "hello",
+                            "stream": true,
+                            "max_output_tokens": 4,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut assembled = String::new();
+        let mut saw_completed = false;
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match event["type"].as_str() {
+                Some("response.output_text.delta") => {
+                    assembled.push_str(event["delta"].as_str().unwrap_or(""));
+                }
+                Some("response.completed") => saw_completed = true,
+                _ => {}
+            }
+        }
+        assert_eq!(assembled, chat["choices"][0]["message"]["content"]);
+        assert!(
+            saw_completed,
+            "stream must end with response.completed: {text}"
+        );
     }
 
     #[test]
@@ -2454,6 +3240,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_reaches_messages_and_responses() {
+        let state = authed_state("secret");
+        let (key, _) = state.api.create_key("client").expect("key");
+        let app = router(state);
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "seed": 1
+                }),
+            ),
+            (
+                "/v1/messages",
+                serde_json::json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 2,
+                    "temperature": 0.0,
+                    "seed": 1
+                }),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({
+                    "input": "hello",
+                    "max_output_tokens": 2,
+                    "temperature": 0.0,
+                    "seed": 1
+                }),
+            ),
+        ];
+        for (uri, body) in cases {
+            let denied = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+            let allowed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(allowed.status(), StatusCode::OK, "{uri}");
+        }
     }
 
     #[tokio::test]
