@@ -440,11 +440,13 @@ async fn generate_blocking(
             Box::pin(engine.generate_stream_multimodal_with_checkpoints(prompt, images, params));
         let mut text = String::new();
         let mut completion_tokens = 0usize;
+        let mut prompt_tokens = 0usize;
         let mut finish = FinishReason::Stop;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(ev) => {
                     text.push_str(&ev.text);
+                    prompt_tokens = ev.prompt_tokens;
                     completion_tokens += 1;
                     if let Some(reason) = ev.finish_reason {
                         finish = reason;
@@ -457,7 +459,7 @@ async fn generate_blocking(
         return Ok(GeneratedText {
             text,
             finish,
-            prompt_tokens: 0,
+            prompt_tokens,
             completion_tokens,
         });
     }
@@ -516,8 +518,6 @@ async fn chat_completions(
     let model = req.model.clone().unwrap_or_else(|| engine.model_id());
     let id = format!("chatcmpl-{}", now_secs());
     let created = now_secs();
-    #[cfg(test)]
-    keep_chat_log_callsite_enabled();
     tracing::info!("chat completion model={model} stream={}", req.stream);
 
     if req.stream {
@@ -565,8 +565,41 @@ enum MessagesBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
     },
+    /// Image, thinking, document, and any other block the chat path cannot run.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultPart>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolResultPart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
+fn tool_result_text(content: ToolResultContent) -> String {
+    match content {
+        ToolResultContent::Text(text) => text,
+        ToolResultContent::Blocks(blocks) => {
+            let mut text = String::new();
+            for block in blocks {
+                if block.kind == "text" {
+                    text.push_str(&block.text);
+                }
+            }
+            text
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,17 +628,21 @@ fn bad_request(err: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-fn render_block(block: MessagesBlock) -> Result<String, Response> {
+fn render_block(block: MessagesBlock) -> Result<Option<String>, Response> {
     match block {
-        MessagesBlock::Text { text } => Ok(text),
+        MessagesBlock::Text { text } => Ok(Some(text)),
         MessagesBlock::ToolUse { id, name, input } => {
             let input = serde_json::to_string(&input).map_err(bad_request)?;
-            Ok(format!("tool_use {name} id={id} {input}"))
+            Ok(Some(format!("tool_use {name} id={id} {input}")))
         }
         MessagesBlock::ToolResult {
             tool_use_id,
             content,
-        } => Ok(format!("tool_result {tool_use_id} {content}")),
+        } => Ok(Some(format!(
+            "tool_result {tool_use_id} {}",
+            tool_result_text(content)
+        ))),
+        MessagesBlock::Other => Ok(None),
     }
 }
 
@@ -617,7 +654,9 @@ fn render_message_turns(turns: Vec<MessagesTurn>) -> Result<Vec<ChatMessage>, Re
             MessagesContentIn::Blocks(blocks) => {
                 let mut parts = Vec::with_capacity(blocks.len());
                 for block in blocks {
-                    parts.push(render_block(block)?);
+                    if let Some(part) = render_block(block)? {
+                        parts.push(part);
+                    }
                 }
                 parts.join("\n")
             }
@@ -898,6 +937,18 @@ fn sse_data(name: &str, body: serde_json::Value) -> Event {
     Event::default().event(name).data(body.to_string())
 }
 
+enum DriveEnd {
+    Done {
+        finish: Option<FinishReason>,
+        output_tokens: usize,
+        prompt_tokens: usize,
+        text: String,
+    },
+    Failed {
+        message: String,
+    },
+}
+
 async fn drive_generation(
     engine: Arc<Engine>,
     prompt: ChatPrompt,
@@ -905,24 +956,34 @@ async fn drive_generation(
     params: GenerationParams,
     id: String,
     tx: SseTx,
-    start: Vec<Event>,
+    start: impl FnOnce(usize) -> Vec<Event>,
     mut on_token: impl FnMut(String, Option<FinishReason>) -> Event,
-    mut on_finish: impl FnMut(Option<FinishReason>, usize) -> Vec<Event>,
+    on_end: impl FnOnce(DriveEnd) -> Vec<Event>,
 ) {
     let mut stream =
         Box::pin(engine.generate_stream_multimodal_with_checkpoints(prompt, images, params));
     let mut done = DoneLog::new(&id);
-    for event in start {
-        let _ = tx.send(Ok(event)).await;
-    }
     let mut last_finish = None;
+    let mut text = String::new();
+    let mut prompt_tokens = 0usize;
+    // The prompt length arrives on the first token. Hold the opening events
+    // until then so message_start can report it. An error before any token
+    // skips those events.
+    let mut start = Some(start);
     while let Some(item) = stream.next().await {
         match item {
             Ok(ev) => {
+                if let Some(start) = start.take() {
+                    prompt_tokens = ev.prompt_tokens;
+                    for event in start(prompt_tokens) {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                }
                 done.token(ev.finish_reason);
                 if ev.finish_reason.is_some() {
                     last_finish = ev.finish_reason;
                 }
+                text.push_str(&ev.text);
                 if tx
                     .send(Ok(on_token(ev.text, ev.finish_reason)))
                     .await
@@ -933,14 +994,26 @@ async fn drive_generation(
                 }
             }
             Err(err) => {
-                done.error = Some(err.to_string());
-                let body = serde_json::json!({"error": {"message": err.to_string()}});
-                let _ = tx.send(Ok(Event::default().data(body.to_string()))).await;
-                break;
+                let message = err.to_string();
+                done.error = Some(message.clone());
+                for event in on_end(DriveEnd::Failed { message }) {
+                    let _ = tx.send(Ok(event)).await;
+                }
+                return;
             }
         }
     }
-    for event in on_finish(last_finish, done.tokens) {
+    if let Some(start) = start.take() {
+        for event in start(prompt_tokens) {
+            let _ = tx.send(Ok(event)).await;
+        }
+    }
+    for event in on_end(DriveEnd::Done {
+        finish: last_finish,
+        output_tokens: done.tokens,
+        prompt_tokens,
+        text,
+    }) {
         let _ = tx.send(Ok(event)).await;
     }
 }
@@ -952,16 +1025,16 @@ fn spawn_drive(
     images: Vec<ImageInput>,
     params: GenerationParams,
     id: String,
-    start: Vec<Event>,
+    start: impl FnOnce(usize) -> Vec<Event> + Send + 'static,
     on_token: impl FnMut(String, Option<FinishReason>) -> Event + Send + 'static,
-    on_finish: impl FnMut(Option<FinishReason>, usize) -> Vec<Event> + Send + 'static,
+    on_end: impl FnOnce(DriveEnd) -> Vec<Event> + Send + 'static,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, mut rx) = mpsc::channel(16);
     let use_async_poll = state.config.engine.max_active_requests > 1;
     if use_async_poll {
         tokio::spawn(async move {
             drive_generation(
-                engine, prompt, images, params, id, tx, start, on_token, on_finish,
+                engine, prompt, images, params, id, tx, start, on_token, on_end,
             )
             .await;
         });
@@ -970,7 +1043,7 @@ fn spawn_drive(
         tokio::task::spawn_blocking(move || {
             let _ = &state;
             rt.block_on(drive_generation(
-                engine, prompt, images, params, id, tx, start, on_token, on_finish,
+                engine, prompt, images, params, id, tx, start, on_token, on_end,
             ));
         });
     }
@@ -1008,7 +1081,7 @@ fn stream_completion(
         images,
         params,
         id,
-        vec![Event::default().data(role.to_string())],
+        move |_prompt_tokens| vec![Event::default().data(role.to_string())],
         move |text, finish| {
             let chunk = serde_json::json!({
                 "id": chunk_id,
@@ -1023,7 +1096,14 @@ fn stream_completion(
             });
             Event::default().data(chunk.to_string())
         },
-        |_finish, _tokens| vec![Event::default().data("[DONE]")],
+        |end| match end {
+            DriveEnd::Done { .. } => vec![Event::default().data("[DONE]")],
+            DriveEnd::Failed { message } => vec![
+                Event::default()
+                    .data(serde_json::json!({"error": {"message": message}}).to_string()),
+                Event::default().data("[DONE]"),
+            ],
+        },
     )
 }
 
@@ -1036,19 +1116,7 @@ fn stream_messages(
     model: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let id = format!("msg_{}", now_secs());
-    let start = serde_json::json!({
-        "type": "message_start",
-        "message": {
-            "id": id,
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "model": model,
-            "stop_reason": null,
-            "stop_sequence": null,
-            "usage": {"input_tokens": 0, "output_tokens": 0}
-        }
-    });
+    let start_id = id.clone();
     spawn_drive(
         state,
         engine,
@@ -1056,17 +1124,34 @@ fn stream_messages(
         images,
         params,
         id,
-        vec![
-            sse_data("message_start", start),
-            sse_data(
-                "content_block_start",
-                serde_json::json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""}
-                }),
-            ),
-        ],
+        move |input_tokens| {
+            vec![
+                sse_data(
+                    "message_start",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": start_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model,
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                        }
+                    }),
+                ),
+                sse_data(
+                    "content_block_start",
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                ),
+            ]
+        },
         |text, _finish| {
             sse_data(
                 "content_block_delta",
@@ -1077,23 +1162,40 @@ fn stream_messages(
                 }),
             )
         },
-        |finish, tokens| {
-            let stop_reason = finish.map(anthropic_stop).unwrap_or("end_turn");
-            vec![
-                sse_data(
-                    "content_block_stop",
-                    serde_json::json!({"type": "content_block_stop", "index": 0}),
-                ),
-                sse_data(
-                    "message_delta",
-                    serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                        "usage": {"output_tokens": tokens}
-                    }),
-                ),
-                sse_data("message_stop", serde_json::json!({"type": "message_stop"})),
-            ]
+        |end| match end {
+            DriveEnd::Failed { message } => vec![sse_data(
+                "error",
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message}
+                }),
+            )],
+            DriveEnd::Done {
+                finish,
+                output_tokens,
+                prompt_tokens,
+                text: _,
+            } => {
+                let stop_reason = finish.map(anthropic_stop).unwrap_or("end_turn");
+                vec![
+                    sse_data(
+                        "content_block_stop",
+                        serde_json::json!({"type": "content_block_stop", "index": 0}),
+                    ),
+                    sse_data(
+                        "message_delta",
+                        serde_json::json!({
+                            "type": "message_delta",
+                            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                            "usage": {
+                                "input_tokens": prompt_tokens,
+                                "output_tokens": output_tokens
+                            }
+                        }),
+                    ),
+                    sse_data("message_stop", serde_json::json!({"type": "message_stop"})),
+                ]
+            }
         },
     )
 }
@@ -1116,7 +1218,7 @@ fn stream_responses(
         images,
         params,
         id,
-        Vec::new(),
+        |_prompt_tokens| Vec::new(),
         |text, _finish| {
             sse_data(
                 "response.output_text.delta",
@@ -1126,21 +1228,49 @@ fn stream_responses(
                 }),
             )
         },
-        move |finish, tokens| {
-            let status = finish.map(responses_status).unwrap_or("completed");
-            vec![sse_data(
-                "response.completed",
+        move |end| match end {
+            DriveEnd::Failed { message } => vec![sse_data(
+                "response.failed",
                 serde_json::json!({
-                    "type": "response.completed",
+                    "type": "response.failed",
                     "response": {
-                        "id": completed_id,
+                        "id": completed_id.clone(),
                         "object": "response",
-                        "status": status,
-                        "model": completed_model,
-                        "usage": {"output_tokens": tokens}
+                        "status": "failed",
+                        "model": completed_model.clone(),
+                        "error": {"message": message}
                     }
                 }),
-            )]
+            )],
+            DriveEnd::Done {
+                finish,
+                output_tokens,
+                prompt_tokens,
+                text,
+            } => {
+                let status = finish.map(responses_status).unwrap_or("completed");
+                vec![sse_data(
+                    "response.completed",
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": completed_id,
+                            "object": "response",
+                            "status": status,
+                            "model": completed_model,
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": text}]
+                            }],
+                            "usage": {
+                                "input_tokens": prompt_tokens,
+                                "output_tokens": output_tokens
+                            }
+                        }
+                    }),
+                )]
+            }
         },
     )
 }
@@ -1337,20 +1467,6 @@ pub(crate) fn error_response(e: allpaca_types::AllpacaError) -> Response {
         .into_response()
 }
 
-/// The chat-completion info event is cached for the whole process. The first
-/// test to reach it installs a subscriber that keeps the callsite enabled, so
-/// a later test can still record that line on its own log ring.
-#[cfg(test)]
-fn keep_chat_log_callsite_enabled() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_test_writer()
-            .try_init();
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,7 +1476,21 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    /// The chat-completion info callsite is cached for the process. Installing
+    /// a subscriber before the first request keeps that callsite enabled, so
+    /// `chat_completion_appears_in_log_ring` can still record the line.
+    fn keep_chat_log_callsite_enabled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
     fn test_state() -> AppState {
+        keep_chat_log_callsite_enabled();
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             synthetic: true,
@@ -1416,6 +1546,7 @@ mod tests {
     }
 
     fn authed_state(password: &str) -> AppState {
+        keep_chat_log_callsite_enabled();
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             synthetic: true,
@@ -1885,6 +2016,7 @@ mod tests {
     }
 
     fn multi_request_state() -> AppState {
+        keep_chat_log_callsite_enabled();
         let mut cfg = Config::compiled_defaults();
         cfg.merge_cli(&CliOverrides {
             synthetic: true,
@@ -2209,6 +2341,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_stream_error_is_an_error_event() {
+        let state = test_state();
+        let engine = state.engine().expect("engine");
+        let _hold = engine
+            .begin_request(
+                "hold the only slot",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("slot");
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": true,
+                            "max_tokens": 4
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("event: error"),
+            "stream error must be an error event: {text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "stream error must not look like a finished message: {text}"
+        );
+        assert!(
+            !text.contains("end_turn"),
+            "stream error must not report end_turn: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_reports_input_tokens() {
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": true,
+                            "max_tokens": 2,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut input_tokens = None;
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            if event["type"] == "message_start" {
+                input_tokens = event["message"]["usage"]["input_tokens"].as_u64();
+            }
+        }
+        assert!(
+            input_tokens.unwrap_or(0) >= 1,
+            "message_start must count the prompt: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_messages_count_input_tokens() {
+        let msg = post_json(
+            multi_request_state(),
+            "/v1/messages",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "seed": 1
+            }),
+        )
+        .await;
+        assert!(
+            msg["usage"]["input_tokens"].as_u64().unwrap_or(0) >= 1,
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn anthropic_messages_includes_the_system_prompt() {
         let sampling = serde_json::json!({
             "max_tokens": 4,
@@ -2256,6 +2500,67 @@ mod tests {
             ]},
             {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "call_1", "content": "22C"}
+            ]}
+        ]);
+        let chat = post_json(test_state(), "/v1/chat/completions", chat_body).await;
+        let msg = post_json(test_state(), "/v1/messages", msg_body).await;
+        assert_eq!(
+            msg["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_tool_result_text_blocks_match_a_string_result() {
+        let sampling = serde_json::json!({
+            "model": "synthetic",
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let mut chat_body = sampling.clone();
+        chat_body["messages"] = serde_json::json!([
+            {"role": "user", "content": "what is the weather"},
+            {"role": "user", "content": "tool_result call_1 22C"}
+        ]);
+        let mut msg_body = sampling;
+        msg_body["messages"] = serde_json::json!([
+            {"role": "user", "content": "what is the weather"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": [
+                    {"type": "text", "text": "22"},
+                    {"type": "image", "source": {"type": "base64", "data": "aaaa"}},
+                    {"type": "text", "text": "C"}
+                ]}
+            ]}
+        ]);
+        let chat = post_json(test_state(), "/v1/chat/completions", chat_body).await;
+        let msg = post_json(test_state(), "/v1/messages", msg_body).await;
+        assert_eq!(
+            msg["content"][0]["text"],
+            chat["choices"][0]["message"]["content"]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_unknown_blocks_are_skipped() {
+        let sampling = serde_json::json!({
+            "model": "synthetic",
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let mut chat_body = sampling.clone();
+        chat_body["messages"] = serde_json::json!([
+            {"role": "user", "content": "hello"}
+        ]);
+        let mut msg_body = sampling;
+        msg_body["messages"] = serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aaaa"}},
+                {"type": "thinking", "thinking": "secret"},
+                {"type": "text", "text": "hello"},
+                {"type": "document", "source": {"type": "text", "data": "notes"}}
             ]}
         ]);
         let chat = post_json(test_state(), "/v1/chat/completions", chat_body).await;
@@ -2402,6 +2707,107 @@ mod tests {
             saw_completed,
             "stream must end with response.completed: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_error_is_response_failed() {
+        let state = test_state();
+        let engine = state.engine().expect("engine");
+        let _hold = engine
+            .begin_request(
+                "hold the only slot",
+                GenerationParams {
+                    max_tokens: 4,
+                    temperature: 0.0,
+                    seed: Some(1),
+                    ..GenerationParams::default()
+                },
+            )
+            .expect("slot");
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "input": "hello",
+                            "stream": true,
+                            "max_output_tokens": 4
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("event: response.failed"),
+            "stream error must be response.failed: {text}"
+        );
+        assert!(
+            !text.contains("response.completed"),
+            "stream error must not complete the response: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_responses_completed_event_includes_the_output() {
+        let res = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "synthetic",
+                            "input": "hello",
+                            "stream": true,
+                            "max_output_tokens": 4,
+                            "temperature": 0.0,
+                            "seed": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut assembled = String::new();
+        let mut completed_text = None;
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match event["type"].as_str() {
+                Some("response.output_text.delta") => {
+                    assembled.push_str(event["delta"].as_str().unwrap_or(""));
+                }
+                Some("response.completed") => {
+                    completed_text = event["response"]["output"][0]["content"][0]["text"]
+                        .as_str()
+                        .map(str::to_string);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            completed_text.as_deref(),
+            Some(assembled.as_str()),
+            "{text}"
+        );
+        assert!(!assembled.is_empty(), "{text}");
     }
 
     #[test]
@@ -2680,6 +3086,7 @@ mod tests {
             ..CliOverrides::default()
         });
         cfg.multimodal.vision_path = Some(vision);
+        keep_chat_log_callsite_enabled();
         let state = AppState::new(
             Arc::new(Engine::new(cfg.clone()).unwrap()),
             cfg,
@@ -2767,6 +3174,7 @@ mod tests {
     #[cfg(feature = "hip")]
     #[tokio::test]
     async fn chat_completions_use_message_checkpoints() {
+        keep_chat_log_callsite_enabled();
         for stream in [false, true] {
             let mut cfg = Config::compiled_defaults();
             cfg.merge_cli(&CliOverrides {
@@ -2956,6 +3364,7 @@ mod tests {
         });
         cfg.http.password = Some("hunter2".into());
         cfg.rpc.token = Some("tok-xyz".into());
+        keep_chat_log_callsite_enabled();
         let state = AppState::new(
             Arc::new(Engine::new(cfg.clone()).unwrap()),
             cfg,
@@ -3306,6 +3715,49 @@ mod tests {
                 .unwrap();
             assert_eq!(allowed.status(), StatusCode::OK, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn anthropic_x_api_key_authenticates_messages() {
+        let state = authed_state("secret");
+        let (key, _) = state.api.create_key("claude").expect("key");
+        let app = router(state);
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "seed": 1
+        });
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "not-the-key")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[tokio::test]

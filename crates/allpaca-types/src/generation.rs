@@ -54,6 +54,9 @@ pub struct TokenEvent {
     pub token_id: u32,
     pub text: String,
     pub finish_reason: Option<FinishReason>,
+    /// Prompt length in tokens. The same count on every event of one reply.
+    #[serde(default)]
+    pub prompt_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
