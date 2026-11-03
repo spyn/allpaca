@@ -87,7 +87,8 @@ struct HostedSeq {
 impl HostedModel {
     fn load(path: &std::path::Path, device: i32) -> Result<Self, AllpacaError> {
         let file = GgufFile::open(path)?;
-        let model = crate::model::TinyModel::from_gguf(&file)?;
+        let mut model = crate::model::TinyModel::from_gguf(&file)?;
+        model.hosted_moe_compat = true;
         let resident = crate::model::ResidentModel::upload_gguf_peer_layers(
             &file,
             &model.config,
@@ -139,6 +140,35 @@ impl HostedModel {
             &self.metrics,
         )?;
         self.model.forward_hidden_token_device(
+            pos,
+            x,
+            &seq.pages,
+            &mut seq.kv,
+            &self.metrics,
+            &self.hip,
+            &self.resident,
+            &mut seq.recurrent,
+            seq.id,
+        )
+    }
+
+    fn run_rows(&self, seq: &mut HostedSeq, pos: usize, x: &mut [f32]) -> Result<(), AllpacaError> {
+        let dim = self.model.config.dim;
+        if x.is_empty() || x.len() % dim != 0 {
+            return Err(err(format!(
+                "q3n run has {} floats, expected a non-empty multiple of {dim}",
+                x.len()
+            )));
+        }
+        crate::model::ensure_pages(
+            &mut seq.kv,
+            &self.model.config,
+            128,
+            &mut seq.pages,
+            pos + x.len() / dim - 1,
+            &self.metrics,
+        )?;
+        self.model.forward_hidden_tokens_device(
             pos,
             x,
             &seq.pages,
@@ -279,11 +309,11 @@ impl SpanHost {
                     return Err(err("q3n run before Load".into()));
                 };
                 let mut x = floats(data);
-                if x.len() != model.model.config.dim {
+                let dim = model.model.config.dim;
+                if x.is_empty() || x.len() % dim != 0 {
                     return Err(err(format!(
-                        "q3n run has {} floats, expected {}",
-                        x.len(),
-                        model.model.config.dim
+                        "q3n run has {} floats, expected a non-empty multiple of {dim}",
+                        x.len()
                     )));
                 }
                 let state = match self.seqs.entry(seq) {
@@ -292,7 +322,11 @@ impl SpanHost {
                         entry.insert(model.new_seq(seq)?)
                     }
                 };
-                model.run(state, pos, &mut x)?;
+                if x.len() == dim {
+                    model.run(state, pos, &mut x)?;
+                } else {
+                    model.run_rows(state, pos, &mut x)?;
+                }
                 Ok(bytes_of(&x))
             }
             Call::CloneSeq { src, dst } => {
@@ -424,6 +458,10 @@ impl RemoteSpan {
     }
 
     pub fn run(&self, seq: &RemoteSeq, pos: usize, x: &mut [f32]) -> Result<(), AllpacaError> {
+        self.run_rows(seq, pos, x)
+    }
+
+    pub fn run_rows(&self, seq: &RemoteSeq, pos: usize, x: &mut [f32]) -> Result<(), AllpacaError> {
         if seq.lost {
             return Err(err("q3n sequence state was lost".into()));
         }
@@ -705,6 +743,121 @@ mod tests {
         drop((seq, accepted));
         drop(span);
         drop(rt);
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A hosted span's multi-row forward (prefill, verify) must round its
+    /// routed MoE like single-token decode, which matches a separate
+    /// `MoeFfn` reply (host top-k, F16 routed sum). Needs a width the fused
+    /// GPU-routed kernels take (256) and stacked Q8_0 experts: the default
+    /// tiny model never reached that path, so rows routed on the GPU in F32
+    /// and the real model's hosted text drifted from the separate path.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hosted_rows_round_routed_experts_like_single_token_runs() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f32_src = dir.join("f32.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_sized(&f32_src, 4, false, 256, 32, 256);
+        let f32_file = GgufFile::open(&f32_src).unwrap();
+        let quant: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = f32_file
+            .tensors
+            .iter()
+            .map(|info| {
+                if info.name.ends_with("_exps.weight") {
+                    let data = f32_file.tensor_f32(&info.name).unwrap();
+                    let bytes = allpaca_gguf::quantize_q8_0(&data);
+                    (info.name.clone(), info.dims.clone(), GgmlType::Q8_0, bytes)
+                } else {
+                    let bytes = f32_file.tensor_bytes(&info.name).unwrap().to_vec();
+                    (info.name.clone(), info.dims.clone(), info.ggml_type, bytes)
+                }
+            })
+            .collect();
+        let tensors: Vec<GgufWriteQuantTensor<'_>> = quant
+            .iter()
+            .map(|(name, dims, ggml_type, bytes)| GgufWriteQuantTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: *ggml_type,
+                bytes,
+            })
+            .collect();
+        let source = dir.join("q8.gguf");
+        write_gguf_quant(&source, &f32_file.metadata, &[], &tensors).unwrap();
+        let source_file = GgufFile::open(&source).unwrap();
+        let span = dir.join("span.gguf");
+        write_span_gguf(&span, &source_file, 0, 2).unwrap();
+        let model = HostedModel::load(&span, 0).unwrap();
+        assert!(model.model.hosted_moe_compat, "a hosted span must load in compat mode");
+        let dim = model.model.config.dim;
+        let input = source_file.tensor_f32("token_embd.weight").unwrap()[dim..5 * dim].to_vec();
+
+        let mut rows_seq = model.new_seq(1).unwrap();
+        let mut rows = input.clone();
+        model.run_rows(&mut rows_seq, 0, &mut rows).unwrap();
+
+        let mut one_seq = model.new_seq(2).unwrap();
+        let mut one = input;
+        for (t, row) in one.chunks_exact_mut(dim).enumerate() {
+            model.run(&mut one_seq, t, row).unwrap();
+        }
+        assert_eq!(rows, one, "hosted rows must equal hosted single-token runs bit for bit");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn rpc_span_runs_batched_rows_like_the_worker() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_with(&source, 4, true);
+        let source_file = GgufFile::open(&source).unwrap();
+        let span_path = dir.join("span.gguf");
+        write_span_gguf(&span_path, &source_file, 1, 2).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = allpaca_rpc::WorkerBackend::Hip(allpaca_rpc::HipWorker::new(0).unwrap());
+            allpaca_rpc::serve_connection_ext(stream, backend, None, vec![worker_extension(None)])
+                .unwrap();
+        });
+        let rt = std::sync::Arc::new(
+            crate::rpc_runtime::RpcRuntime::connect(&[addr.to_string()], None).unwrap(),
+        );
+        let span = RemoteSpan::from_gguf(&rt, 0, 0, &span_path).unwrap();
+        let dim = source_file.meta_u32("qwen35moe.embedding_length").unwrap() as usize;
+        let embeddings = source_file.tensor_f32("token_embd.weight").unwrap();
+        let input = embeddings[dim..5 * dim].to_vec();
+        let seq = span.new_seq();
+        let mut remote = input.clone();
+        span.run_rows(&seq, 0, &mut remote).unwrap();
+
+        let direct = HostedModel::load(&span_path, 0).unwrap();
+        let mut expected_seq = direct.new_seq(99).unwrap();
+        let mut expected = input;
+        direct
+            .run_rows(&mut expected_seq, 0, &mut expected)
+            .unwrap();
+        assert_eq!(remote, expected);
+
+        let mut remote_next = remote.clone();
+        let mut expected_next = expected.clone();
+        span.run_rows(&seq, 4, &mut remote_next).unwrap();
+        direct
+            .run_rows(&mut expected_seq, 4, &mut expected_next)
+            .unwrap();
+        assert_eq!(remote_next, expected_next);
+        drop((seq, span, rt));
         worker.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }

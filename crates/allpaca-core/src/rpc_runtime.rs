@@ -420,6 +420,18 @@ impl RpcRuntime {
                 .unwrap_or(false)
     }
 
+    /// Some forward work runs on a worker: placed or hosted layers, or
+    /// expert-parallel routed experts. Arithmetic that must match across
+    /// machines keys off this, not [`Self::placed_remote`].
+    pub fn sends_work_remote(&self) -> bool {
+        self.placed_remote()
+            || self
+                .experts
+                .lock()
+                .map(|experts| experts.iter().any(Option::is_some))
+                .unwrap_or(false)
+    }
+
     pub fn has_hosted(&self) -> bool {
         self.hosted
             .lock()
@@ -1816,6 +1828,16 @@ impl RpcRuntime {
         recurrent: Option<&mut crate::anchors::RecurrentState>,
         x: &mut [f32],
     ) -> Result<(), AllpacaError> {
+        self.run_hosted_rows(layer_idx, pos, recurrent, x)
+    }
+
+    pub fn run_hosted_rows(
+        &self,
+        layer_idx: usize,
+        pos: usize,
+        recurrent: Option<&mut crate::anchors::RecurrentState>,
+        x: &mut [f32],
+    ) -> Result<(), AllpacaError> {
         let hosted = self
             .hosted
             .lock()
@@ -1834,7 +1856,7 @@ impl RpcRuntime {
             recurrent.remote = Some(hosted.span.new_seq());
         }
         let seq = recurrent.remote.as_ref().expect("hosted remote sequence");
-        hosted.span.run(seq, pos, x)
+        hosted.span.run_rows(seq, pos, x)
     }
 
     /// Run one remote layer. A call on the first layer of a contiguous same-worker

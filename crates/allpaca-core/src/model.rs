@@ -53,6 +53,8 @@ pub struct DeviceDecodeSide<'a> {
     pub write_logits: bool,
     /// M-RoPE layout of a Request with images (rotary position != KV position).
     pub mrope: Option<&'a MropeLayout>,
+    /// Match host routing and F16 reply rounding of separate remote experts.
+    pub separate_moe_compat: bool,
 }
 
 impl<'a> DeviceDecodeSide<'a> {
@@ -66,6 +68,7 @@ impl<'a> DeviceDecodeSide<'a> {
             last_hidden: None,
             write_logits: true,
             mrope: None,
+            separate_moe_compat: false,
         }
     }
 }
@@ -2662,12 +2665,15 @@ fn relu_sqr(v: f32) -> f32 {
     }
 }
 
+/// Host sigmoid with `det_expf`: the platform `exp` (MSVC CRT vs glibc)
+/// differs in the last bit for some inputs, which split hosted RPC spans
+/// from the separate path. Same bits on every coordinator and worker.
 fn sigmoid_stable(v: f32) -> f32 {
     if v >= 0.0 {
-        let z = (-v).exp();
+        let z = allpaca_cpu::det_expf(-v);
         1.0 / (1.0 + z)
     } else {
-        let z = v.exp();
+        let z = allpaca_cpu::det_expf(v);
         z / (1.0 + z)
     }
 }
@@ -2980,7 +2986,7 @@ pub(crate) fn topk_from_logits(
         }
         let mut sum = 0.0f32;
         for (e, w) in weights.iter_mut().enumerate() {
-            *w = if off(e) { 0.0 } else { (*w - max).exp() };
+            *w = if off(e) { 0.0 } else { allpaca_cpu::det_expf(*w - max) };
             sum += *w;
         }
         let sum = sum.max(1e-9);
@@ -2991,7 +2997,7 @@ pub(crate) fn topk_from_logits(
         let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for w in weights.iter_mut() {
-            *w = (*w - max).exp();
+            *w = allpaca_cpu::det_expf(*w - max);
             sum += *w;
         }
         let sum = sum.max(1e-9);
@@ -4662,6 +4668,10 @@ pub struct TinyModel {
     pub expert_controls: Arc<crate::expert_controls::ExpertControls>,
     /// Residual rows entering chosen layers, for a DFlash2 draft (off by default).
     pub layer_capture: Arc<crate::dflash2::LayerCapture>,
+    /// Set on a worker's hosted `q3n-layers` span: its routed MoE rounds like
+    /// a separate `MoeFfn` reply (host top-k, F16 routed sum), so hosted
+    /// output equals the separate expert-parallel path bit for bit.
+    pub hosted_moe_compat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4841,6 +4851,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         }
     }
 
@@ -5886,7 +5897,9 @@ impl TinyModel {
         // host routing for it changed its tokens (the two routings round
         // differently), so concurrent output drifted from solo output.
         // `moe_norm` snapshots then come only from host-routed layers.
-        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1)? {
+        let separate_moe_compat =
+            self.hosted_moe_compat || side.as_ref().is_some_and(|s| s.separate_moe_compat);
+        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1, separate_moe_compat)? {
             record_elementwise(Some(metrics));
             return Ok(());
         }
@@ -5902,6 +5915,7 @@ impl TinyModel {
             ds_queue,
             last_hidden: None,
             write_logits: s.write_logits,
+            separate_moe_compat: s.separate_moe_compat,
         });
         if let Some(s) = side.as_mut() {
             if let Some(norm) = s.moe_norm.as_mut() {
@@ -6075,6 +6089,9 @@ impl TinyModel {
                 hip.copy_h2d_f32(buf.proj, &scratch)?;
                 hip.residual_add(buf.attn, buf.proj, dim as i32)?;
             }
+        }
+        if separate_moe_compat {
+            hip.round_f16(buf.attn, dim)?;
         }
         if off.w_shared_up.n > 0
             && off.w_shared_down.n > 0
@@ -6260,6 +6277,7 @@ impl TinyModel {
         host_layer: &LayerWeights,
         buf: DeviceDecode,
         n_tok: usize,
+        separate_moe_compat: bool,
     ) -> Result<bool, AllpacaError> {
         let cfg = &self.config;
         let (dim, ff, n_exp) = (cfg.dim, cfg.ff_dim, cfg.n_experts);
@@ -6269,6 +6287,7 @@ impl TinyModel {
             && !cfg.moe_sqrt_softplus
             && (cfg.expert_weights_scale == 0.0 || cfg.expert_weights_scale == 1.0);
         if !softmax_router
+            || separate_moe_compat
             || k > 64
             || off.w_router.n != n_exp * dim
             || self.edge0.is_some()
@@ -6335,6 +6354,9 @@ impl TinyModel {
             buf.attn,
         )?;
         drop(scratch);
+        if separate_moe_compat {
+            hip.round_f16(buf.attn, n_tok * dim)?;
+        }
         if has_shared {
             let scale = (!shexp_gate.is_null()).then_some(routes.shexp_scale.cast_const());
             self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &[], n_tok, scale)?;
@@ -6521,7 +6543,16 @@ impl TinyModel {
         record_elementwise(Some(metrics));
         // Same GPU routing as single-token decode, so verify spans and decode
         // produce identical tokens.
-        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, n_tok)? {
+        if self.gpu_routed_local_moe(
+            layer_idx,
+            hip,
+            resident,
+            off,
+            host_layer,
+            buf,
+            n_tok,
+            self.hosted_moe_compat,
+        )? {
             record_elementwise(Some(metrics));
             return Ok(());
         }
@@ -6655,6 +6686,9 @@ impl TinyModel {
                     hip.residual_add(buf.attn_row(t, dim), src, dim as i32)?;
                 }
             }
+        }
+        if self.hosted_moe_compat {
+            hip.round_f16(buf.attn, n_tok * dim)?;
         }
         if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
             self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, n_tok, None)?;
@@ -7324,6 +7358,7 @@ impl TinyModel {
             mla_cache,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7487,6 +7522,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         }
     }
 
@@ -7625,6 +7661,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         })
     }
 
@@ -7742,6 +7779,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         })
     }
 
@@ -8526,10 +8564,7 @@ impl TinyModel {
         // Layers on RPC workers: the batched device path below sends each
         // remote span `rpc.prefill_rows` rows per round trip. Without a local
         // GPU workspace the prompt runs one token at a time.
-        let batched_remote = hip.is_some()
-            && resident.is_some()
-            && self.supports_hip_batched_prefill()
-            && self.rpc.as_ref().is_none_or(|rpc| !rpc.has_hosted());
+        let batched_remote = hip.is_some() && resident.is_some() && self.supports_hip_batched_prefill();
         if self.rpc.as_ref().is_some_and(|r| r.placed_remote()) && !batched_remote {
             for (i, tok) in tokens.iter().enumerate() {
                 let last = i + 1 == tokens.len();
@@ -9632,6 +9667,7 @@ impl TinyModel {
         }
         let mut out = Vec::new();
         let mut side = DeviceDecodeSide::new(request_id);
+        side.separate_moe_compat = true;
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.forward_token_device(
             0,
@@ -10268,9 +10304,95 @@ impl TinyModel {
         resident: &ResidentModel,
         write_logits: bool,
         row_logits: Option<&mut [f32]>,
-        mut out_row_hiddens: Option<&mut Vec<f32>>,
+        out_row_hiddens: Option<&mut Vec<f32>>,
         vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
+        self.forward_tokens_device_impl(
+            tokens,
+            segs,
+            kv,
+            metrics,
+            logits,
+            hip,
+            resident,
+            write_logits,
+            row_logits,
+            out_row_hiddens,
+            vision,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_hidden_tokens_device(
+        &self,
+        start_pos: usize,
+        x: &mut [f32],
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        recurrent: &mut RecurrentState,
+        request_id: u64,
+    ) -> Result<(), AllpacaError> {
+        let dim = self.config.dim;
+        if x.is_empty() || x.len() % dim != 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "hidden rows must be a non-empty multiple of the model dimension".into(),
+            )));
+        }
+        let tokens = vec![0; x.len() / dim];
+        let mut segs = [SeqRows {
+            start_pos,
+            n_rows: tokens.len(),
+            page_ids,
+            request_id,
+            recurrent: Some(recurrent),
+        }];
+        // Hosted rows need the same arithmetic as the coordinator's RPC prefill.
+        let _exact_rows = allpaca_hip::ExactRows::enable();
+        self.forward_tokens_device_impl(
+            &tokens,
+            &mut segs,
+            kv,
+            metrics,
+            &mut [],
+            hip,
+            resident,
+            false,
+            None,
+            None,
+            None,
+            Some(x),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tokens_device_impl(
+        &self,
+        tokens: &[u32],
+        segs: &mut [SeqRows<'_>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        write_logits: bool,
+        row_logits: Option<&mut [f32]>,
+        mut out_row_hiddens: Option<&mut Vec<f32>>,
+        vision: Option<&VisionSeq>,
+        hidden_rows: Option<&mut [f32]>,
+    ) -> Result<(), AllpacaError> {
+        // Remote RPC prefill must use the same row arithmetic on every worker
+        // arch; a local tensor split keeps its existing single-machine path.
+        // Expert-parallel counts: without exact rows its local prefill takes
+        // the BLAS/WMMA paths, and those changed text from run to run.
+        let _exact_rows = self
+            .rpc
+            .as_ref()
+            .is_some_and(|rpc| rpc.sends_work_remote())
+            .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()
             || segs.iter().map(|s| s.n_rows).sum::<usize>() != tokens.len()
@@ -10359,13 +10481,17 @@ impl TinyModel {
             let mut buf = buf;
             let mut xfer = vec![0.0f32; n_tok * dim];
             let mut normed_ready = false;
-            resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
-            record_elementwise(Some(metrics));
-            if let Some(v) = vision {
-                // Soft (image) rows replace their placeholder token embeddings.
-                for t in 0..n_tok {
-                    if let Some(row) = v.soft_row(start_pos + t, dim) {
-                        hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+            if let Some(input) = hidden_rows.as_deref() {
+                hip.copy_h2d_f32(buf.x, input)?;
+            } else {
+                resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
+                record_elementwise(Some(metrics));
+                if let Some(v) = vision {
+                    // Soft (image) rows replace their placeholder token embeddings.
+                    for t in 0..n_tok {
+                        if let Some(row) = v.soft_row(start_pos + t, dim) {
+                            hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+                        }
                     }
                 }
             }
@@ -10378,7 +10504,28 @@ impl TinyModel {
                             let mut host_x = vec![0.0f32; n_tok * dim];
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
                             let consecutive = row_pos.windows(2).all(|w| w[1] == w[0] + 1);
-                            if consecutive {
+                            if rpc.is_hosted(layer_idx) {
+                                if consecutive && segs.len() == 1 {
+                                    rpc.run_hosted_rows(
+                                        layer_idx,
+                                        row_pos[0],
+                                        segs[0].recurrent.as_deref_mut(),
+                                        &mut host_x,
+                                    )?;
+                                } else {
+                                    for (si, seg) in segs.iter_mut().enumerate() {
+                                        for t in 0..seg.n_rows {
+                                            let r = seg_row0[si] + t;
+                                            rpc.run_hosted(
+                                                layer_idx,
+                                                row_pos[r],
+                                                seg.recurrent.as_deref_mut(),
+                                                &mut host_x[r * dim..(r + 1) * dim],
+                                            )?;
+                                        }
+                                    }
+                                }
+                            } else if consecutive {
                                 // One prompt: the worker runs the rows together.
                                 rpc.run_rows(layer_idx, row_pos[0], dim, &mut host_x)?;
                             } else {
@@ -10923,7 +11070,9 @@ impl TinyModel {
                 logits_rows,
             )?;
 
-            if row_logits.is_some() {
+            if let Some(out) = hidden_rows {
+                hip.copy_d2h_f32(buf.x, out)?;
+            } else if row_logits.is_some() {
                 rmsnorm_device_rows(
                     hip,
                     buf.x,
@@ -12628,6 +12777,32 @@ pub fn ensure_pages(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod host_exp_tests {
+    use super::*;
+
+    /// The shared-expert gate and host routing use `sigmoid_stable` on the
+    /// coordinator and on workers. The platform `exp` (MSVC CRT vs glibc)
+    /// differed in the last bit at one decode step of Qwen3-Coder-Next and
+    /// split hosted RPC spans from the separate path, so these bits are
+    /// pinned: they must hold on Windows and Linux alike.
+    #[test]
+    fn host_sigmoid_has_the_same_bits_on_every_platform() {
+        let expect = [
+            (-7.25f32, 0x3a3a_092d_u32),
+            (-1.5, 0x3e3a_cdc1),
+            (-0.3, 0x3ed9_e2ab),
+            (0.0, 0x3f00_0000),
+            (0.7, 0x3f2b_0e5a),
+            (2.25, 0x3f67_972d),
+            (9.5, 0x3f7f_fb18),
+        ];
+        for (v, bits) in expect {
+            assert_eq!(sigmoid_stable(v).to_bits(), bits, "sigmoid({v})");
+        }
+    }
 }
 
 #[cfg(test)]

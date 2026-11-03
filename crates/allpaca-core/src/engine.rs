@@ -3302,7 +3302,11 @@ impl Engine {
         prompt_checkpoints.sort_unstable();
         prompt_checkpoints.dedup();
         prompt_checkpoints.retain(|&n| n > 0 && n < prompt_len);
-        if !vision_seq.is_empty() || read.is_some() || !self.message_checkpoints_help(&target) {
+        // Only qwen4exp stops here: its checkpoints sit at exact capture points
+        // and resume equal to a cold run. A dense checkpoint at the prompt's end
+        // serves every shared prefix, and on a hybrid an extra prefill stop
+        // changes the text.
+        if !vision_seq.is_empty() || read.is_some() || target.q4x.is_none() {
             prompt_checkpoints.clear();
         }
         let older = prompt_checkpoints.len().saturating_sub(MESSAGE_CHECKPOINTS);
@@ -5041,17 +5045,6 @@ impl Engine {
         let cp = inner.kv_radix.checkpoint(recurrent, Vec::new());
         inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
-    }
-
-    /// Whether stopping prefill at a chat message saves anything. A dense
-    /// checkpoint at the end of the prompt already serves every shared prefix,
-    /// so only qwen4exp (exact capture points) and hybrids (their recurrent
-    /// state cannot be cut) need one there.
-    fn message_checkpoints_help(&self, target: &TinyModel) -> bool {
-        target.q4x.is_some()
-            || (target.config.recurrent
-                && self.hip.is_some()
-                && Self::prompt_cache_holds_layers(target))
     }
 
     /// Whether the host can read this model's layer state back for the
@@ -8935,7 +8928,12 @@ mod tests {
         local_cfg.engine.cpu_only = false;
         local_cfg.engine.gpu_backend = "hip".into();
         let local = Engine::new(local_cfg).unwrap();
-        let expected = local.generate("hello", params.clone()).unwrap().token_ids;
+        let messages = [("user", "hello"), ("assistant", "world"), ("user", "there")];
+        let prompt = local.format_chat_with_checkpoints(&messages).unwrap();
+        let expected = local
+            .generate_multimodal_with_checkpoints(&prompt, &[], params.clone())
+            .unwrap()
+            .token_ids;
 
         let run = |hosted: bool| {
             if hosted {
@@ -8966,17 +8964,28 @@ mod tests {
                 .map(|layer| (layer, format!("rpc:{addr}/0")))
                 .collect();
             let engine = Engine::new(cfg).unwrap();
-            let output = engine.generate("hello", params.clone()).unwrap().token_ids;
-            let trips = engine.stats().rpc_roundtrips;
+            let prompt = engine.format_chat_with_checkpoints(&messages).unwrap();
+            let output = engine
+                .generate_multimodal_with_checkpoints(&prompt, &[], params.clone())
+                .unwrap();
+            let stats = engine.stats();
             drop(engine);
             worker.join().unwrap();
-            (output, trips)
+            (output, stats.rpc_roundtrips, stats.prefill_chunks)
         };
-        let (separate, separate_trips) = run(false);
-        let (hosted, hosted_trips) = run(true);
-        assert_eq!(separate, expected);
-        assert_eq!(hosted, expected);
+        let (separate, separate_trips, separate_chunks) = run(false);
+        let (hosted, hosted_trips, hosted_chunks) = run(true);
+        assert_eq!(separate.token_ids, expected);
+        assert_eq!(hosted.token_ids, expected);
         assert!(hosted_trips < separate_trips, "hosted={hosted_trips} separate={separate_trips}");
+        assert!(hosted.prompt_tokens > 1);
+        assert_eq!(hosted_chunks, 1);
+        assert_eq!(hosted_chunks, separate_chunks);
+        assert!(
+            hosted_trips <= hosted.completion_tokens as u64 + hosted_chunks,
+            "one call per prefill chunk plus decode/stop-check calls: hosted={hosted_trips} completions={} chunks={hosted_chunks}",
+            hosted.completion_tokens
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

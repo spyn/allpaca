@@ -370,6 +370,7 @@ fn load_edge0_weights(
         mla_cache: None,
         expert_controls: Default::default(),
         layer_capture: Default::default(),
+        hosted_moe_compat: false,
         dsv4: None,
         q4x: None,
         g4: None,

@@ -12,6 +12,8 @@ const SOURCES: &[&str] = &[
     "crates/allpaca-cuda/src",
     "crates/allpaca-core/src/qwen4_gpu.rs",
     "crates/allpaca-core/src/qwen4_remote.rs",
+    "crates/allpaca-core/src/qwen3next_remote.rs",
+    "crates/allpaca-core/src/model.rs",
     "crates/allpaca-core/src/deltanet.rs",
     "hip/src",
     "hip/include",

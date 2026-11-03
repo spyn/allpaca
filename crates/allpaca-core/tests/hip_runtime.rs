@@ -5938,6 +5938,13 @@ fn hip_gated_delta_step_matches_host_warp_k128() {
             state_h[i]
         );
     }
+    let digest = |v: &[f32]| {
+        v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        })
+    };
+    assert_eq!(digest(&out), 0xa8ca08248c574d69, "delta output bits");
+    assert_eq!(digest(&state), 0x8b64af77fdd441ae, "delta state bits");
 }
 
 /// Transitional H2D scratch path used by `forward_token_device` must match host math.
@@ -6634,7 +6641,90 @@ fn hip_gdn_decode_step_resident_matches_host_without_qkv_d2h() {
             gated_h[i]
         );
     }
+    let digest = gated.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+    });
+    assert_eq!(digest, 590683133665046509, "cross-card GDN digest");
     hip.gdn_clear_request(req);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_decode_step_real_shape_has_stable_cross_card_bits() {
+    if allpaca_hip::device_count() == 0 {
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 8 << 20, 8).unwrap();
+    let (n_k, n_v, head_k, head_v, conv_k) = (16usize, 32usize, 128usize, 128usize, 4usize);
+    let key_dim = n_k * head_k;
+    let qkv_dim = 2 * key_dim + n_v * head_v;
+    let value_dim = n_v * head_v;
+    let vector = |n: usize, seed: usize| {
+        (0..n)
+            .map(|i| ((i * 17 + seed * 31) % 257) as f32 / 128.0 - 1.0)
+            .collect::<Vec<f32>>()
+    };
+    let qkv = vector(qkv_dim, 1);
+    let z = vector(value_dim, 2);
+    let alpha = vector(n_v, 3);
+    let beta = vector(n_v, 4);
+    let conv_w = vector(conv_k * qkv_dim, 5);
+    let dt = vector(n_v, 6);
+    let a = vector(n_v, 7);
+    let norm = vector(head_v, 8);
+    let mut host_state = vector(n_v * head_v * head_k, 9);
+    let mut host_conv = vector((conv_k - 1) * qkv_dim, 10);
+    let parts = [
+        &qkv, &z, &alpha, &beta, &conv_w, &dt, &a, &norm,
+    ];
+    let total = parts.iter().map(|v| v.len()).sum::<usize>() + value_dim;
+    let blob = allpaca_hip::DeviceWeights::alloc(0, total * 4).unwrap();
+    let mut off = 0usize;
+    let mut put = |src: &[f32]| {
+        let p = blob.ptr_at(off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        off += src.len() * 4;
+        p
+    };
+    let qkv_d = put(&qkv);
+    let z_d = put(&z);
+    let alpha_d = put(&alpha);
+    let beta_d = put(&beta);
+    let conv_w_d = put(&conv_w);
+    let dt_d = put(&dt);
+    let a_d = put(&a);
+    let norm_d = put(&norm);
+    let out_d = put(&vec![0.0f32; value_dim]);
+    hip.gdn_decode_step_resident(
+        41,
+        41,
+        &mut host_state,
+        &mut host_conv,
+        qkv_d,
+        z_d,
+        alpha_d,
+        beta_d,
+        conv_w_d,
+        dt_d,
+        a_d,
+        norm_d,
+        out_d,
+        n_v as i32,
+        n_k as i32,
+        head_v as i32,
+        head_k as i32,
+        conv_k as i32,
+        1e-6,
+        true,
+    )
+    .unwrap();
+    let mut out = vec![0.0f32; value_dim];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    let digest = out.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+    });
+    assert_eq!(digest, 18417993370823597083, "real-shape cross-card GDN digest");
+    hip.gdn_clear_request(41);
 }
 
 /// Device GDN clone/rewind must restore state+conv after an extra step without D2H.
@@ -8033,51 +8123,6 @@ fn hip_prompt_cache_hit_decodes_like_a_full_prefill() {
 
 #[cfg(feature = "hip")]
 #[test]
-fn hip_message_checkpoint_restores_after_mid_edit() {
-    let model = ModelConfig::tiny_hybrid();
-    let fresh = Engine::new(hip_auto_synthetic()).unwrap();
-    fresh.load_synthetic(model.clone()).unwrap();
-    if hip_gpus(&fresh).is_empty() {
-        eprintln!("skip hip_message_checkpoint_restores_after_mid_edit: no HIP device");
-        return;
-    }
-    let edited = fresh
-        .format_chat_with_checkpoints(&[
-            ("user", "hello"),
-            ("assistant", "world"),
-            ("user", "true"),
-        ])
-        .unwrap();
-    let cold = fresh.generate(&edited.text, greedy(12)).unwrap();
-
-    let mut cfg = hip_auto_synthetic();
-    cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
-    let warm = Engine::new(cfg).unwrap();
-    warm.load_synthetic(model).unwrap();
-    let cached = warm
-        .format_chat_with_checkpoints(&[
-            ("user", "hello"),
-            ("assistant", "world"),
-            ("user", "there"),
-        ])
-        .unwrap();
-    warm.generate_multimodal_with_checkpoints(&cached, &[], greedy(4))
-        .unwrap();
-    let hit = warm
-        .generate_multimodal_with_checkpoints(&edited, &[], greedy(12))
-        .unwrap();
-
-    let stats = warm.stats();
-    assert_eq!(stats.radix_hits, 1, "the second-message checkpoint must hit; {stats:?}");
-    assert!(
-        stats.radix_skip_tokens >= edited.checkpoint_offsets[1] as u64,
-        "the whole second message must be skipped; {stats:?}"
-    );
-    assert_eq!(hit.token_ids, cold.token_ids);
-}
-
-#[cfg(feature = "hip")]
-#[test]
 fn hip_dense_chat_restores_a_mid_edit_without_splitting_prefill() {
     let model = ModelConfig::tiny();
     let fresh = Engine::new(hip_auto_synthetic()).unwrap();
@@ -8123,27 +8168,22 @@ fn hip_dense_chat_restores_a_mid_edit_without_splitting_prefill() {
     assert_eq!(hit.token_ids, cold.token_ids);
 }
 
+/// An extra prefill stop changes a hybrid's text, so a chat does not add any.
 #[cfg(feature = "hip")]
 #[test]
-fn hip_hybrid_chat_stops_prefill_only_at_its_last_messages() {
+fn hip_hybrid_chat_prefills_in_one_chunk() {
     let engine = Engine::new(hip_auto_synthetic()).unwrap();
     engine.load_synthetic(ModelConfig::tiny_hybrid()).unwrap();
     if hip_gpus(&engine).is_empty() {
-        eprintln!("skip hip_hybrid_chat_stops_prefill_only_at_its_last_messages: no HIP device");
+        eprintln!("skip hip_hybrid_chat_prefills_in_one_chunk: no HIP device");
         return;
     }
-    let messages = [("user", "hello"); 12];
-    let prompt = engine.format_chat_with_checkpoints(&messages).unwrap();
+    let prompt = engine.format_chat_with_checkpoints(&[("user", "hello"); 4]).unwrap();
     engine
         .generate_multimodal_with_checkpoints(&prompt, &[], greedy(1))
         .unwrap();
     let stats = engine.stats();
-    assert_eq!(
-        stats.prefill_chunks,
-        prompt.checkpoint_offsets.len() as u64 + 1,
-        "{stats:?}"
-    );
-    assert!(prompt.checkpoint_offsets.len() < messages.len());
+    assert_eq!(stats.prefill_chunks, 1, "{stats:?}");
 }
 
 /// Real model: a prompt that extends a cached one decodes exactly as a full
