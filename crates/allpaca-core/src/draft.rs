@@ -422,4 +422,46 @@ mod tests {
             ctx2.len() + 3
         );
     }
+
+    /// A prompt-cache restore of the draft KV continues the same drafts a
+    /// cache that never left memory would, and does not prefill the prefix again.
+    #[test]
+    fn restored_draft_cache_continues_without_replaying_the_prefix() {
+        let cfg = ModelConfig::draft_tiny();
+        let mut live = DraftModelProvider::new(TinyModel::synthetic(cfg.clone(), 1, "draft"));
+        let mut cache = DenseKv::default();
+        let first = live.propose_on(&[1, 2], 3, 0.0, &mut cache, None, None, None).unwrap();
+        let bytes = cache.to_cache_bytes(&[0.5, 0.25]).unwrap();
+        let (mut restored, seed) = DenseKv::from_cache_bytes(&bytes).expect("draft cache");
+        assert_eq!(seed, vec![0.5, 0.25]);
+
+        let ctx2 = vec![1, 2, first[0]];
+        let live_before = cache.forwards;
+        let from_live = live
+            .propose_on(&ctx2, 3, 0.0, &mut cache, None, None, None)
+            .unwrap();
+        let mut resumed = DraftModelProvider::new(TinyModel::synthetic(cfg, 1, "draft"));
+        let restored_before = restored.forwards;
+        let from_restored = resumed
+            .propose_on(&ctx2, 3, 0.0, &mut restored, None, None, None)
+            .unwrap();
+        assert_eq!(from_restored, from_live);
+        assert_eq!(restored.forwards - restored_before, cache.forwards - live_before);
+    }
+
+    #[test]
+    fn a_damaged_draft_cache_is_refused_without_allocating_for_it() {
+        let cfg = ModelConfig::draft_tiny();
+        let mut live = DraftModelProvider::new(TinyModel::synthetic(cfg, 1, "draft"));
+        let mut cache = DenseKv::default();
+        live.propose_on(&[1, 2], 3, 0.0, &mut cache, None, None, None).unwrap();
+        let bytes = cache.to_cache_bytes(&[]).unwrap();
+        assert!(DenseKv::from_cache_bytes(&bytes).is_some());
+        assert!(DenseKv::from_cache_bytes(&bytes[..bytes.len() - 1]).is_none());
+        let mut huge = bytes.clone();
+        huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(DenseKv::from_cache_bytes(&huge).is_none());
+        let huge_layers = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255];
+        assert!(DenseKv::from_cache_bytes(&huge_layers).is_none());
+    }
 }

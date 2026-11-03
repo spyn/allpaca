@@ -39,6 +39,9 @@ pub struct RadixCheckpoint {
     /// Only recurrent state: the keys and values come from a longer
     /// prompt's checkpoint below it.
     pub(crate) state_only: bool,
+    /// MTP drafter warmed with exactly this prefix ([`crate::model::DenseKv::to_cache_bytes`]).
+    /// A shorter cut drops it.
+    pub(crate) draft: Option<Vec<u8>>,
 }
 
 impl RadixCheckpoint {
@@ -57,9 +60,11 @@ impl RadixCheckpoint {
             .sum();
         let host_kv: usize = r.host_kv.iter().map(|(k, v)| (k.len() + v.len()) * 4).sum();
         let kv: usize = self.kv.iter().map(EncodedRows::bytes).sum();
+        let draft = self.draft.as_ref().map_or(0, Vec::len);
         rec.saturating_add(host_kv)
             .saturating_add(r.q4x.host_bytes())
             .saturating_add(kv)
+            .saturating_add(draft)
             .saturating_add(64)
     }
 
@@ -70,6 +75,7 @@ impl RadixCheckpoint {
             kv: self.kv.iter().map(|layer| layer.prefix(n)).collect(),
             sliceable: self.sliceable,
             state_only: self.state_only,
+            draft: None,
         }
     }
 }
@@ -496,6 +502,7 @@ impl KvRadixForest {
             kv: kv.iter().map(|rows| EncodedRows::encode(self.codec, rows)).collect(),
             sliceable: false,
             state_only: false,
+            draft: None,
         }
     }
 
@@ -622,7 +629,7 @@ impl KvRadixForest {
 
     /// Keep the recurrent state at the end of `tokens` (a state checkpoint).
     /// A checkpoint already there with keys and values is left as it is.
-    pub fn insert_state(&mut self, tokens: &[u32], recurrent: RecurrentState) {
+    pub fn insert_state(&mut self, tokens: &[u32], recurrent: RecurrentState, draft: Option<Vec<u8>>) {
         if node_at(&self.root, tokens).is_some_and(|n| n.has_kv()) {
             return;
         }
@@ -631,6 +638,7 @@ impl KvRadixForest {
             kv: Vec::new(),
             sliceable: false,
             state_only: true,
+            draft,
         };
         self.insert_checkpoint(tokens, cp);
     }
@@ -746,12 +754,14 @@ impl KvRadixForest {
         kv: &KvTierManager,
         pages: &[Vec<u64>],
         cfg: &ModelConfig,
+        draft: Option<Vec<u8>>,
     ) -> Result<(), AllpacaError> {
         if tokens.is_empty() {
             return Ok(());
         }
         let mut cp = self.checkpoint(recurrent.clone(), snapshot_kv(kv, pages, cfg)?);
         cp.sliceable = !cfg.recurrent;
+        cp.draft = draft;
         self.insert_checkpoint(tokens, cp);
         Ok(())
     }
@@ -776,7 +786,11 @@ impl KvRadixForest {
         let mut full = self.checkpoint(recurrent.clone(), snapshot_kv(kv, pages, cfg)?);
         full.sliceable = !cfg.recurrent;
         for n in 1..=tokens.len() {
-            self.insert_checkpoint(&tokens[..n], full.prefix(n));
+            let mut cp = full.prefix(n);
+            if n == tokens.len() {
+                cp.draft = full.draft.clone();
+            }
+            self.insert_checkpoint(&tokens[..n], cp);
         }
         Ok(())
     }
@@ -1067,7 +1081,9 @@ fn kv_below(node: &RadixNode) -> Option<Vec<u32>> {
 }
 
 const MAGIC: &[u8; 4] = b"APKC";
-const VERSION: u32 = 3;
+/// Checkpoint files. 3 has no drafter trailer; 4 may.
+const VERSION: u32 = 4;
+const VERSION_V3: u32 = 3;
 const FLAG_SLICEABLE: u8 = 1;
 const FLAG_STATE_ONLY: u8 = 2;
 
@@ -1138,22 +1154,36 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     if q4x {
         r.q4x.write_to(&mut out);
     }
+    match &cp.draft {
+        None => out.push(0),
+        Some(draft) => {
+            out.push(1);
+            let n = u32::try_from(draft.len()).expect("draft cache fits in a checkpoint file");
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(draft);
+        }
+    }
     out
 }
 
-fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8)> {
-    if r.take(4)? != MAGIC || r.u32()? != VERSION {
+fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8, u32)> {
+    if r.take(4)? != MAGIC {
+        return None;
+    }
+    let version = r.u32()?;
+    if version != VERSION && version != VERSION_V3 {
         return None;
     }
     let n = r.u32()? as usize;
     let tokens = (0..n).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
     let flags = r.u8()?;
-    Some((tokens, flags))
+    Some((tokens, flags, version))
 }
 
 /// Tokens and flags of the checkpoint file `data`.
 pub(crate) fn header_of(data: &[u8]) -> Option<(Vec<u32>, u8)> {
-    read_header(&mut Reader(data))
+    let (tokens, flags, _) = read_header(&mut Reader(data))?;
+    Some((tokens, flags))
 }
 
 /// Tokens and flags, reading only the start of the file.
@@ -1166,13 +1196,14 @@ fn read_file_header(path: &Path) -> Option<(Vec<u32>, u8)> {
     f.read_exact(&mut rest).ok()?;
     let mut all = head.to_vec();
     all.extend_from_slice(&rest);
-    read_header(&mut Reader(&all))
+    let (tokens, flags, _) = read_header(&mut Reader(&all))?;
+    Some((tokens, flags))
 }
 
 /// The checkpoint in `bytes`, when it is one and belongs to `tokens`.
 fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     let mut r = Reader(bytes);
-    let (found, flags) = read_header(&mut r)?;
+    let (found, flags, version) = read_header(&mut r)?;
     if found != tokens {
         return None;
     }
@@ -1205,6 +1236,18 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
         1 => Some(crate::qwen4exp::Qwen4Memory::read_from(&mut r)?),
         _ => return None,
     };
+    let draft = if version >= VERSION {
+        match r.u8()? {
+            0 => None,
+            1 => {
+                let n = r.u32()? as usize;
+                Some(r.take(n)?.to_vec())
+            }
+            _ => return None,
+        }
+    } else {
+        None
+    };
     if !r.0.is_empty() {
         return None;
     }
@@ -1224,6 +1267,7 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
         kv,
         sliceable: flags & FLAG_SLICEABLE != 0,
         state_only: flags & FLAG_STATE_ONLY != 0,
+        draft,
     })
 }
 
@@ -1506,6 +1550,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A later turn resumes the drafter that was warmed with this prefix.
+    /// The bytes ride in the checkpoint file, so a RAM miss still brings them back.
+    #[test]
+    fn a_checkpoint_keeps_the_drafter_state_it_was_saved_with() {
+        let dir = disk_dir("draft");
+        let mut saved = rich_cp(1);
+        saved.draft = Some(vec![9, 8, 7, 6]);
+        let mut forest = KvRadixForest::with_limits(0, 1).with_disk(&dir, 0).unwrap();
+        forest.insert_checkpoint(&[1, 2, 3], saved);
+        assert_eq!(forest.checkpoint_bytes(), 0, "the checkpoint left RAM");
+
+        let (n, back) = forest.lookup_checkpoint(&[1, 2, 3, 9]).expect("back from disk");
+        assert_eq!(n, 3);
+        assert_eq!(back.draft, Some(vec![9, 8, 7, 6]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shorter_cut_does_not_keep_the_drafter_from_a_longer_prefix() {
+        let mut full = rich_cp(1);
+        full.draft = Some(vec![1, 2, 3, 4]);
+        let rows = full.kv[0].rows();
+        assert!(rows > 1);
+        assert!(full.prefix(rows - 1).draft.is_none());
+        assert!(full.prefix(rows).draft.is_none());
+    }
+
     #[test]
     fn checkpoints_on_disk_outlive_the_forest() {
         let dir = disk_dir("restart");
@@ -1565,7 +1636,7 @@ mod tests {
             if !reopen {
                 let full = forest.checkpoint(state(6.0), rows_upto(6));
                 forest.insert_checkpoint(&[1, 2, 3, 4, 5, 6], full);
-                forest.insert_state(&[1, 2, 3], state(3.0));
+                forest.insert_state(&[1, 2, 3], state(3.0), None);
             }
             let (n, cp) = forest
                 .lookup_checkpoint(&[1, 2, 3, 9, 9])
@@ -1582,7 +1653,7 @@ mod tests {
         let mut forest = KvRadixForest::new();
         let short = forest.checkpoint(state(1.0), rows_upto(1));
         forest.insert_checkpoint(&[1], short);
-        forest.insert_state(&[1, 2, 3], state(3.0));
+        forest.insert_state(&[1, 2, 3], state(3.0), None);
         let (n, cp) = forest.lookup_checkpoint(&[1, 2, 3, 9]).expect("the shorter one");
         assert_eq!(n, 1);
         assert_eq!(cp.recurrent.gdn_state, state(1.0).gdn_state);

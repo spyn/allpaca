@@ -1997,7 +1997,7 @@ mod tests {
                 return;
             }
             engine
-                .load_synthetic(allpaca_core::ModelConfig::tiny_hybrid())
+                .load_synthetic(allpaca_core::ModelConfig::tiny())
                 .unwrap();
             let app = router(AppState::new(
                 engine.clone(),

@@ -11924,6 +11924,14 @@ impl DenseKv {
         self.seq.len()
     }
 
+    pub(crate) fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    pub(crate) fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
     pub(crate) fn seq_matches(&self, ctx: &[u32]) -> bool {
         self.seq.as_slice() == ctx
     }
@@ -11940,6 +11948,89 @@ impl DenseKv {
     pub(crate) fn seed_h_nextn_from_target(&mut self, hidden: &[f32]) {
         self.h_nextn = hidden.to_vec();
         self.h_nextn_host_dirty = true;
+    }
+
+    /// The warmed K/V, its tokens and the target's last hidden state (`seed`)
+    /// for a prompt-cache checkpoint. Reads device K/V back to the host.
+    /// `h_nextn` is left out: the next process step seeds it from `seed`.
+    pub(crate) fn to_cache_bytes(&self, seed: &[f32]) -> Result<Vec<u8>, AllpacaError> {
+        let len = |n: usize| u32::try_from(n).expect("draft cache length fits in u32");
+        // Only the device path records the width.
+        let kv_dim = match self.layers.first() {
+            Some(layer) if self.kv_dim == 0 => layer.k.len().checked_div(self.seq.len()).unwrap_or(0),
+            _ => self.kv_dim,
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&len(kv_dim).to_le_bytes());
+        out.extend_from_slice(&len(self.seq.len()).to_le_bytes());
+        for t in &self.seq {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        crate::kv_codec::write_f32s(&mut out, seed);
+        match self.device {
+            Some(device) if !self.device_layers.is_empty() => {
+                allpaca_hip::set_device(device)?;
+                let n = self.tokens.saturating_mul(self.kv_dim);
+                out.extend_from_slice(&len(self.device_layers.len()).to_le_bytes());
+                let mut row = vec![0.0f32; n];
+                for layer in &self.device_layers {
+                    for src in [layer.k, layer.v] {
+                        allpaca_hip::memcpy(
+                            row.as_mut_ptr().cast(),
+                            src,
+                            n * 4,
+                            allpaca_hip::MEMCPY_D2H,
+                        )?;
+                        crate::kv_codec::write_f32s(&mut out, &row);
+                    }
+                }
+            }
+            _ => {
+                out.extend_from_slice(&len(self.layers.len()).to_le_bytes());
+                for layer in &self.layers {
+                    crate::kv_codec::write_f32s(&mut out, &layer.k);
+                    crate::kv_codec::write_f32s(&mut out, &layer.v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// What [`Self::to_cache_bytes`] wrote, with its seed: K/V on the host,
+    /// which the first device step uploads. `None` when `bytes` is not one.
+    pub(crate) fn from_cache_bytes(bytes: &[u8]) -> Option<(Self, Vec<f32>)> {
+        let mut r = crate::kv_codec::Reader(bytes);
+        let kv_dim = r.u32()? as usize;
+        let n_seq = r.u32()? as usize;
+        let seq = r
+            .take(n_seq.checked_mul(4)?)?
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let seed = r.f32s()?;
+        let n_layers = r.u32()? as usize;
+        // Each layer's two lengths take 16 bytes.
+        if n_layers > r.0.len() / 16 {
+            return None;
+        }
+        let mut layers = Vec::with_capacity(n_layers);
+        let want = n_seq.checked_mul(kv_dim)?;
+        for _ in 0..n_layers {
+            let (k, v) = (r.f32s()?, r.f32s()?);
+            if k.len() != want || v.len() != want {
+                return None;
+            }
+            layers.push(DenseLayerKv { k, v });
+        }
+        if !r.0.is_empty() {
+            return None;
+        }
+        let mut kv = Self::default();
+        kv.layers = layers;
+        kv.kv_dim = kv_dim;
+        kv.tokens = n_seq;
+        kv.seq = seq;
+        Some((kv, seed))
     }
 
     /// Independent copy of process KV (host seq/h_nextn/layers + D2D device K/V).
@@ -12103,7 +12194,7 @@ impl DenseKv {
         if reuse {
             return Ok(());
         }
-        let new_cap = need.max(self.capacity.saturating_mul(2)).max(8);
+        let new_cap = need.max(self.tokens).max(self.capacity.saturating_mul(2)).max(8);
         let bytes = new_cap * kv_dim * 4;
         let copy_tokens = if self.device == Some(device) && self.kv_dim == kv_dim {
             self.tokens
@@ -12155,6 +12246,25 @@ impl DenseKv {
         self.device = Some(device);
         self.capacity = new_cap;
         self.kv_dim = kv_dim;
+        if copy_tokens == 0 {
+            self.upload_host_layers()?;
+        }
+        Ok(())
+    }
+
+    /// Move K/V restored from a prompt-cache checkpoint onto fresh device layers.
+    fn upload_host_layers(&mut self) -> Result<(), AllpacaError> {
+        let n = self.tokens.saturating_mul(self.kv_dim);
+        if n == 0 || self.layers.iter().any(|l| l.k.len() != n || l.v.len() != n) {
+            return Ok(());
+        }
+        for (host, dev) in self.layers.iter_mut().zip(&self.device_layers) {
+            for (src, dst) in [(&host.k, dev.k), (&host.v, dev.v)] {
+                allpaca_hip::memcpy(dst, src.as_ptr().cast(), n * 4, allpaca_hip::MEMCPY_H2D)?;
+            }
+            host.k = Vec::new();
+            host.v = Vec::new();
+        }
         Ok(())
     }
 
