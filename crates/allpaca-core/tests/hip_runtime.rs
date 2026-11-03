@@ -7393,6 +7393,113 @@ fn hip_mtp_prefill_batches_and_keeps_drafts() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A later turn keeps the drafter the earlier one warmed: no MTP step is
+/// skipped, and the drafts and text equal a cold run's.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_resumed_mtp_drafts_like_a_cold_run() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_resumed_mtp_drafts_like_a_cold_run: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_qwen_hybrid_mtp_resume-{}.gguf",
+        std::process::id()
+    ));
+    write_tiny_qwen_hybrid_gguf_opts(&path, true);
+    let engine = || {
+        let mut cfg = tiny_written_cfg(path.clone(), false);
+        cfg.prefill.chunk_tokens = 512;
+        cfg.speculative.enabled = true;
+        cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Mtp];
+        cfg.speculative.max_depth = 3;
+        cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+        Engine::new(cfg).expect("tiny hybrid MTP Engine::new")
+    };
+    let first = "t3 t4 t5 t6 t3 t4 t5 t6";
+    let second = "t3 t4 t5 t6 t3 t4 t5 t6 t3 t4 t5 t6 t3 t4 t5 t6";
+
+    let cold = engine();
+    if hip_gpus(&cold).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let want = cold.generate(second, greedy(24)).expect("cold");
+    let cold_stats = cold.stats();
+    drop(cold);
+
+    let warm = engine();
+    warm.generate(first, greedy(2)).expect("first turn");
+    let before = warm.stats();
+    let got = warm.generate(second, greedy(24)).expect("second turn");
+    let after = warm.stats();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(after.radix_hits, 1, "{after:?}");
+    assert_eq!(got.token_ids, want.token_ids);
+    assert_eq!(after.mtp_process_skips, before.mtp_process_skips, "the drafter must not fall behind");
+    assert!(cold_stats.draft_proposed > 0, "fixture must exercise MTP drafts");
+    assert_eq!(
+        (
+            after.draft_accepted - before.draft_accepted,
+            after.draft_proposed - before.draft_proposed
+        ),
+        (cold_stats.draft_accepted, cold_stats.draft_proposed),
+        "restored draft K/V must draft like the cold run's"
+    );
+}
+
+/// The next turn of a chat keeps the live drafter: it does not read the
+/// earlier turn again, and the text stays a cold run's.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_next_turn_keeps_the_live_drafter() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_next_turn_keeps_the_live_drafter: no HIP device");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "allpaca_tiny_qwen_hybrid_mtp_turn-{}.gguf",
+        std::process::id()
+    ));
+    write_tiny_qwen_hybrid_gguf_opts(&path, true);
+    let engine = || {
+        let mut cfg = tiny_written_cfg(path.clone(), false);
+        cfg.prefill.chunk_tokens = 512;
+        cfg.speculative.enabled = true;
+        cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Mtp];
+        cfg.speculative.max_depth = 3;
+        cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+        Engine::new(cfg).expect("tiny hybrid MTP Engine::new")
+    };
+    let warm = engine();
+    if hip_gpus(&warm).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let first = "t3 t4 t5 t6 t3 t4 t5 t6";
+    let reply = warm.generate(first, greedy(16)).expect("first turn");
+    let turn: Vec<String> = reply.token_ids.iter().map(|id| format!("t{id}")).collect();
+    let next = format!("{first} {} t3 t4", turn.join(" "));
+    let before = warm.stats();
+    let got = warm.generate(&next, greedy(8)).expect("second turn");
+    let after = warm.stats();
+
+    let cold = engine();
+    let want = cold.generate(&next, greedy(8)).expect("cold");
+    let cold_stats = cold.stats();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(after.radix_hits, 1, "{after:?}");
+    assert_eq!(got.token_ids, want.token_ids);
+    let forwards = after.draft_gpu_forwards - before.draft_gpu_forwards;
+    assert!(
+        forwards + 8 < cold_stats.draft_gpu_forwards,
+        "resumed {forwards} vs cold {}",
+        cold_stats.draft_gpu_forwards
+    );
+}
+
 /// MTP process steps (pairing an accepted token with the target hidden) only
 /// write the draft KV; they must not run the vocab-wide draft lm_head, and
 /// greedy output must still match plain decode.

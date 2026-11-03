@@ -465,6 +465,42 @@ fn capture_qwen4_reply(inner: &mut EngineInner, id: u64) -> Result<(), AllpacaEr
     Ok(())
 }
 
+/// The MTP drafter warmed with this Request's first `end` tokens, for a
+/// checkpoint there. The drafter is engine-wide, so it is kept only while its
+/// Request runs alone.
+fn drafter_snapshot(inner: &EngineInner, id: u64, end: usize) -> Option<Vec<u8>> {
+    let active = inner.active.get(&id).filter(|_| inner.active.len() == 1)?;
+    if !mtp_draft_active(inner) || inner.qwen4_mtp.is_some() || !inner.draft_kv.seq_matches(&active.tokens[..end]) {
+        return None;
+    }
+    match inner.draft_kv.to_cache_bytes(&active.last_hidden) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!(error = %e, "prompt cache: the drafter was not kept");
+            None
+        }
+    }
+}
+
+/// Put a checkpoint's MTP drafter back for a Request resuming at `resumed`,
+/// and give back the target hidden state its next step pairs with. A saved
+/// drafter of another shape or sequence is ignored.
+fn restore_drafter(inner: &mut EngineInner, bytes: &[u8], resumed: &[u32]) -> Option<Vec<f32>> {
+    if !inner.active.is_empty() || !mtp_draft_active(inner) || inner.qwen4_mtp.is_some() {
+        return None;
+    }
+    let draft = inner.draft_model.as_ref()?;
+    let (kv, seed) = DenseKv::from_cache_bytes(bytes)?;
+    let fits = kv.seq_matches(resumed)
+        && kv.layer_count() == draft.config.n_layers
+        && kv.kv_dim() == draft.config.n_kv_heads * draft.config.head_dim()
+        && seed.len() == draft.config.dim;
+    fits.then(|| {
+        inner.draft_kv = kv;
+        seed
+    })
+}
+
 fn rpc_hello_token(config: &Config) -> String {
     if let Some(t) = config
         .rpc
@@ -3221,6 +3257,7 @@ impl Engine {
         self.sync_prompt_cache(&mut inner, &target);
         let probe = read.map(|read| DecisionProbe::new(read, &tokens));
         let mut prefill_pos = 0;
+        let mut resumed_draft = None;
         // Soft vision tokens are not text anchors / radix keys yet. A
         // decision request that reads hidden states forwards every token.
         // gemma4's K/V is in its sequence state, which checkpoints do not hold.
@@ -3260,6 +3297,7 @@ impl Engine {
             };
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
+                    resumed_draft = cp.draft.clone();
                     restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
@@ -3296,7 +3334,16 @@ impl Engine {
         let id = inner.next_request_id;
         inner.next_request_id += 1;
         inner.draft_ahead = None;
-        inner.draft_kv.reset();
+        let keep = inner.draft_kv.prefix_len(&tokens);
+        let resumed_hidden = if inner.active.is_empty() && prefill_pos > 0 && keep > prefill_pos {
+            // The chat's next turn: the drafter already read past the checkpoint.
+            let kv_dim = inner.draft_model.as_ref().map_or(0, |d| d.config.n_kv_heads * d.config.head_dim());
+            inner.draft_kv.truncate(keep, kv_dim);
+            None
+        } else {
+            inner.draft_kv.reset();
+            resumed_draft.and_then(|bytes| restore_drafter(&mut inner, &bytes, &tokens[..prefill_pos]))
+        };
         let prompt_len = tokens.len();
         let mut prompt_checkpoints = checkpoint_offsets;
         prompt_checkpoints.sort_unstable();
@@ -3338,7 +3385,7 @@ impl Engine {
                 recurrent,
                 decode_step: 0,
                 moe_norm: vec![0.0f32; dim],
-                last_hidden: vec![0.0f32; dim],
+                last_hidden: resumed_hidden.unwrap_or_else(|| vec![0.0f32; dim]),
                 last_hidden_fresh: false,
                 defer_lm_head: false,
                 deferred: None,
@@ -4635,14 +4682,16 @@ impl Engine {
                     } else {
                         row_hiddens[(i - 1) * hidden_width..i * hidden_width].to_vec()
                     };
-                    mtp_process_token(
-                        inner,
-                        *tok,
-                        start + i,
-                        &h_prev,
-                        self.draft_hip.as_deref(),
-                        &self.metrics,
-                    )?;
+                    if start + i >= inner.draft_kv.seq_len() {
+                        mtp_process_token(
+                            inner,
+                            *tok,
+                            start + i,
+                            &h_prev,
+                            self.draft_hip.as_deref(),
+                            &self.metrics,
+                        )?;
+                    }
                 }
                 last_hidden = row_hiddens[(toks.len() - 1) * hidden_width..].to_vec();
             }
@@ -4684,14 +4733,16 @@ impl Engine {
                 let pos = start + i;
                 let last = pos + 1 >= total;
                 // MTP process: (token_pos, h_{pos-1}) before target updates last_hidden.
-                mtp_process_token(
-                    inner,
-                    *tok,
-                    pos,
-                    &last_hidden,
-                    self.draft_hip.as_deref(),
-                    &self.metrics,
-                )?;
+                if pos >= inner.draft_kv.seq_len() {
+                    mtp_process_token(
+                        inner,
+                        *tok,
+                        pos,
+                        &last_hidden,
+                        self.draft_hip.as_deref(),
+                        &self.metrics,
+                    )?;
+                }
                 let mut decode_side = DeviceDecodeSide {
                     last_hidden: if want_hidden {
                         Some(&mut last_hidden)
@@ -4828,6 +4879,7 @@ impl Engine {
                         &inner.kv,
                         &pages_now,
                         &target.config,
+                        None,
                     )?;
                     if is_anchor {
                         if let Some(state) = recurrent.as_ref() {
@@ -4877,8 +4929,7 @@ impl Engine {
             self.capture_prompt(inner, id, &target)?;
         } else {
             let every = self.config.prompt_cache.boundary_tokens;
-            let at_boundary = every > 0 && end / every > start / every;
-            if target.config.recurrent && (message_boundary || at_boundary) {
+            if target.config.recurrent && every > 0 && end / every > start / every {
                 self.capture_state(inner, id, &target, end)?;
             }
         }
@@ -5015,7 +5066,8 @@ impl Engine {
         let Some(state) = active.recurrent.clone() else {
             return Ok(());
         };
-        inner.kv_radix.insert_state(&tokens, state);
+        let draft = drafter_snapshot(inner, id, end);
+        inner.kv_radix.insert_state(&tokens, state, draft);
         Ok(())
     }
 
@@ -5047,13 +5099,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether the host can read this model's layer state back for the
-    /// prompt cache.
-    fn prompt_cache_holds_layers(target: &TinyModel) -> bool {
-        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
-        !(target.dsv4.is_some() || target.q4x.is_some() || target.g4.is_some() || layers_remote)
-    }
-
     /// Whether the prompt cache can take this Request's state on HIP, after
     /// reading its GDN/Mamba state back to the host. Left out: models whose
     /// state the host cannot read back yet (DeepSeek-V4, qwen4exp, layers on
@@ -5064,9 +5109,13 @@ impl Engine {
         id: u64,
         target: &TinyModel,
     ) -> Result<bool, AllpacaError> {
-        let Some(hip) = self.hip.as_deref().filter(|_| Self::prompt_cache_holds_layers(target)) else {
+        let Some(hip) = self.hip.as_deref() else {
             return Ok(false);
         };
+        let layers_remote = target.rpc.as_ref().is_some_and(|rpc| rpc.placed_remote());
+        if target.dsv4.is_some() || target.q4x.is_some() || target.g4.is_some() || layers_remote {
+            return Ok(false);
+        }
         let active = request_mut(inner, id)?;
         if !active.vision.is_empty() || active.probe.is_some() {
             return Ok(false);
@@ -5109,9 +5158,10 @@ impl Engine {
             .recurrent
             .clone()
             .unwrap_or_else(|| RecurrentState::zeros(target.config.n_layers, target.config.dim));
+        let draft = drafter_snapshot(inner, id, tokens.len());
         inner
             .kv_radix
-            .capture(&tokens, &state, &inner.kv, &pages, &target.config)
+            .capture(&tokens, &state, &inner.kv, &pages, &target.config, draft)
     }
 
     /// Whether this Engine can batch decode at all: enabled, several Request
@@ -6033,7 +6083,7 @@ fn prompt_cache_settings(
          |experimental=row_variant:{},chunked_gdn:{},route_tail_skip:{tail_skip}\
          |device={:?},cpu_only:{},backend:{},vram_budget_mib:{:?}\
          |tensor_split={:?}|expert_homes={:?}|host_f32={},miss_policy={:?}\
-         |edge0_no_lora={},edge0_no_prerouter={}|plan={plan}",
+         |edge0_no_lora={},edge0_no_prerouter={}|draft={:?}|plan={plan}",
         config.prompt_cache.codec,
         x.row_variant_kernels,
         x.chunked_gdn,
@@ -6047,6 +6097,7 @@ fn prompt_cache_settings(
         w.miss_policy,
         m.edge0_no_lora,
         m.edge0_no_prerouter,
+        m.draft_path,
     ))
 }
 
@@ -10455,6 +10506,14 @@ mod tests {
         assert_ne!(s("build-a"), s("build-b"));
         assert!(engine_build_id().is_some());
         assert_eq!(engine_build_id(), engine_build_id(), "read once per process");
+    }
+
+    #[test]
+    fn prompt_cache_settings_follow_the_drafter() {
+        let mut cfg = test_config();
+        let before = prompt_cache_settings(&cfg, Some("c"), &[], "cpu");
+        cfg.model.draft_path = Some("other-mtp.gguf".into());
+        assert_ne!(before, prompt_cache_settings(&cfg, Some("c"), &[], "cpu"));
     }
 
     #[test]
