@@ -10387,11 +10387,11 @@ impl TinyModel {
         // Remote RPC prefill must use the same row arithmetic on every worker
         // arch; a local tensor split keeps its existing single-machine path.
         // Expert-parallel counts: without exact rows its local prefill takes
-        // the BLAS/WMMA paths, and those changed text from run to run.
-        let _exact_rows = self
-            .rpc
-            .as_ref()
-            .is_some_and(|rpc| rpc.sends_work_remote())
+        // the BLAS/WMMA paths, and those changed text from run to run. MoE
+        // models also take exact rows when nothing is remote: Ling-mini's
+        // local prefill changed text between fresh starts without it (S2).
+        let moe = self.config.n_experts > 0;
+        let _exact_rows = (moe || self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote()))
             .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()
@@ -12887,6 +12887,103 @@ pub fn ensure_pages(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod moe_prefill_rows_tests {
+    use super::*;
+    use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor};
+
+    /// A local MoE model at a width the wide GEMMs take (dim and ff 256) with
+    /// stacked Q8_0 experts, like a real K-quant / Q8_0 MoE file.
+    fn tiny_q8_moe(dir: &std::path::Path) -> std::path::PathBuf {
+        let f32_src = dir.join("f32.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_sized(&f32_src, 4, false, 256, 32, 256);
+        let f32_file = GgufFile::open(&f32_src).unwrap();
+        let quant: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = f32_file
+            .tensors
+            .iter()
+            .map(|info| {
+                if info.name.ends_with("_exps.weight") {
+                    let data = f32_file.tensor_f32(&info.name).unwrap();
+                    (info.name.clone(), info.dims.clone(), GgmlType::Q8_0, allpaca_gguf::quantize_q8_0(&data))
+                } else {
+                    let bytes = f32_file.tensor_bytes(&info.name).unwrap().to_vec();
+                    (info.name.clone(), info.dims.clone(), info.ggml_type, bytes)
+                }
+            })
+            .collect();
+        let tensors: Vec<GgufWriteQuantTensor<'_>> = quant
+            .iter()
+            .map(|(name, dims, ggml_type, bytes)| GgufWriteQuantTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: *ggml_type,
+                bytes,
+            })
+            .collect();
+        let path = dir.join("q8.gguf");
+        write_gguf_quant(&path, &f32_file.metadata, &[], &tensors).unwrap();
+        path
+    }
+
+    /// Local MoE prefill (no RPC) gives each row the bits it gets alone.
+    /// Without exact rows the wide GEMMs sum in another order, and the same
+    /// prompt changed text between fresh starts on Ling-mini (S2, measured).
+    #[test]
+    fn local_moe_prefill_rows_equal_token_by_token() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-moe-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = GgufFile::open(&tiny_q8_moe(&dir)).unwrap();
+        let model = TinyModel::from_gguf(&file).unwrap();
+        assert!(model.config.n_experts > 0 && model.rpc.is_none());
+        let resident = ResidentModel::upload_gguf(&file, &model.config, 0).unwrap();
+        let hip = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 256).unwrap();
+        let cfg = &model.config;
+        let tokens: Vec<u32> = (0..64u32).map(|i| 1 + (i * 7 + i / 3) % 5).collect();
+        let run = |batched: bool, request_id: u64| -> Vec<f32> {
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::with_hip(64 << 20, 64 << 20, 0.75, Some(hip.device));
+            let keeps = kv_layer_mask(&model);
+            let pages = alloc_pages_for_seq_masked(&mut kv, cfg, 128, tokens.len() + 1, Some(&keeps), &metrics).unwrap();
+            let mut recurrent = crate::anchors::RecurrentState::zeros(cfg.n_layers, cfg.dim);
+            let mut logits = vec![0.0f32; cfg.vocab_size];
+            if batched {
+                let mut segs = [SeqRows {
+                    start_pos: 0,
+                    n_rows: tokens.len(),
+                    page_ids: &pages,
+                    request_id,
+                    recurrent: Some(&mut recurrent),
+                }];
+                model
+                    .forward_tokens_device(
+                        &tokens, &mut segs, &mut kv, &metrics, &mut logits, &hip, &resident, true, None,
+                        None, None,
+                    )
+                    .unwrap();
+            } else {
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    model
+                        .forward_token_device(
+                            tok, pos, &pages, &mut kv, &metrics, &mut logits, &hip, &resident, true, None,
+                            None, Some(&mut recurrent), None, None,
+                        )
+                        .unwrap();
+                }
+            }
+            hip.gdn_clear_request(request_id);
+            logits
+        };
+        let one_by_one = run(false, 11);
+        let rows = run(true, 12);
+        let differ = one_by_one.iter().zip(&rows).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(differ, 0, "batched MoE prefill changed {differ} of {} logits", rows.len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
