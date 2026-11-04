@@ -6489,8 +6489,10 @@ fn propose_after_deferred(
             Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
         }
     }
-    if let Some(provider) = inner.qwen4_mtp.as_mut() {
-        let draft = provider.propose_after(ctx, tok, depth + 1, temperature, metrics)?;
+    if inner.qwen4_mtp.is_some() {
+        let last_hidden = request(inner, id)?.last_hidden.clone();
+        let provider = inner.qwen4_mtp.as_mut().expect("checked above");
+        let draft = provider.propose_after(ctx, tok, &last_hidden, depth + 1, temperature, metrics)?;
         if draft.len() >= 2 {
             host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
         }
