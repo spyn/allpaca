@@ -4630,8 +4630,24 @@ static int kq_i8_lanes(int qt, int n) {
  * measured, 5120x5120: Q4_K m=8 68 -> 41 us on the RX 9070, 108 -> 66 on the
  * RX 9060 XT; m=1 is 29 / 53). Decode (m = 1) and wave64 cards (the MI50, not
  * measured) keep the compiler default. Override: 0 = that pick, 1 = off,
- * 2 = on; it only serves tests and benches. */
+ * 2 = on; it only serves tests and benches. Without one,
+ * ALLPACA_KQ_LOADS_FIRST=0 runs every row count off (an SDK 7.1 build's
+ * schedule before P6) and =1 on, for A/B runs of a whole server. */
 static std::atomic<int> g_kq_lf_override{0};
+
+static int kq_lf_env() {
+    static const int mode = [] {
+        const char *v = std::getenv("ALLPACA_KQ_LOADS_FIRST");
+        if (v && v[0] == '0') {
+            return 1;
+        }
+        if (v && v[0] == '1') {
+            return 2;
+        }
+        return 0;
+    }();
+    return mode;
+}
 
 extern "C" int allpaca_kquant_i8_set_loads_first(int32_t mode) {
     if (mode < 0 || mode > 2) {
@@ -4700,6 +4716,9 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
             return hip_status(hipGetLastError());
         }
         int lf = g_kq_lf_override.load(std::memory_order_relaxed);
+        if (lf == 0) {
+            lf = kq_lf_env();
+        }
         if (lf == 0 && m >= 2 && !kq_wave64()) {
             lf = 2;
         }
