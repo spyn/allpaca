@@ -218,6 +218,9 @@ struct EngineInner {
     anchors: AnchorCache,
     /// GEM radix prefix KV reuse (arbitrary mid-prompt edits).
     kv_radix: KvRadixForest,
+    /// Prompt tokens per second of prefill, measured per chunk, for the
+    /// prompt cache's fetch-vs-recompute rule.
+    prefill_rate: crate::kv_radix::RateEma,
     /// Model and expert mask the prompt cache holds checkpoints for.
     prompt_cache_key: Option<u64>,
     /// Keeps the open local disk folder marked used.
@@ -736,6 +739,7 @@ impl Engine {
             // One node per token: the node cap must allow long prompts.
             kv_radix: KvRadixForest::with_limits(1 << 20, config.prompt_cache.ram_bytes)
                 .with_codec(config.prompt_cache.codec),
+            prefill_rate: Default::default(),
             prompt_cache_key: None,
             prompt_cache_touch: None,
             ds_probe: ds_probe.clone(),
@@ -1245,6 +1249,12 @@ impl Engine {
                 self.metrics
                     .radix_evictions
                     .store(g.kv_radix.evictions(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .radix_fetches
+                    .store(g.kv_radix.fetches(), std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .radix_fetch_skips
+                    .store(g.kv_radix.fetch_skips(), std::sync::atomic::Ordering::Relaxed);
                 self.metrics.radix_bytes.store(
                     g.kv_radix.checkpoint_bytes() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -3275,13 +3285,21 @@ impl Engine {
             // Decision scores are checked against a reference: they resume
             // only from checkpoints that hold the rows as they were.
             let exact_only = probe.is_some() && inner.kv_radix.codec() != allpaca_types::KvCodec::F32;
+            let mut lookup_started = Instant::now();
             let found = if exact_only {
                 None
             } else {
+                let rule = crate::kv_radix::FetchRule {
+                    min_speedup: self.config.prompt_cache.min_fetch_speedup,
+                    prefill_secs_per_token: inner.prefill_rate.per_sec().map(|tok_per_sec| 1.0 / tok_per_sec),
+                    resume_floor: prefill_pos,
+                };
+                lookup_started = Instant::now();
                 inner
                     .kv_radix
-                    .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1))
+                    .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1), rule)
             };
+            let lookup_ms = lookup_started.elapsed().as_secs_f64() * 1e3;
             // A qwen4exp checkpoint whose hosted blocks' state the worker
             // has lost is a miss.
             let found = match found {
@@ -3298,7 +3316,18 @@ impl Engine {
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
                     resumed_draft = cp.draft.clone();
-                    restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
+                    let decode_started = Instant::now();
+                    let rows = cp.kv_rows();
+                    let decode_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                    let upload_started = Instant::now();
+                    restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
+                    tracing::info!(
+                        tokens = n,
+                        lookup_ms,
+                        decode_ms,
+                        upload_ms = upload_started.elapsed().as_secs_f64() * 1e3,
+                        "prompt cache: restored a checkpoint"
+                    );
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
                     } else if target.config.recurrent {
@@ -4551,7 +4580,23 @@ impl Engine {
         Ok(StepResult::Token(ev))
     }
 
+    /// [`Self::run_prefill_chunk`], timed for the prompt cache's
+    /// fetch-vs-recompute rule.
     fn prefill_chunk(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+    ) -> Result<(usize, usize), AllpacaError> {
+        let start = request(inner, id)?.prefill_pos;
+        let started = Instant::now();
+        let (done, total) = self.run_prefill_chunk(inner, id)?;
+        inner
+            .prefill_rate
+            .record(done.saturating_sub(start) as f64, started.elapsed().as_secs_f64());
+        Ok((done, total))
+    }
+
+    fn run_prefill_chunk(
         &self,
         inner: &mut EngineInner,
         id: u64,
@@ -4967,6 +5012,7 @@ impl Engine {
         inner.prompt_cache_key = Some(key);
         inner.prompt_cache_touch = None;
         inner.kv_radix.reset();
+        inner.prefill_rate = Default::default();
         let pc = &self.config.prompt_cache;
         // Its state is not part of a checkpoint file.
         if target.dsv4.is_some() || target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted()) {
@@ -10574,6 +10620,59 @@ mod tests {
         let stats = engine.stats();
         assert!(stats.radix_hits >= 1, "checkpoints on disk must serve a new engine; {stats:?}");
         assert_eq!(hit.token_ids, full.token_ids);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_reads_back_from_disk_only_when_faster_than_prefill() {
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let dir = std::env::temp_dir()
+            .join("allpaca_prompt_cache_tests")
+            .join(format!("fetch_rule_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = || {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg.prompt_cache.disk_dir = Some(dir.clone());
+            cfg
+        };
+        let cold = {
+            let mut cfg = test_config();
+            cfg.speculative.enabled = false;
+            Engine::new(cfg).unwrap().generate("hello world hello true", params.clone()).unwrap()
+        };
+        Engine::new(config()).unwrap().generate("hello world hello", params.clone()).unwrap();
+
+        // A new engine finds the checkpoint on disk only. A first request
+        // measures its prefill (it may read back the shared first token while
+        // nothing is measured yet); then the store's rate is set.
+        let run = |store_bytes_per_sec: f64| {
+            let engine = Engine::new(config()).unwrap();
+            engine.generate("true true", params.clone()).unwrap();
+            engine.lock().unwrap().kv_radix.store_rate.record(store_bytes_per_sec, 1.0);
+            let before = engine.stats();
+            let out = engine.generate("hello world hello true", params.clone()).unwrap();
+            let after = engine.stats();
+            let fetches = after.radix_fetches - before.radix_fetches;
+            let skips = after.radix_fetch_skips - before.radix_fetch_skips;
+            let skipped = after.radix_skip_tokens - before.radix_skip_tokens;
+            (out, fetches, skips, skipped)
+        };
+        let (slow, fetches, skips, _) = run(1.0);
+        assert_eq!(fetches, 0, "1 B/s: prefill wins");
+        assert!(skips >= 1);
+        assert_eq!(slow.token_ids, cold.token_ids, "recomputed == cold");
+        let (fast, fetches, skips, skipped) = run(1e15);
+        assert_eq!(fetches, 1, "a fast store is read back");
+        assert_eq!(skips, 0);
+        assert!(skipped >= 3, "skipped {skipped}");
+        assert_eq!(fast.token_ids, cold.token_ids, "restored == cold");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

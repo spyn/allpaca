@@ -167,6 +167,10 @@ pub struct Metrics {
     /// Packed residual stream (`x+WO+FFN`) written into Request `last_hidden`.
     pub batch_gemm_residual_hidden: AtomicU64,
     pub radix_evictions: AtomicU64,
+    /// Prompt-cache checkpoints read back from the disk tier or worker.
+    pub radix_fetches: AtomicU64,
+    /// Ones left there because prefilling their tokens was faster.
+    pub radix_fetch_skips: AtomicU64,
     pub radix_bytes: AtomicU64,
     pub gemv_tile_cols: AtomicU64,
     pub vram_rebalances: AtomicU64,
@@ -367,6 +371,8 @@ impl Metrics {
             batch_gemm_lm_head_skipped: self.batch_gemm_lm_head_skipped.load(Ordering::Relaxed),
             batch_gemm_residual_hidden: self.batch_gemm_residual_hidden.load(Ordering::Relaxed),
             radix_evictions: self.radix_evictions.load(Ordering::Relaxed),
+            radix_fetches: self.radix_fetches.load(Ordering::Relaxed),
+            radix_fetch_skips: self.radix_fetch_skips.load(Ordering::Relaxed),
             radix_bytes: self.radix_bytes.load(Ordering::Relaxed),
             gemv_tile_cols: self.gemv_tile_cols.load(Ordering::Relaxed),
             vram_rebalances: self.vram_rebalances.load(Ordering::Relaxed),

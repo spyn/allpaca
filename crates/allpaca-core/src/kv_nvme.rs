@@ -262,9 +262,16 @@ pub fn temp_kv_nvme_path() -> PathBuf {
     std::env::temp_dir().join(format!("allpaca-kv-{}-{id}.bin", std::process::id()))
 }
 
+/// The slot file, unbuffered when the platform allows: a buffered handle
+/// kept open for random page reads is slow on Windows.
 fn open_rw(path: &Path) -> Result<(File, bool), AllpacaError> {
-    if let Ok(file) = open_direct(path, true) {
-        return Ok((file, true));
+    match open_direct(path, true) {
+        Ok(file) => return Ok((file, true)),
+        Err(e) => tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "KV NVMe tier: unbuffered open failed, using a buffered handle"
+        ),
     }
     Ok((OpenOptions::new().read(true).write(true).open(path)?, false))
 }
@@ -283,5 +290,7 @@ mod tests {
         assert_eq!(got, data);
         assert!(store.writes() >= 1);
         assert!(store.reads() >= 1);
+        #[cfg(windows)]
+        assert!(store.is_direct(), "pages are read unbuffered on Windows");
     }
 }

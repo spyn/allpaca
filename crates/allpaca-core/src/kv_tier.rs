@@ -396,15 +396,44 @@ impl KvTierManager {
         k: &[f32],
         v: &[f32],
     ) -> Result<(), AllpacaError> {
+        self.write_slots(id, slot, n_kv_heads, head_dim, k, v)
+    }
+
+    /// Write consecutive rows from `first_slot` on: `k` and `v` hold one row
+    /// of `n_kv_heads * head_dim` values each after another. A page keeps
+    /// its rows' keys together and their values together, so this is one copy
+    /// for each, where a device page took two synchronous copies per row.
+    pub fn write_slots(
+        &mut self,
+        id: PageId,
+        first_slot: u32,
+        n_kv_heads: usize,
+        head_dim: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<(), AllpacaError> {
         self.ensure_dram(id)?;
         let page = self.pages.get(&id).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
         })?;
         let kv_width = n_kv_heads * head_dim;
-        let k_off = page.location.offset + slot as usize * kv_width;
+        let n = if kv_width == 0 { 0 } else { k.len() / kv_width };
+        if k.len() != n * kv_width || v.len() != k.len() || first_slot as usize + n > page.capacity_tokens as usize {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "KV page {id}: {} key / {} value floats from slot {first_slot} do not fit {} slots of {kv_width}",
+                k.len(),
+                v.len(),
+                page.capacity_tokens
+            ))));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let width = n * kv_width;
+        let k_off = page.location.offset + first_slot as usize * kv_width;
         let v_off = page.location.offset
             + page.capacity_tokens as usize * kv_width
-            + slot as usize * kv_width;
+            + first_slot as usize * kv_width;
         match page.location.kind {
             DeviceBufferKind::Hip => {
                 let alloc = self.hip_pages.get(&id).ok_or_else(|| {
@@ -412,7 +441,7 @@ impl KvTierManager {
                         "HIP KV page {id} missing device buffer"
                     )))
                 })?;
-                let k_bytes = kv_width * 4;
+                let k_bytes = width * 4;
                 let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
                 allpaca_hip::memcpy(k_ptr, k.as_ptr().cast(), k_bytes, allpaca_hip::MEMCPY_H2D)?;
@@ -426,7 +455,7 @@ impl KvTierManager {
                         "CUDA KV page {id} missing device buffer"
                     )))
                 })?;
-                let k_bytes = kv_width * 4;
+                let k_bytes = width * 4;
                 let k_ptr = unsafe { alloc.ptr.add(k_off * 4) };
                 let v_ptr = unsafe { alloc.ptr.add(v_off * 4) };
                 allpaca_cuda::memcpy(
@@ -461,12 +490,12 @@ impl KvTierManager {
                     .fetch_add((k.len() * 8) as u64, Ordering::Relaxed);
             }
             DeviceBufferKind::CpuVram => {
-                self.vram.slice_mut(k_off, kv_width).copy_from_slice(k);
-                self.vram.slice_mut(v_off, kv_width).copy_from_slice(v);
+                self.vram.slice_mut(k_off, width).copy_from_slice(k);
+                self.vram.slice_mut(v_off, width).copy_from_slice(v);
             }
             DeviceBufferKind::CpuPinnedDram => {
-                self.dram.slice_mut(k_off, kv_width).copy_from_slice(k);
-                self.dram.slice_mut(v_off, kv_width).copy_from_slice(v);
+                self.dram.slice_mut(k_off, width).copy_from_slice(k);
+                self.dram.slice_mut(v_off, width).copy_from_slice(v);
             }
             DeviceBufferKind::Nvme => {
                 return Err(AllpacaError::Fatal(FatalError::OutOfMemory(
@@ -475,7 +504,7 @@ impl KvTierManager {
             }
         }
         if let Some(page) = self.pages.get_mut(&id) {
-            page.filled = page.filled.max(slot + 1);
+            page.filled = page.filled.max(first_slot + n as u32);
         }
         self.prefetch_next(id);
         Ok(())
@@ -1748,6 +1777,50 @@ fn copy_f32(dst: &mut [f32], src: &[f32]) -> Result<(), AllpacaError> {
 mod tests {
     use super::*;
     use crate::telemetry::Metrics;
+
+    /// Rows written together land where rows written one at a time do.
+    fn write_slots_matches_row_by_row_on(mut kv: KvTierManager) {
+        let metrics = Metrics::default();
+        let (heads, head_dim) = (2usize, 4usize);
+        let width = heads * head_dim;
+        let rows = 5usize;
+        let k: Vec<f32> = (0..rows * width).map(|i| i as f32 * 0.5).collect();
+        let v: Vec<f32> = (0..rows * width).map(|i| -(i as f32) - 1.0).collect();
+        let together = kv.alloc_page(0, 0, 8, heads, head_dim, &metrics).unwrap();
+        let one_by_one = kv.alloc_page(0, 1, 8, heads, head_dim, &metrics).unwrap();
+        kv.write_slots(together, 2, heads, head_dim, &k, &v).unwrap();
+        let zero = vec![0.0f32; width];
+        for slot in 0..2u32 {
+            kv.write_slot(one_by_one, slot, heads, head_dim, &zero, &zero).unwrap();
+        }
+        for r in 0..rows {
+            let span = r * width..(r + 1) * width;
+            kv.write_slot(one_by_one, 2 + r as u32, heads, head_dim, &k[span.clone()], &v[span]).unwrap();
+        }
+        let a = kv.read_kv(together, heads, head_dim).unwrap();
+        let b = kv.read_kv(one_by_one, heads, head_dim).unwrap();
+        assert_eq!(a.0.len(), 7 * width, "filled up to slot 7");
+        assert_eq!(a.0[2 * width..], b.0[2 * width..]);
+        assert_eq!(a.1[2 * width..], b.1[2 * width..]);
+        assert!(
+            kv.write_slots(together, 6, heads, head_dim, &k, &v).is_err(),
+            "5 rows from slot 6 overflow an 8-slot page"
+        );
+    }
+
+    #[test]
+    fn write_slots_matches_row_by_row() {
+        write_slots_matches_row_by_row_on(KvTierManager::new(1 << 20, 1 << 20, 0.9));
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_write_slots_matches_row_by_row() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        write_slots_matches_row_by_row_on(KvTierManager::with_hip(1 << 20, 1 << 20, 0.9, Some(0)));
+    }
 
     #[test]
     fn rewind_filled_drops_tail_slots() {
