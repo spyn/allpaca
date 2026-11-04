@@ -363,7 +363,7 @@ impl Qwen4MtpProvider {
         let mut logits = vec![0.0f32; vocab];
         // The position of the next token the head runs.
         let mut pos = ctx.len();
-        let mut step = |token: u32, pos: usize, logits: &mut [f32], memory: &mut crate::qwen4exp::Qwen4Memory| {
+        let step = |token: u32, pos: usize, logits: &mut [f32], memory: &mut crate::qwen4exp::Qwen4Memory| {
             metrics.draft_gpu_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::qwen4exp::forward_qwen4_token(&self.model, token, pos, logits, memory)
         };
