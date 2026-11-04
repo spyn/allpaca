@@ -13,6 +13,10 @@ pub fn peak_gbs(device_name: &str) -> Option<f64> {
         Some(1024.0)
     } else if n.contains("3060") {
         Some(360.0)
+    } else if n.contains("3080 ti") {
+        Some(912.0)
+    } else if n.contains("3070 ti") {
+        Some(608.0)
     } else if n.contains("k80") || n.contains("tesla k80") {
         Some(240.0)
     } else {
@@ -73,6 +77,8 @@ mod tests {
         assert_eq!(peak_gbs("AMD Instinct MI50"), Some(1024.0));
         assert_eq!(peak_gbs("NVIDIA GeForce RTX 3060"), Some(360.0));
         assert_eq!(peak_gbs("Tesla K80"), Some(240.0));
+        assert_eq!(peak_gbs("NVIDIA GeForce RTX 3070 Ti"), Some(608.0));
+        assert_eq!(peak_gbs("NVIDIA GeForce RTX 3080 Ti"), Some(912.0));
         assert_eq!(peak_gbs("Mysterious GPU"), None);
         assert_eq!(peak_for("Mysterious GPU", 123.0), 123.0);
     }
