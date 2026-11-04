@@ -181,11 +181,29 @@ impl HostedModel {
         )
     }
 
-    fn clone_seq(&self, src: &HostedSeq, dst: &mut HostedSeq) -> Result<(), AllpacaError> {
-        let rows = crate::anchors::snapshot_kv(&src.kv, &src.pages, &self.model.config)?;
-        crate::anchors::restore_kv(&mut dst.kv, &dst.pages, &rows, &self.model.config)?;
+    /// Make `dst` continue exactly like `src`.
+    fn clone_seq(&self, src: &mut HostedSeq, dst: &mut HostedSeq) -> Result<(), AllpacaError> {
+        let cfg = &self.model.config;
+        // The live GDN state is on the device once a step has run there; the
+        // host copy is only what seeded it.
+        self.hip.gdn_sync_request_to_host(src.id, &mut src.recurrent.gdn_state)?;
+        self.hip.gdn_sync_conv_to_host(src.id, &mut src.recurrent.gdn_conv)?;
+        self.hip
+            .mamba2_sync_request_to_host(src.id, &mut src.recurrent.ssm_h, &mut src.recurrent.ssm_conv)?;
+        let rows = crate::anchors::snapshot_kv(&src.kv, &src.pages, cfg)?;
+        if let Some(len) = rows.iter().map(Vec::len).max().filter(|&n| n > 0) {
+            crate::model::ensure_pages(&mut dst.kv, cfg, 128, &mut dst.pages, len - 1, &self.metrics)?;
+        }
+        crate::anchors::restore_kv(&mut dst.kv, &dst.pages, &rows, cfg)?;
         dst.recurrent = src.recurrent.clone();
+        // `dst` seeds its device slots from that host copy on its next step.
+        self.hip.gdn_clear_request(dst.id);
         Ok(())
+    }
+
+    /// Free `seq`'s device GDN slots.
+    fn drop_seq(&self, seq: u64) {
+        self.hip.gdn_clear_request(seq);
     }
 }
 
@@ -225,7 +243,21 @@ struct SpanHost {
     device: i32,
 }
 
+impl Drop for SpanHost {
+    /// A connection that ends mid-upload leaves no partial file.
+    fn drop(&mut self) {
+        self.abandon_upload();
+    }
+}
+
 impl SpanHost {
+    /// Forget an unfinished upload and delete its partial file.
+    fn abandon_upload(&mut self) {
+        if let Some((path, ..)) = self.upload.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn upload_path(key: u64) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "allpaca-q3n-{}-{key:016x}.gguf",
@@ -251,7 +283,7 @@ impl SpanHost {
             Call::Begin { key, len, device } => {
                 self.seqs.clear();
                 self.model = None;
-                self.upload = None;
+                self.abandon_upload();
                 self.device = device;
                 if self.load_cached(key, len)? {
                     return Ok(vec![1]);
@@ -289,6 +321,7 @@ impl SpanHost {
                     return Err(err("q3n load before Begin".into()));
                 };
                 if received != len {
+                    let _ = std::fs::remove_file(&path);
                     return Err(err(format!(
                         "q3n upload has {received} bytes, expected {len}"
                     )));
@@ -333,8 +366,9 @@ impl SpanHost {
                 let Some(model) = &self.model else {
                     return Err(err("q3n clone before Load".into()));
                 };
-                let Some(source) = self.seqs.get(&src) else {
+                let Some(source) = self.seqs.get_mut(&src) else {
                     self.seqs.remove(&dst);
+                    model.drop_seq(dst);
                     return Ok(Vec::new());
                 };
                 let mut target = model.new_seq(dst)?;
@@ -344,6 +378,9 @@ impl SpanHost {
             }
             Call::DropSeq { seq } => {
                 self.seqs.remove(&seq);
+                if let Some(model) = &self.model {
+                    model.drop_seq(seq);
+                }
                 Ok(Vec::new())
             }
         }
@@ -363,10 +400,9 @@ impl allpaca_rpc::Extension for SpanHost {
 pub fn worker_extension(
     cache: Option<crate::qwen4_remote::WeightCache>,
 ) -> Box<dyn allpaca_rpc::Extension> {
-    Box::new(SpanHost {
-        cache,
-        ..SpanHost::default()
-    })
+    let mut host = SpanHost::default();
+    host.cache = cache;
+    Box::new(host)
 }
 
 #[derive(Debug)]
@@ -517,6 +553,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn abandoned_and_short_uploads_leave_no_files() {
+        let call = |c: &Call| serde_json::to_vec(c).unwrap();
+        let mut host = SpanHost::default();
+        let (first, second) = (0x5e_0001u64, 0x5e_0002u64);
+        host.serve(&call(&Call::Begin { key: first, len: 8, device: 0 }), &[]).unwrap();
+        host.serve(&call(&Call::Chunk { offset: 0 }), &[1, 2, 3]).unwrap();
+        assert!(SpanHost::upload_path(first).exists());
+        // A new upload replaces the unfinished one.
+        host.serve(&call(&Call::Begin { key: second, len: 8, device: 0 }), &[]).unwrap();
+        assert!(!SpanHost::upload_path(first).exists(), "the abandoned partial file is deleted");
+        host.serve(&call(&Call::Chunk { offset: 0 }), &[1, 2, 3]).unwrap();
+        assert!(SpanHost::upload_path(second).exists());
+        // Loading a short upload fails and deletes it.
+        assert!(host.serve(&call(&Call::Load), &[]).is_err());
+        assert!(!SpanHost::upload_path(second).exists(), "a short upload is deleted");
+    }
+
+    #[test]
     fn chunk_upload_cannot_pass_declared_length() {
         let mut host = SpanHost::default();
         let begin = serde_json::to_vec(&Call::Begin {
@@ -560,10 +614,8 @@ mod tests {
 
         let cache = crate::qwen4_remote::WeightCache::new(&dir, 1 << 30);
         cache.put(key, &bytes);
-        let mut host = SpanHost {
-            cache: Some(cache),
-            ..SpanHost::default()
-        };
+        let mut host = SpanHost::default();
+        host.cache = Some(cache);
         host.load_cached(key, len).unwrap();
         assert!(!SpanHost::upload_path(key).exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -683,15 +735,58 @@ mod tests {
         let mut reference = model.new_seq(3).unwrap();
         let mut x = input.clone();
         model.run(&mut accepted, 0, &mut x).unwrap();
-        model.clone_seq(&accepted, &mut rejected).unwrap();
-        model.clone_seq(&accepted, &mut reference).unwrap();
+        model.clone_seq(&mut accepted, &mut rejected).unwrap();
+        model.clone_seq(&mut accepted, &mut reference).unwrap();
         model.run(&mut rejected, 1, &mut x).unwrap();
-        model.clone_seq(&accepted, &mut rejected).unwrap();
+        model.clone_seq(&mut accepted, &mut rejected).unwrap();
         let mut restored = x.clone();
         let mut expected = x.clone();
         model.run(&mut rejected, 1, &mut restored).unwrap();
         model.run(&mut reference, 1, &mut expected).unwrap();
         assert_eq!(restored, expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A clone taken mid-sequence carries the live device GDN state and
+    /// keys and values past the first KV page.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn a_clone_past_the_first_page_carries_gdn_and_attention_state() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-clone-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_with(&source, 4, true);
+        let source_file = GgufFile::open(&source).unwrap();
+        let span = dir.join("span.gguf");
+        // Layer 0 is Gated DeltaNet, layer 1 full attention.
+        write_span_gguf(&span, &source_file, 0, 2).unwrap();
+        let model = HostedModel::load(&span, 0).unwrap();
+        let dim = model.model.config.dim;
+        let embed = source_file.tensor_f32("token_embd.weight").unwrap();
+        let vocab = embed.len() / dim;
+        let input = |pos: usize| embed[(pos % vocab) * dim..(pos % vocab + 1) * dim].to_vec();
+        let steps = 140; // past one 128-token page
+        let mut live = model.new_seq(1).unwrap();
+        let mut reference = model.new_seq(2).unwrap();
+        for pos in 0..steps {
+            let mut x = input(pos);
+            model.run(&mut live, pos, &mut x).unwrap();
+            let mut y = input(pos);
+            model.run(&mut reference, pos, &mut y).unwrap();
+        }
+        let mut copy = model.new_seq(3).unwrap();
+        model.clone_seq(&mut live, &mut copy).unwrap();
+        let mut from_copy = input(steps);
+        model.run(&mut copy, steps, &mut from_copy).unwrap();
+        let mut from_reference = input(steps);
+        model.run(&mut reference, steps, &mut from_reference).unwrap();
+        assert_eq!(from_copy, from_reference, "the copy continues like the original");
+        let mut from_live = input(steps);
+        model.run(&mut live, steps, &mut from_live).unwrap();
+        assert_eq!(from_live, from_reference, "cloning leaves the source as it was");
         let _ = std::fs::remove_dir_all(dir);
     }
 

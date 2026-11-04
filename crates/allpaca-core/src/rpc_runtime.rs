@@ -228,6 +228,29 @@ fn pinned_budget(pinned_mib: &[u64], slot: usize) -> Option<u64> {
     pinned_mib.get(slot).copied().filter(|m| *m > 0).map(|m| m << 20)
 }
 
+/// Worker GPU room a hosted layer span keeps beyond its weights: keys and
+/// values (64 MiB of VRAM per hosted sequence, a few sequences at once) and
+/// the hosted workspace's scratch. Estimated, not measured.
+const HOSTED_SPAN_RESERVE: u64 = 512 << 20;
+
+/// First layer of the longest run of the last of `n` layers that are
+/// `on_gpu` and whose bodies (`weights`, experts already charged) fit in
+/// `room` after [`HOSTED_SPAN_RESERVE`]. None when fewer than two fit.
+fn hosted_suffix_start(n: usize, on_gpu: impl Fn(usize) -> bool, weights: &[u64], room: u64) -> Option<usize> {
+    let mut room = room.checked_sub(HOSTED_SPAN_RESERVE)?;
+    let mut start = n;
+    while start > 0 {
+        let l = start - 1;
+        let need = weights.get(l).copied().unwrap_or(u64::MAX);
+        if !on_gpu(l) || need > room {
+            break;
+        }
+        room -= need;
+        start = l;
+    }
+    (n - start >= 2).then_some(start)
+}
+
 fn plan_local_by_bytes(
     model: &TinyModel,
     file: &GgufFile,
@@ -785,6 +808,9 @@ impl RpcRuntime {
         let cfg = &model.config;
         let n = model.layers.len();
         let (mut body, experts, globals) = crate::model::gguf_device_bytes_split(file, cfg);
+        // Weights only: a hosted span's keys and values live in the worker's
+        // own per-sequence budget ([`HOSTED_SPAN_RESERVE`]).
+        let body_weights = body.clone();
         let is_attn: Vec<bool> = model
             .layers
             .iter()
@@ -912,36 +938,38 @@ impl RpcRuntime {
             picks[l] = Some(o);
         }
         let hosted_start = self.extension_host(crate::qwen3next_remote::EXT).and_then(|(session, _)| {
-            if std::env::var("ALLPACA_Q3N_NO_HOST").ok().as_deref() == Some("1")
-                || std::env::var("ALLPACA_Q3N_HOST").ok().as_deref() != Some("1")
-            {
+            if std::env::var("ALLPACA_Q3N_HOST").ok().as_deref() != Some("1") {
                 return None;
             }
-            let mut start = n;
-            let device = (n > 0 && remote(n - 1)).then(|| owners[picks[n - 1].expect("last remote layer")].1);
-            while start > 0 {
-                let l = start - 1;
-                if remote(l)
-                    && device.is_some_and(|device| {
-                        picks[l].is_some_and(|o| owners[o].0 == session && owners[o].1 == device)
-                    })
-                {
-                    start = l;
-                } else {
-                    break;
-                }
+            // The last layer's worker GPU, which already holds the experts.
+            let last = picks[n.checked_sub(1)?]?;
+            if owners[last].0 != session {
+                return None;
             }
-            (n - start >= 2).then_some((session, start))
+            let on_gpu = |l: usize| remote(l) && picks[l] == Some(last);
+            let start = hosted_suffix_start(n, on_gpu, &body_weights, worker_free[last]);
+            if start.is_none() {
+                tracing::info!(
+                    free_mib = worker_free[last] >> 20,
+                    "expert-parallel: no room on the worker GPU to host a layer span"
+                );
+            }
+            Some((session, start?))
         });
         let mut hosted = vec![None; n];
         if let Some((session, start)) = hosted_start {
-            let device = owners[picks[start].expect("hosted layer placement")].1;
+            let device = picks[start].map(|o| owners[o].1).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!("expert-parallel: hosted layer {start} has no worker")))
+            })?;
             let path = std::env::temp_dir().join(format!(
                 "allpaca-q3n-span-{}-{start}-{n}.gguf",
                 std::process::id()
             ));
-            crate::qwen3next_remote::write_span_gguf(&path, file, start, n)?;
-            let span = crate::qwen3next_remote::RemoteSpan::from_gguf(self, session, device as i32, &path)?;
+            // The span file goes whether or not the upload worked.
+            let span = crate::qwen3next_remote::write_span_gguf(&path, file, start, n)
+                .and_then(|()| crate::qwen3next_remote::RemoteSpan::from_gguf(self, session, device as i32, &path));
+            let _ = std::fs::remove_file(&path);
+            let span = span?;
             for l in start..n {
                 hosted[l] = Some(HostedSpan {
                     session,
@@ -951,7 +979,6 @@ impl RpcRuntime {
                 });
                 layer_device[l] = -1;
             }
-            let _ = std::fs::remove_file(path);
             tracing::info!(session, device, start, end = n, "expert-parallel: whole layer span on rpc");
         }
         let mut remote_experts = vec![None; n];
@@ -960,7 +987,9 @@ impl RpcRuntime {
             if !remote(l) || hosted[l].is_some() {
                 continue;
             }
-            let (session, device) = owners[picks[l].expect("expert placement")];
+            let (session, device) = picks[l].map(|o| owners[o]).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!("expert-parallel: remote layer {l} has no worker")))
+            })?;
             remote_experts[l] = Some(self.upload_experts(file, cfg, l, session, device)?);
             remote_bytes += experts[l];
             tracing::info!(
@@ -1852,10 +1881,7 @@ impl RpcRuntime {
         let recurrent = recurrent.ok_or_else(|| {
             AllpacaError::Fatal(FatalError::InvalidConfig("hosted span needs recurrent state".into()))
         })?;
-        if recurrent.remote.is_none() {
-            recurrent.remote = Some(hosted.span.new_seq());
-        }
-        let seq = recurrent.remote.as_ref().expect("hosted remote sequence");
+        let seq = recurrent.remote.get_or_insert_with(|| hosted.span.new_seq());
         hosted.span.run_rows(seq, pos, x)
     }
 
@@ -2358,7 +2384,22 @@ fn memcpy_at(dst: BufId, src: BufId, dst_off: i32, nbytes: i32) -> LaunchItem {
 
 #[cfg(test)]
 mod tests {
-    use super::pinned_budget;
+    use super::{hosted_suffix_start, pinned_budget, HOSTED_SPAN_RESERVE};
+
+    #[test]
+    fn a_hosted_span_grows_only_while_its_bodies_fit_the_worker() {
+        const MIB: u64 = 1 << 20;
+        let weights = [100 * MIB; 6];
+        let all = |_: usize| true;
+        // Room for three bodies after the reserve: layers 3..6.
+        assert_eq!(hosted_suffix_start(6, all, &weights, HOSTED_SPAN_RESERVE + 350 * MIB), Some(3));
+        // Room for one body: no span.
+        assert_eq!(hosted_suffix_start(6, all, &weights, HOSTED_SPAN_RESERVE + 150 * MIB), None);
+        // Less than the reserve: no span.
+        assert_eq!(hosted_suffix_start(6, all, &weights, HOSTED_SPAN_RESERVE / 2), None);
+        // Stops at the first layer on another GPU.
+        assert_eq!(hosted_suffix_start(6, |l| l >= 4, &weights, u64::MAX), Some(4));
+    }
 
     #[test]
     fn pinned_budget_overrides_only_set_slots() {

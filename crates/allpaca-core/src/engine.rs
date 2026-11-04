@@ -7344,14 +7344,21 @@ fn packed_linear_verify_span(
     }
     // gemma4's state is K/V only: a reject truncates it (finish_linear_span).
     let g4 = target.g4.is_some();
-    let rec_before = if g4 { None } else { recurrent.clone() };
-    let pending_h = request(inner, id)?.last_hidden.clone();
+    // Layers hosted on a worker keep their state there, where no journal
+    // can rewind it.
+    let hosted = target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted());
     // One packed forward over the span when a partial accept can be rewound
-    // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots)
-    // forward one token at a time and stop at the reject, so no rewind is needed.
-    let journal_rewind = device_gdn_cloned > 0
+    // from the device GDN journal. Otherwise (host GDN state, Mamba-2 slots,
+    // hosted layers) forward one token at a time and stop at the reject, so
+    // no rewind is needed.
+    let journal_rewind = !hosted
+        && device_gdn_cloned > 0
         && hip.is_some_and(|h| gdn_all_can_replay(h, &target, id, 0));
     let incremental_gdn = recurrent.is_some() && !journal_rewind && !g4;
+    // Only the packed path restores the pre-span state; for a hosted
+    // sequence a copy is a worker round trip.
+    let rec_before = if g4 || incremental_gdn { None } else { recurrent.clone() };
+    let pending_h = request(inner, id)?.last_hidden.clone();
     let mut produced = vec![first];
     let mut accepted = 1u64;
     let mut keep = 1usize;
@@ -8927,6 +8934,161 @@ mod tests {
         assert_eq!(stats.rpc_activation_bytes, 1536);
     }
 
+    /// Held by tests that set `ALLPACA_Q3N_HOST`, which is process-wide.
+    #[cfg(feature = "hip")]
+    static Q3N_HOST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A tiny three-layer qwen35moe GGUF in `dir` (layer 2 copies layer 1).
+    /// Layer 1 is full attention when `attention`, else every layer is
+    /// Gated DeltaNet; no end-of-text token unless `eos`.
+    #[cfg(feature = "hip")]
+    fn three_layer_qwen35moe(dir: &std::path::Path, attention: bool, eos: bool) -> std::path::PathBuf {
+        use allpaca_gguf::{write_gguf_quant, GgufWriteQuantTensor};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let source = dir.join("source.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_with(&source, 4, attention);
+        let file = allpaca_gguf::GgufFile::open(&source).unwrap();
+        let three = dir.join("three.gguf");
+        let mut metadata = file.metadata.clone();
+        metadata.insert("qwen35moe.block_count".into(), allpaca_gguf::GgufValue::Uint32(3));
+        if !eos {
+            metadata.remove("tokenizer.ggml.eos_token_id");
+        }
+        let mut tensors = Vec::new();
+        for info in &file.tensors {
+            tensors.push(GgufWriteQuantTensor {
+                name: info.name.clone(),
+                dims: info.dims.clone(),
+                ggml_type: info.ggml_type,
+                bytes: file.tensor_bytes(&info.name).unwrap(),
+            });
+            if let Some(suffix) = info.name.strip_prefix("blk.1.") {
+                tensors.push(GgufWriteQuantTensor {
+                    name: format!("blk.2.{suffix}"),
+                    dims: info.dims.clone(),
+                    ggml_type: info.ggml_type,
+                    bytes: file.tensor_bytes(&info.name).unwrap(),
+                });
+            }
+        }
+        write_gguf_quant(&three, &metadata, &[], &tensors).unwrap();
+        three
+    }
+
+    /// Serve one RPC connection on a new local port from a HIP worker, with
+    /// the hosted-span extension when `hosted`.
+    #[cfg(feature = "hip")]
+    fn spawn_q3n_worker(hosted: bool) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use allpaca_rpc::{serve_connection_ext, WorkerBackend};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(allpaca_rpc::HipWorker::new(0).unwrap());
+            if hosted {
+                serve_connection_ext(stream, backend, None, vec![crate::qwen3next_remote::worker_extension(None)]).unwrap();
+            } else {
+                allpaca_rpc::serve_connection(stream, backend).unwrap();
+            }
+        });
+        (addr, worker)
+    }
+
+    /// A partly accepted draft must not leave the rejected rows in the
+    /// worker's KV or GDN state: speculative output equals plain decode
+    /// with the last two layers hosted on the worker.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hosted_span_partial_accept_matches_plain_decode() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-r3-partial-{}", std::process::id()));
+        // Every layer GDN: the hosted layers 1-2 keep recurrent state on the worker.
+        let three = three_layer_qwen35moe(&dir, false, false);
+        let params = GenerationParams {
+            max_tokens: 10,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        let prompt = "hello world again hello";
+        let mut local_cfg = test_config();
+        local_cfg.model.synthetic = false;
+        local_cfg.model.path = Some(three.clone());
+        local_cfg.speculative.enabled = false;
+        local_cfg.engine.cpu_only = false;
+        local_cfg.engine.gpu_backend = "hip".into();
+        let expected = Engine::new(local_cfg).unwrap().generate(prompt, params.clone()).unwrap().token_ids;
+        assert_eq!(expected.len(), 10, "no end-of-text token stops it: {expected:?}");
+        let vocab_wrong = |t: u32| if t == 0 { 1 } else { 0 };
+
+        let _env = Q3N_HOST_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("ALLPACA_Q3N_HOST", "1") };
+        let (addr, worker) = spawn_q3n_worker(true);
+        let mut cfg = test_config();
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(three.clone());
+        cfg.engine.cpu_only = false;
+        cfg.engine.gpu_backend = "hip".into();
+        cfg.engine.determinism_seed = Some(7);
+        cfg.speculative.enabled = true;
+        cfg.speculative.min_depth = 4;
+        cfg.speculative.max_depth = 4;
+        cfg.features.draft_model_speculation = Some(false);
+        cfg.features.ngram_speculation = Some(true);
+        cfg.rpc.endpoints = vec![addr.to_string()];
+        cfg.rpc.expert_homes = ["1".into(), "2".into()]
+            .into_iter()
+            .map(|layer| (layer, format!("rpc:{addr}/0")))
+            .collect();
+        let engine = Engine::new(cfg).unwrap();
+        assert!(
+            engine.lock().unwrap().target.as_ref().unwrap().rpc.as_ref().unwrap().has_hosted(),
+            "layers 1-2 hosted on the worker"
+        );
+        let mut handle = engine.begin_request(prompt, params).unwrap();
+        let mut ids = Vec::new();
+        let mut injected = false;
+        loop {
+            if !injected {
+                let mut inner = engine.lock().unwrap();
+                let ready = inner
+                    .active
+                    .get(&handle.id())
+                    .is_some_and(|a| a.prefill_pos >= a.prompt_len);
+                if ready {
+                    // Accept the first draft, reject the rest.
+                    let ctx = inner.active[&handle.id()].tokens.clone();
+                    let draft = vec![expected[1], vocab_wrong(expected[2]), vocab_wrong(expected[3]), vocab_wrong(expected[4])];
+                    let mut observed = ctx.clone();
+                    observed.extend_from_slice(&draft);
+                    inner.ngram.observe(&observed);
+                    inner.draft_ahead = Some(DraftAhead { ctx, tokens: draft });
+                    injected = true;
+                }
+            }
+            match engine.step(&mut handle).unwrap() {
+                allpaca_types::StepResult::Prefill { .. } => {}
+                allpaca_types::StepResult::Token(ev) => ids.push(ev.token_id),
+                allpaca_types::StepResult::Finished(_) => break,
+            }
+        }
+        let stats = engine.stats();
+        drop(handle);
+        drop(engine);
+        worker.join().unwrap();
+        unsafe { std::env::remove_var("ALLPACA_Q3N_HOST") };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            stats.draft_accepted >= 1 && stats.draft_accepted < stats.draft_proposed,
+            "a partial accept happened: {stats:?}"
+        );
+        assert_eq!(ids, expected, "hosted speculative == plain decode");
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn rpc_qwen3next_whole_span_matches_local_and_cuts_roundtrips() {
@@ -8986,6 +9148,7 @@ mod tests {
             .unwrap()
             .token_ids;
 
+        let _env = Q3N_HOST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let run = |hosted: bool| {
             if hosted {
                 unsafe { std::env::set_var("ALLPACA_Q3N_HOST", "1") };
@@ -9026,6 +9189,7 @@ mod tests {
         };
         let (separate, separate_trips, separate_chunks) = run(false);
         let (hosted, hosted_trips, hosted_chunks) = run(true);
+        unsafe { std::env::remove_var("ALLPACA_Q3N_HOST") };
         assert_eq!(separate.token_ids, expected);
         assert_eq!(hosted.token_ids, expected);
         assert!(hosted_trips < separate_trips, "hosted={hosted_trips} separate={separate_trips}");

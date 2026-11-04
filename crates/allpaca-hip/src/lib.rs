@@ -14523,7 +14523,7 @@ mod tests {
             for w in w8 {
                 device_free(w, staged.len());
             }
-            // R3: narrow-input Q8 projections must keep the same activation
+            // Narrow-input Q8 projections must keep the same activation
             // precision on gfx9 and gfx12.
             let (nn, kk) = (8192usize, 2048usize);
             let pn: Vec<u8> = (0..nn * kk / 32 * 34)
@@ -14550,7 +14550,7 @@ mod tests {
             for w in wn {
                 device_free(w, staged_n.len());
             }
-            // R3: the GDN alpha/beta projection uses fixed 32-lane sums.
+            // The GDN alpha/beta projection uses fixed 32-lane sums.
             let (nf, kf) = (64usize, 2048usize);
             let wf: Vec<f32> = (0..nf * kf).map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.01).collect();
             let wfs: Vec<*mut u8> = (0..ROTATE_BYTES.div_ceil(wf.len() * 4))
