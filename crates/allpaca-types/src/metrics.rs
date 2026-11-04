@@ -23,6 +23,21 @@ pub struct RpcWorkerCalls {
     /// Extension and raw stream bytes.
     pub ext_bytes_out: u64,
     pub ext_bytes_in: u64,
+    /// The same calls per operation: commands by name, extension calls as
+    /// `<extension>:<op>`.
+    #[serde(default)]
+    pub ops: Vec<RpcOpCalls>,
+}
+
+/// Calls of one operation to one RPC worker since connect. `calls` waited
+/// for their reply (`wait_us` in all); `posted` went out without waiting,
+/// their replies read by the next call that waits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcOpCalls {
+    pub op: String,
+    pub calls: u64,
+    pub posted: u64,
+    pub wait_us: u64,
 }
 
 /// In-memory telemetry snapshot exposed by `GET /stats`.

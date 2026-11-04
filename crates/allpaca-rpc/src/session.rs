@@ -1,7 +1,8 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::protocol::{
     check_hello, decode_hello_reply, encode_hello_req, encode_launch_list, read_reply,
@@ -29,6 +30,108 @@ impl CallCounters {
     }
 }
 
+/// Calls to one worker per operation since connect: commands by name
+/// (`MoeFfn`, `RunSpan`, ...), extension calls as `<extension>:<op>` where
+/// `<op>` is the first word of the head (the variant of a JSON enum).
+/// Readable while the session is busy (the lock is held only to add).
+#[derive(Debug, Default)]
+pub struct OpCounters(Mutex<BTreeMap<String, OpCount>>);
+
+/// One operation's calls: `calls` waited for their reply, `posted` did not
+/// ([`RpcSession::ext_post`]). `wait_us` is the coordinator's wait for the
+/// replies of `calls`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpCount {
+    pub op: String,
+    pub calls: u64,
+    pub posted: u64,
+    pub wait_us: u64,
+}
+
+impl OpCounters {
+    fn add(&self, op: &str, calls: u64, posted: u64, wait_us: u64) {
+        let Ok(mut map) = self.0.lock() else {
+            return;
+        };
+        let entry = map.entry(op.to_string()).or_insert_with(|| OpCount {
+            op: op.to_string(),
+            ..OpCount::default()
+        });
+        entry.calls += calls;
+        entry.posted += posted;
+        entry.wait_us += wait_us;
+    }
+
+    /// Every operation seen so far, by name.
+    pub fn snapshot(&self) -> Vec<OpCount> {
+        self.0
+            .lock()
+            .map(|map| map.values().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// The operation an extension call names: the first word of its head (a
+/// JSON enum's variant), else its first byte.
+fn ext_op(name: &str, head: &[u8]) -> String {
+    let text = head
+        .iter()
+        .position(|&b| b != b'{' && b != b'"')
+        .map(|start| &head[start..])
+        .unwrap_or(&[]);
+    let end = text
+        .iter()
+        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+        .unwrap_or(text.len());
+    match (end, head.first()) {
+        (0, Some(b)) => format!("{name}:op{b}"),
+        (0, None) => format!("{name}:"),
+        _ => format!("{name}:{}", String::from_utf8_lossy(&text[..end])),
+    }
+}
+
+/// What a call sent with [`RpcSession::ext_post`] came to. Known once a
+/// later call on the session has read its reply: every call that waits
+/// reads the posted replies before its own (the worker answers in order).
+#[derive(Debug, Clone, Default)]
+pub struct Posted(Arc<Mutex<Option<Result<(), String>>>>);
+
+impl Posted {
+    /// A handle for a call that has already been answered.
+    pub fn settled(outcome: Result<(), String>) -> Self {
+        Self(Arc::new(Mutex::new(Some(outcome))))
+    }
+
+    /// `None` while the reply is unread.
+    pub fn outcome(&self) -> Option<Result<(), String>> {
+        self.0.lock().ok().and_then(|o| o.clone())
+    }
+
+    /// The worker's error, once the reply is read and it was one.
+    pub fn failed(&self) -> Option<String> {
+        self.outcome().and_then(Result::err)
+    }
+
+    fn settle(&self, outcome: Result<(), String>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(outcome);
+        }
+    }
+}
+
+/// A reply the worker still owes, in the order the calls went out.
+#[derive(Debug)]
+enum Due {
+    /// [`RpcSession::ext_send`]: read by [`RpcSession::ext_recv`].
+    Wanted(String),
+    /// [`RpcSession::ext_post`]: read by whatever waits next.
+    Posted(String, Posted),
+}
+
+/// Posted replies left unread before a post reads them itself, so a
+/// session that only posts cannot fill the socket buffers.
+const MAX_POSTED: usize = 256;
+
 /// Coordinator-side TCP session to one `rpc-server`.
 pub struct RpcSession {
     stream: TcpStream,
@@ -44,6 +147,10 @@ pub struct RpcSession {
     /// Extension calls and raw streams: `wall_us` counts only the wait for
     /// each reply, since pipelined calls overlap.
     ext_calls: Arc<CallCounters>,
+    /// Calls per operation.
+    ops: Arc<OpCounters>,
+    /// Replies still owed for calls sent ahead, oldest first.
+    due: VecDeque<Due>,
 }
 
 impl RpcSession {
@@ -83,6 +190,8 @@ impl RpcSession {
             build_id: None,
             calls: Arc::default(),
             ext_calls: Arc::default(),
+            ops: Arc::default(),
+            due: VecDeque::new(),
         };
         session.handshake()?;
         Ok(session)
@@ -144,6 +253,32 @@ impl RpcSession {
     /// session in between. Keep what is in flight well under the socket
     /// buffers ([`SOCKET_BUFFER`]).
     pub fn ext_send(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
+        self.write_ext(name, head, data)?;
+        let op = ext_op(name, head);
+        self.ops.add(&op, 1, 0, 0);
+        self.due.push_back(Due::Wanted(op));
+        Ok(())
+    }
+
+    /// Send a call to the extension `name` whose reply nobody waits for.
+    /// The worker runs it before any call sent after it; the next call
+    /// that waits reads its reply first, and from then on the returned
+    /// handle tells how it went. For calls whose reply the next step does
+    /// not use (copying or dropping a sequence's state): whatever depends
+    /// on the call checks the handle after its own next reply.
+    pub fn ext_post(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<Posted, RpcError> {
+        if self.due.len() >= MAX_POSTED {
+            self.read_posted()?;
+        }
+        self.write_ext(name, head, data)?;
+        let op = ext_op(name, head);
+        self.ops.add(&op, 0, 1, 0);
+        let posted = Posted::default();
+        self.due.push_back(Due::Posted(op, posted.clone()));
+        Ok(posted)
+    }
+
+    fn write_ext(&mut self, name: &str, head: &[u8], data: &[u8]) -> Result<(), RpcError> {
         if !self.has_extension(name) {
             return Err(RpcError::Protocol(format!("extension {name} is not served")));
         }
@@ -153,11 +288,47 @@ impl RpcSession {
         crate::protocol::write_ext_request(&mut self.stream, name, head, data)
     }
 
-    /// The reply to the oldest call sent with [`Self::ext_send`].
+    /// Read the replies of posted calls at the front of the queue and
+    /// settle their handles; stop at a reply someone waits for. Errors
+    /// only on I/O: a failed call is reported on its handle.
+    fn read_posted(&mut self) -> Result<(), RpcError> {
+        while matches!(self.due.front(), Some(Due::Posted(..))) {
+            let Some(Due::Posted(op, posted)) = self.due.pop_front() else {
+                break;
+            };
+            let (status, body) = read_reply(&mut self.stream)?;
+            self.ext_calls.calls.fetch_add(1, Ordering::Relaxed);
+            self.ext_calls.bytes_in.fetch_add(body.len() as u64, Ordering::Relaxed);
+            if status == STATUS_OK {
+                posted.settle(Ok(()));
+            } else {
+                let error = String::from_utf8_lossy(&body).into_owned();
+                if Arc::strong_count(&posted.0) == 1 {
+                    tracing::warn!(op, error, endpoint = %self.endpoint, "a posted rpc call failed");
+                }
+                posted.settle(Err(error));
+            }
+        }
+        Ok(())
+    }
+
+    /// Read every posted reply the worker owes ahead of any reply someone
+    /// waits for. Errors only on I/O.
+    pub fn settle_posted(&mut self) -> Result<(), RpcError> {
+        self.read_posted()
+    }
+
+    /// The reply to the oldest call sent with [`Self::ext_send`]. Replies
+    /// of calls posted before it are read first.
     pub fn ext_recv(&mut self) -> Result<Vec<u8>, RpcError> {
         let started = std::time::Instant::now();
+        self.read_posted()?;
+        let Some(Due::Wanted(op)) = self.due.pop_front() else {
+            return Err(RpcError::Protocol("no extension reply is due".into()));
+        };
         let (status, body) = read_reply(&mut self.stream)?;
         self.ext_calls.add(started, 0, body.len());
+        self.ops.add(&op, 0, 0, started.elapsed().as_micros() as u64);
         if status != STATUS_OK {
             return Err(RpcError::Worker(String::from_utf8_lossy(&body).into_owned()));
         }
@@ -178,11 +349,25 @@ impl RpcSession {
         (Arc::clone(&self.calls), Arc::clone(&self.ext_calls))
     }
 
+    /// Calls per operation ([`OpCounters`]); the handle stays valid while
+    /// the session is busy.
+    pub fn op_counters(&self) -> Arc<OpCounters> {
+        Arc::clone(&self.ops)
+    }
+
     fn rpc(&mut self, cmd: Cmd, payload: &[u8]) -> Result<Vec<u8>, RpcError> {
+        if self.due.iter().any(|d| matches!(d, Due::Wanted(_))) {
+            return Err(RpcError::Protocol(format!(
+                "{cmd:?} sent while a pipelined extension reply is unread"
+            )));
+        }
         let started = std::time::Instant::now();
         write_request(&mut self.stream, cmd, payload)?;
+        // The worker answers in order: posted calls' replies come first.
+        self.read_posted()?;
         let (status, body) = read_reply(&mut self.stream)?;
         self.calls.add(started, payload.len(), body.len());
+        self.ops.add(&format!("{cmd:?}"), 1, 0, started.elapsed().as_micros() as u64);
         if status != STATUS_OK {
             return Err(RpcError::Worker(
                 String::from_utf8_lossy(&body).into_owned(),
@@ -341,8 +526,27 @@ impl RpcSession {
     }
 }
 
+impl Drop for RpcSession {
+    /// Read the replies still owed before closing: a socket closed with
+    /// unread data resets the connection, and the worker would see an
+    /// error instead of the end of the session.
+    fn drop(&mut self) {
+        if self.due.is_empty() {
+            return;
+        }
+        let _ = self.stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        while self.due.pop_front().is_some() {
+            if read_reply(&mut self.stream).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 impl Read for RpcSession {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A raw stream comes after the replies the worker already owes.
+        self.read_posted().map_err(std::io::Error::other)?;
         let n = self.stream.read(buf)?;
         self.ext_calls.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)

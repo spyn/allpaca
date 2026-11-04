@@ -419,6 +419,10 @@ pub struct RpcSection {
     /// (the worker keeps a scratch of this many rows per GPU). `0` sends one
     /// token per round trip.
     pub prefill_rows: usize,
+    /// Send calls whose reply the next step does not use (copying or
+    /// dropping a sequence's state on a worker) without waiting for it; a
+    /// failure fails that sequence's next call. `false` waits for each.
+    pub defer_replies: bool,
     /// Shared HELLO secret (`--rpc-token` / `ALLPACA_RPC_TOKEN`). Empty = loopback workers only.
     #[serde(default)]
     pub token: Option<String>,
@@ -437,6 +441,7 @@ impl Default for RpcSection {
             tensor_split: None,
             max_seq: 0,
             prefill_rows: 128,
+            defer_replies: true,
             token: None,
             expert_homes: BTreeMap::new(),
         }

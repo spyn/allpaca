@@ -651,6 +651,7 @@ impl Engine {
                 },
             )?;
             rt.apply_hello_to_inventory(&mut inventory.devices)?;
+            rt.set_defer_replies(config.rpc.defer_replies);
             Some(Arc::new(rt))
         };
         let mut flags = FeatureFlags::from_mode(inventory.pipeline_mode);

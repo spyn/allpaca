@@ -23,6 +23,11 @@ pub struct RpcRuntime {
     builds: Vec<Option<String>>,
     /// Each session's call counters, readable while the session is busy.
     counters: Vec<(Arc<allpaca_rpc::CallCounters>, Arc<allpaca_rpc::CallCounters>)>,
+    /// Each session's calls per operation, readable while it is busy.
+    op_counters: Vec<Arc<allpaca_rpc::OpCounters>>,
+    /// `rpc.defer_replies`: calls whose reply the next step does not use go
+    /// out without waiting for it ([`Self::ext_post`]).
+    defer_replies: std::sync::atomic::AtomicBool,
     plan: Mutex<LayerPlan>,
     remote: Mutex<Vec<Option<RemoteLayer>>>,
     /// Whole hybrid layers hosted as one contiguous worker span.
@@ -338,12 +343,15 @@ impl RpcRuntime {
             sessions.push(session);
         }
         let counters = sessions.iter().map(RpcSession::counters).collect();
+        let op_counters = sessions.iter().map(RpcSession::op_counters).collect();
         let builds = sessions.iter().map(|s| s.build_id().map(str::to_string)).collect();
         Ok(Self {
             sessions: Mutex::new(sessions),
             endpoints: endpoints.to_vec(),
             builds,
             counters,
+            op_counters,
+            defer_replies: std::sync::atomic::AtomicBool::new(true),
             plan: Mutex::new(LayerPlan::all_local(0)),
             remote: Mutex::new(Vec::new()),
             hosted: Mutex::new(Vec::new()),
@@ -415,7 +423,8 @@ impl RpcRuntime {
         self.endpoints
             .iter()
             .zip(&self.counters)
-            .map(|(endpoint, (calls, ext))| allpaca_types::RpcWorkerCalls {
+            .zip(&self.op_counters)
+            .map(|((endpoint, (calls, ext)), ops)| allpaca_types::RpcWorkerCalls {
                 endpoint: endpoint.clone(),
                 calls: load(&calls.calls),
                 wall_us: load(&calls.wall_us),
@@ -425,6 +434,16 @@ impl RpcRuntime {
                 ext_wait_us: load(&ext.wall_us),
                 ext_bytes_out: load(&ext.bytes_out),
                 ext_bytes_in: load(&ext.bytes_in),
+                ops: ops
+                    .snapshot()
+                    .into_iter()
+                    .map(|o| allpaca_types::RpcOpCalls {
+                        op: o.op,
+                        calls: o.calls,
+                        posted: o.posted,
+                        wait_us: o.wait_us,
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -1137,6 +1156,43 @@ impl RpcRuntime {
             .get_mut(session)
             .ok_or_else(|| AllpacaError::Fatal(FatalError::InvalidConfig(format!("no rpc session {session}"))))?;
         f(session)
+    }
+
+    /// `rpc.defer_replies`: whether [`Self::ext_post`] waits for replies.
+    pub fn set_defer_replies(&self, defer: bool) {
+        self.defer_replies.store(defer, Ordering::Relaxed);
+    }
+
+    /// A call to the extension `name` of worker `session` whose reply the
+    /// next step does not use: it goes out without waiting, and the
+    /// returned handle tells how it went once a later call on that worker
+    /// has waited for its own reply (the worker answers in order, so that
+    /// call runs after it). With `rpc.defer_replies` off it waits here and
+    /// the handle is settled already.
+    pub fn ext_post(
+        &self,
+        session: usize,
+        name: &str,
+        head: &[u8],
+        data: &[u8],
+    ) -> Result<allpaca_rpc::Posted, AllpacaError> {
+        if !self.defer_replies.load(Ordering::Relaxed) {
+            return Ok(match self.ext(session, name, head, data) {
+                Ok(_) => allpaca_rpc::Posted::settled(Ok(())),
+                Err(e) => allpaca_rpc::Posted::settled(Err(e.to_string())),
+            });
+        }
+        self.with_session(session, |s| {
+            let posted = s.ext_post(name, head, data).map_err(map_rpc)?;
+            self.h2d_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            Ok(posted)
+        })
+    }
+
+    /// Read the replies of every call posted to worker `session`, so their
+    /// handles are settled. Only I/O errors are returned.
+    pub fn settle_posted(&self, session: usize) -> Result<(), AllpacaError> {
+        self.with_session(session, |s| s.settle_posted().map_err(map_rpc))
     }
 
     /// One call to the extension `name` of worker `session`.

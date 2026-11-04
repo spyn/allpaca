@@ -21,7 +21,7 @@ pub use protocol::{
     SOCKET_BUFFER,
     PROTO_MAJOR, PROTO_MINOR, PROTO_PATCH, STATUS_ERR, STATUS_OK,
 };
-pub use session::{CallCounters, RpcSession};
+pub use session::{CallCounters, OpCount, OpCounters, Posted, RpcSession};
 pub use worker::{
     serve_connection, serve_connection_ext, serve_connection_with_token, serve_listener,
     serve_listener_ext, serve_listener_with_token, serve_tcp, CpuWorker, Extension, WorkerBackend,
@@ -316,6 +316,112 @@ mod tests {
         // A reply that ends at the device list is from a worker without either.
         let old = encode_hello_reply(client.hello());
         assert_eq!(crate::protocol::decode_hello_tail(&old).unwrap(), (Vec::new(), None));
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    /// An extension that logs every call's head and sleeps on `sleep`.
+    struct Logger(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl Extension for Logger {
+        fn name(&self) -> &str {
+            "log"
+        }
+        fn call(&mut self, head: &[u8], _data: &[u8]) -> Result<Vec<u8>, String> {
+            let head = String::from_utf8_lossy(head).into_owned();
+            self.0.lock().unwrap().push(head.clone());
+            match head.as_str() {
+                "sleep" => std::thread::sleep(std::time::Duration::from_millis(300)),
+                "fail" => return Err("asked to fail".into()),
+                _ => {}
+            }
+            Ok(head.into_bytes())
+        }
+    }
+
+    fn serve_logger() -> (RpcSession, std::sync::Arc<std::sync::Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ext = Logger(log.clone());
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection_ext(stream, WorkerBackend::Cpu(CpuWorker::new(1 << 20)), None, vec![Box::new(ext)]).unwrap();
+        });
+        (RpcSession::connect_addr(&addr.to_string()).unwrap(), log, worker)
+    }
+
+    /// A call whose reply nobody needs goes out without waiting for it; the
+    /// worker still runs calls in the order they were sent, and the next
+    /// call that waits reads the posted replies first.
+    #[test]
+    fn posted_calls_do_not_wait_and_keep_their_order() {
+        let (mut client, log, worker) = serve_logger();
+        let started = std::time::Instant::now();
+        let slow = client.ext_post("log", b"sleep", &[]).unwrap();
+        let quick = client.ext_post("log", b"a", &[]).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "posting must not wait for the worker ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(slow.outcome(), None, "nothing has read the reply yet");
+        assert_eq!(client.ext("log", b"b", &[]).unwrap(), b"b");
+        assert_eq!(slow.outcome(), Some(Ok(())));
+        assert_eq!(quick.outcome(), Some(Ok(())));
+        assert_eq!(*log.lock().unwrap(), ["sleep", "a", "b"]);
+        // A plain command reads posted replies too.
+        let posted = client.ext_post("log", b"c", &[]).unwrap();
+        client.mem_info().unwrap();
+        assert_eq!(posted.outcome(), Some(Ok(())));
+        // So does the next pipelined reply.
+        let posted = client.ext_post("log", b"d", &[]).unwrap();
+        client.ext_send("log", b"e", &[]).unwrap();
+        assert_eq!(client.ext_recv().unwrap(), b"e");
+        assert_eq!(posted.outcome(), Some(Ok(())));
+        // A session closed with posted replies unread still ends cleanly
+        // for the worker (no connection reset).
+        drop(client.ext_post("log", b"last", &[]).unwrap());
+        drop(client);
+        worker.join().unwrap();
+        assert_eq!(log.lock().unwrap().last().map(String::as_str), Some("last"));
+    }
+
+    /// A posted call that fails reports it on its handle once the next call
+    /// that waits has read the reply; that call's own result is unaffected.
+    #[test]
+    fn a_failed_posted_call_is_reported_at_the_next_reply() {
+        let (mut client, _log, worker) = serve_logger();
+        let failed = client.ext_post("log", b"fail", &[]).unwrap();
+        assert_eq!(failed.failed(), None, "not known before a reply is read");
+        assert_eq!(client.ext("log", b"x", &[]).unwrap(), b"x");
+        let error = failed.failed().expect("the failure is known after the next reply");
+        assert!(error.contains("asked to fail"), "{error}");
+        // A dropped handle's failure only logs; the session goes on.
+        drop(client.ext_post("log", b"fail", &[]).unwrap());
+        assert_eq!(client.ext("log", b"y", &[]).unwrap(), b"y");
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    /// Calls are counted per operation: commands by name, extension calls by
+    /// extension and the first word of their head; posted calls apart.
+    #[test]
+    fn session_counts_calls_per_operation() {
+        let (mut client, _log, worker) = serve_logger();
+        let ops = client.op_counters();
+        client.mem_info().unwrap();
+        client.ext("log", br#"{"Run":{"seq":1}}"#, &[]).unwrap();
+        client.ext("log", br#"{"Run":{"seq":2}}"#, &[]).unwrap();
+        drop(client.ext_post("log", br#"{"CloneSeq":{"src":1,"dst":2}}"#, &[]).unwrap());
+        drop(client.ext_post("log", br#""Load""#, &[]).unwrap());
+        client.sync().unwrap();
+        let snap: std::collections::BTreeMap<String, (u64, u64)> =
+            ops.snapshot().into_iter().map(|o| (o.op, (o.calls, o.posted))).collect();
+        assert_eq!(snap["MemInfo"], (1, 0));
+        assert_eq!(snap["Sync"], (1, 0));
+        assert_eq!(snap["log:Run"], (2, 0));
+        assert_eq!(snap["log:CloneSeq"], (0, 1));
+        assert_eq!(snap["log:Load"], (0, 1));
         drop(client);
         worker.join().unwrap();
     }

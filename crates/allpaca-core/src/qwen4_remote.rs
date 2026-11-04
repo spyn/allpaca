@@ -383,6 +383,12 @@ impl RemoteBlocks {
         self.rt.ext(self.session, EXT, &head, data)
     }
 
+    /// A call whose reply the next step does not use ([`RpcRuntime::ext_post`]).
+    fn post(&self, call: &Call) -> Result<allpaca_rpc::Posted, AllpacaError> {
+        let head = serde_json::to_vec(call).map_err(|e| err(format!("qwen4exp block call: {e}")))?;
+        self.rt.ext_post(self.session, EXT, &head, &[])
+    }
+
     /// The hosted blocks, in the order they run.
     pub fn blocks(&self) -> &[usize] {
         &self.blks
@@ -391,12 +397,14 @@ impl RemoteBlocks {
     /// Keep a copy of `seq` after its first `tokens` tokens on the worker,
     /// for the prompt cache. `None` when the worker has no room for it.
     pub fn save(self: &Arc<Self>, seq: &RemoteSeq, tokens: usize) -> Result<Option<RemoteSaved>, AllpacaError> {
-        if seq.lost {
+        if seq.check().is_err() {
             return Ok(None);
         }
         let id = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let reply = self.call(&Call::SaveSeq { seq: seq.id, id, tokens }, &[])?;
-        Ok((reply.first() == Some(&1)).then(|| RemoteSaved { host: self.clone(), id }))
+        let saved = (reply.first() == Some(&1)).then(|| RemoteSaved { host: self.clone(), id });
+        // The copy this state came from failed: what was kept is nothing.
+        Ok(saved.filter(|_| seq.check().is_ok()))
     }
 
     /// A new sequence that starts from `saved`. `None` when the worker no
@@ -413,16 +421,19 @@ impl RemoteBlocks {
             host: self.clone(),
             id: self.next_seq.fetch_add(1, Ordering::Relaxed),
             lost: false,
+            copies: Vec::new(),
         }
     }
 
     /// Run the hosted blocks on the streams of `rows` tokens from `pos` of
     /// `seq`, in place: one round trip.
     pub fn run(&self, seq: &RemoteSeq, pos: usize, rows: usize, streams: &mut [f32]) -> Result<(), AllpacaError> {
-        if seq.lost {
-            return Err(err("qwen4exp: this sequence's state on the worker was lost".into()));
-        }
-        let reply = self.call(&Call::Run { seq: seq.id, pos, rows }, &bytes_of(streams))?;
+        seq.check()?;
+        let reply = self.call(&Call::Run { seq: seq.id, pos, rows }, &bytes_of(streams));
+        // Waiting for this reply read the replies of the copies posted
+        // before it: a failed one means the worker ran this on no state.
+        seq.check()?;
+        let reply = reply?;
         if reply.len() != streams.len() * 4 {
             return Err(err(format!("qwen4exp block run: {} reply bytes", reply.len())));
         }
@@ -442,13 +453,12 @@ impl RemoteBlocks {
         self.rt.with_session(self.session, |session| {
             let mut pipe = Pipe {
                 session,
-                in_flight: 0,
+                in_flight: std::collections::VecDeque::new(),
                 roundtrips: &self.rt.roundtrips,
             };
             let out = f(&mut pipe);
             // Leave nothing unread: the next call would take it for its reply.
-            while pipe.in_flight > 0 {
-                pipe.in_flight -= 1;
+            while pipe.in_flight.pop_front().is_some() {
                 let _ = pipe.session.ext_recv();
             }
             out
@@ -463,30 +473,30 @@ pub const PIPE_BYTES: usize = allpaca_rpc::SOCKET_BUFFER / 4;
 /// The worker's connection while passes are in flight.
 pub struct Pipe<'a> {
     session: &'a mut allpaca_rpc::RpcSession,
-    in_flight: usize,
+    /// Per pass in flight, the posted copies its sequence's state needs.
+    in_flight: std::collections::VecDeque<Vec<allpaca_rpc::Posted>>,
     roundtrips: &'a AtomicU64,
 }
 
 impl Pipe<'_> {
     /// Hand the worker the streams of `rows` tokens from `pos` of `seq`.
     pub fn send(&mut self, seq: &RemoteSeq, pos: usize, rows: usize, streams: &[f32]) -> Result<(), AllpacaError> {
-        if seq.lost {
-            return Err(err("qwen4exp: this sequence's state on the worker was lost".into()));
-        }
+        seq.check()?;
         let head = serde_json::to_vec(&Call::Run { seq: seq.id, pos, rows })
             .map_err(|e| err(format!("qwen4exp block call: {e}")))?;
         self.session.ext_send(EXT, &head, &bytes_of(streams)).map_err(crate::rpc_runtime::map_rpc)?;
-        self.in_flight += 1;
+        self.in_flight.push_back(seq.copies.clone());
         Ok(())
     }
 
     /// The streams of the oldest pass in flight, after the hosted blocks.
     pub fn recv(&mut self, streams: &mut [f32]) -> Result<(), AllpacaError> {
-        if self.in_flight == 0 {
+        let Some(copies) = self.in_flight.pop_front() else {
             return Err(err("qwen4exp: no pass is in flight".into()));
-        }
-        self.in_flight -= 1;
-        let reply = self.session.ext_recv().map_err(crate::rpc_runtime::map_rpc)?;
+        };
+        let reply = self.session.ext_recv().map_err(crate::rpc_runtime::map_rpc);
+        check_copies(&copies)?;
+        let reply = reply?;
         if reply.len() != streams.len() * 4 {
             return Err(err(format!("qwen4exp block run: {} reply bytes", reply.len())));
         }
@@ -513,7 +523,16 @@ impl RemoteSaved {
 
 impl Drop for RemoteSaved {
     fn drop(&mut self) {
-        let _ = self.host.call(&Call::DropSaved { id: self.id }, &[]);
+        // Nothing waits for it; a failure only leaves the copy on the worker.
+        let _ = self.host.post(&Call::DropSaved { id: self.id });
+    }
+}
+
+/// Fails when one of the posted copies a sequence's state comes from failed.
+fn check_copies(copies: &[allpaca_rpc::Posted]) -> Result<(), AllpacaError> {
+    match copies.iter().find_map(allpaca_rpc::Posted::failed) {
+        Some(e) => Err(err(format!("qwen4exp: a deferred sequence copy failed on the worker: {e}"))),
+        None => Ok(()),
     }
 }
 
@@ -523,26 +542,127 @@ impl Drop for RemoteSaved {
 pub struct RemoteSeq {
     host: Arc<RemoteBlocks>,
     id: u64,
-    /// The copy on the worker failed: the sequence cannot go on.
+    /// The copy on the worker could not be sent: the sequence cannot go on.
     lost: bool,
+    /// The posted copies this state comes from (its own and its source's)
+    /// whose replies were not yet read as successes: a failure means the
+    /// worker has no state for this sequence.
+    copies: Vec<allpaca_rpc::Posted>,
+}
+
+impl RemoteSeq {
+    /// Fails when the state on the worker is known to be missing.
+    fn check(&self) -> Result<(), AllpacaError> {
+        if self.lost {
+            return Err(err("qwen4exp: this sequence's state on the worker was lost".into()));
+        }
+        check_copies(&self.copies)
+    }
 }
 
 impl Clone for RemoteSeq {
+    /// The copy is posted: the worker makes it before the next call, and
+    /// the copy's next pass fails if it could not.
     fn clone(&self) -> Self {
         let mut copy = self.host.new_seq();
-        copy.lost = self.lost
-            || self
-                .host
-                .call(&Call::CloneSeq { src: self.id, dst: copy.id }, &[])
-                .inspect_err(|e| tracing::warn!(error = %e, "qwen4exp: copying a sequence on the worker failed"))
-                .is_err();
+        if self.check().is_err() {
+            copy.lost = true;
+            return copy;
+        }
+        // With `rpc.defer_replies` off the reply is in already.
+        let posted = self.host.post(&Call::CloneSeq { src: self.id, dst: copy.id }).and_then(|posted| match posted.failed() {
+            Some(e) => Err(err(e)),
+            None => Ok(posted),
+        });
+        match posted {
+            Ok(posted) => {
+                copy.copies = self
+                    .copies
+                    .iter()
+                    .filter(|p| p.outcome().is_none())
+                    .cloned()
+                    .chain(std::iter::once(posted))
+                    .collect();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "qwen4exp: copying a sequence on the worker failed");
+                copy.lost = true;
+            }
+        }
         copy
     }
 }
 
 impl Drop for RemoteSeq {
     fn drop(&mut self) {
-        // A dead connection has dropped the state already.
-        let _ = self.host.call(&Call::DropSeq { seq: self.id }, &[]);
+        // Nothing waits for it. A dead connection has dropped the state already.
+        let _ = self.host.post(&Call::DropSeq { seq: self.id });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worker serving only `q4x-blocks` with no blocks begun (every
+    /// sequence call fails) and the coordinator's end of it.
+    fn unbegun_blocks() -> (Arc<RpcRuntime>, Arc<RemoteBlocks>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = allpaca_rpc::WorkerBackend::Cpu(allpaca_rpc::CpuWorker::new(1 << 20));
+            allpaca_rpc::serve_connection_ext(stream, backend, None, vec![worker_extension(None)]).unwrap();
+        });
+        let rt = Arc::new(RpcRuntime::connect(&[addr.to_string()], None).unwrap());
+        let host = Arc::new(RemoteBlocks {
+            rt: rt.clone(),
+            session: 0,
+            blks: Vec::new(),
+            next_seq: AtomicU64::new(1),
+            cached: AtomicBool::new(false),
+            cache_bytes: AtomicU64::new(0),
+        });
+        (rt, host, worker)
+    }
+
+    fn op_calls(rt: &RpcRuntime, op: &str) -> (u64, u64) {
+        rt.worker_calls()[0].ops.iter().find(|o| o.op == op).map_or((0, 0), |o| (o.calls, o.posted))
+    }
+
+    /// Copying and dropping a sequence's state, and dropping a saved one,
+    /// go out without waiting for the reply (Q19). A copy that failed on
+    /// the worker fails the copy's next pass, alone or pipelined.
+    #[test]
+    fn sequence_copies_are_posted_and_a_failed_copy_fails_its_next_pass() {
+        let (rt, host, worker) = unbegun_blocks();
+        let seq = host.new_seq();
+        let copy = seq.clone();
+        assert_eq!(op_calls(&rt, "q4x-blocks:CloneSeq"), (0, 1), "the copy is posted");
+        let mut streams = vec![0.0f32; 8];
+        let error = host.run(&copy, 0, 1, &mut streams).unwrap_err().to_string();
+        assert!(
+            error.contains("sequence copy failed") && error.contains("before Begin"),
+            "the copy's pass reports the failed copy: {error}"
+        );
+        let other = seq.clone();
+        let error = host
+            .pipeline(|pipe| {
+                pipe.send(&other, 0, 1, &streams)?;
+                pipe.recv(&mut streams)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sequence copy failed"), "pipelined: {error}");
+        drop(RemoteSaved { host: host.clone(), id: 77 });
+        drop((copy, other));
+        assert_eq!(op_calls(&rt, "q4x-blocks:DropSaved"), (0, 1));
+        assert_eq!(op_calls(&rt, "q4x-blocks:DropSeq"), (0, 2));
+        // A save of a sequence whose copy failed is no save.
+        let copy = seq.clone();
+        rt.settle_posted(0).unwrap();
+        assert!(host.save(&copy, 1).unwrap().is_none());
+        drop((seq, copy, host, rt));
+        worker.join().unwrap();
     }
 }

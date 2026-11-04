@@ -79,6 +79,73 @@ pub struct Sample {
     /// From `/stats` `exactness`: `exact`, `distribution-exact`, or `lossy`.
     #[serde(default = "exact_default")]
     pub exactness: String,
+    /// RPC calls per operation, all workers together, while this request
+    /// ran (for concurrent requests: the group, on its first sample only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpc_ops: Vec<RpcOpDelta>,
+    /// Tokens the server generated over the same window as `rpc_ops`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rpc_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// One RPC operation's calls over a window, from two `/stats` reads:
+/// `calls` waited for their reply (`wait_us` in all), `posted` did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcOpDelta {
+    pub op: String,
+    pub calls: u64,
+    pub posted: u64,
+    pub wait_us: u64,
+}
+
+/// `/stats` `tokens_generated` and the RPC calls per operation summed over
+/// every worker, `None` when the server has no RPC workers.
+type RpcReading = (u64, std::collections::BTreeMap<String, (u64, u64, u64)>);
+
+fn read_rpc(target: &Target) -> Option<RpcReading> {
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build().ok()?;
+    let body: serde_json::Value = client
+        .get(format!("{}/stats", target.url.trim_end_matches('/')))
+        .bearer_auth(&target.key)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .ok()?;
+    let workers = body.get("rpc_workers")?.as_array()?;
+    if workers.is_empty() {
+        return None;
+    }
+    let mut ops = std::collections::BTreeMap::new();
+    for op in workers.iter().filter_map(|w| w.get("ops")?.as_array()).flatten() {
+        let n = |k: &str| op.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let Some(name) = op.get("op").and_then(|v| v.as_str()) else { continue };
+        let e: &mut (u64, u64, u64) = ops.entry(name.to_string()).or_default();
+        (e.0, e.1, e.2) = (e.0 + n("calls"), e.1 + n("posted"), e.2 + n("wait_us"));
+    }
+    Some((body.get("tokens_generated").and_then(|v| v.as_u64()).unwrap_or(0), ops))
+}
+
+/// What happened between two readings.
+fn rpc_delta(before: &RpcReading, after: &RpcReading) -> (u64, Vec<RpcOpDelta>) {
+    let ops = after
+        .1
+        .iter()
+        .filter_map(|(op, a)| {
+            let b = before.1.get(op).copied().unwrap_or_default();
+            let d = RpcOpDelta {
+                op: op.clone(),
+                calls: a.0.saturating_sub(b.0),
+                posted: a.1.saturating_sub(b.1),
+                wait_us: a.2.saturating_sub(b.2),
+            };
+            (d.calls + d.posted > 0).then_some(d)
+        })
+        .collect();
+    (after.0.saturating_sub(before.0), ops)
 }
 
 fn exact_default() -> String {
@@ -201,6 +268,7 @@ pub fn run(
         }
     };
     let exactness = fetch_exactness(target).unwrap_or_else(|_| "exact".into());
+    let mut rpc_before = read_rpc(target);
     let concurrency = concurrency.max(1);
     let mut samples = Vec::new();
     for round in first_round..first_round + rounds {
@@ -213,8 +281,15 @@ pub fn run(
                     .map(|(p, h)| (p, h.join().unwrap_or_else(|_| Err("request thread panicked".into()))))
                     .collect()
             });
+            let rpc_after = rpc_before.as_ref().and_then(|_| read_rpc(target));
+            let mut rpc = match (&rpc_before, &rpc_after) {
+                (Some(b), Some(a)) => Some(rpc_delta(b, a)),
+                _ => None,
+            };
+            rpc_before = rpc_after;
             for (prompt, result) in results {
                 let (first_token_s, pieces, rate, sha) = result?;
+                let (rpc_tokens, rpc_ops) = rpc.take().unwrap_or_default();
                 let mut sample = Sample {
                     tag: tag.to_string(),
                     round,
@@ -231,6 +306,8 @@ pub fn run(
                     weights_unknown: false,
                     devices: Vec::new(),
                     exactness: exactness.clone(),
+                    rpc_ops,
+                    rpc_tokens,
                 };
                 if let Some(snap) = &snap {
                     apply_snap(&mut sample, snap);
@@ -539,13 +616,57 @@ pub fn roofline_table(starts: &[FreshStart]) -> String {
     out
 }
 
-/// Rate summary plus roofline fresh-start lines when bytes were recorded.
+/// RPC calls per generated token by operation, per tag: `blocking` calls
+/// waited for their reply, `posted` ones did not.
+pub fn rpc_table(samples: &[Sample]) -> String {
+    let mut tags: Vec<&str> = Vec::new();
+    for s in samples {
+        if !tags.contains(&s.tag.as_str()) {
+            tags.push(&s.tag);
+        }
+    }
+    let mut out = String::new();
+    for tag in tags {
+        let mine: Vec<&Sample> = samples.iter().filter(|s| s.tag == tag).collect();
+        let tokens: u64 = mine.iter().map(|s| s.rpc_tokens).sum();
+        if tokens == 0 {
+            continue;
+        }
+        let mut ops: std::collections::BTreeMap<&str, (u64, u64, u64)> = std::collections::BTreeMap::new();
+        for d in mine.iter().flat_map(|s| &s.rpc_ops) {
+            let e = ops.entry(&d.op).or_default();
+            (e.0, e.1, e.2) = (e.0 + d.calls, e.1 + d.posted, e.2 + d.wait_us);
+        }
+        if out.is_empty() {
+            out += "RPC calls per generated token\n";
+            out += &format!("{:<16} {:<24} {:>12} {:>10} {:>14}\n", "tag", "op", "blocking/tok", "posted/tok", "us/blocking");
+        }
+        let t = tokens as f64;
+        let (mut blocking, mut posted) = (0u64, 0u64);
+        for (op, (c, p, w)) in &ops {
+            let us = if *c > 0 { format!("{:.0}", *w as f64 / *c as f64) } else { "-".into() };
+            out += &format!("{tag:<16} {op:<24} {:>12.3} {:>10.3} {us:>14}\n", *c as f64 / t, *p as f64 / t);
+            blocking += c;
+            posted += p;
+        }
+        out += &format!("{tag:<16} {:<24} {:>12.3} {:>10.3} {:>14}\n", "(all)", blocking as f64 / t, posted as f64 / t, format!("{tokens} tok"));
+    }
+    out
+}
+
+/// Rate summary plus roofline fresh-start lines when bytes were recorded,
+/// and RPC calls per token when the server has workers.
 pub fn report_text(samples: &[Sample]) -> String {
     let mut out = table(&summarize(samples));
     let roof = roofline_table(&fresh_starts(samples));
     if !roof.is_empty() {
         out.push('\n');
         out.push_str(&roof);
+    }
+    let rpc = rpc_table(samples);
+    if !rpc.is_empty() {
+        out.push('\n');
+        out.push_str(&rpc);
     }
     out
 }
@@ -571,7 +692,45 @@ mod tests {
             weights_unknown: false,
             devices: Vec::new(),
             exactness: "exact".into(),
+            rpc_ops: Vec::new(),
+            rpc_tokens: 0,
         }
+    }
+
+    /// The report lists RPC calls per generated token by operation, blocking
+    /// and posted apart, summed over a tag's samples.
+    #[test]
+    fn report_lists_rpc_calls_per_token_by_operation() {
+        let op = |op: &str, calls, posted, wait_us| RpcOpDelta { op: op.into(), calls, posted, wait_us };
+        let samples = vec![
+            Sample {
+                rpc_ops: vec![op("q3n-layers:Run", 100, 0, 30_000), op("q3n-layers:CloneSeq", 0, 10, 0)],
+                rpc_tokens: 100,
+                ..sample("defer", 1, 0, 12.0, "aa")
+            },
+            Sample {
+                rpc_ops: vec![op("q3n-layers:Run", 100, 0, 30_000), op("q3n-layers:CloneSeq", 10, 0, 1_000)],
+                rpc_tokens: 100,
+                ..sample("wait", 1, 0, 12.0, "aa")
+            },
+            sample("local", 1, 0, 12.0, "aa"),
+        ];
+        let text = rpc_table(&samples);
+        let line = |tag: &str, op: &str| {
+            text.lines()
+                .find(|l| l.starts_with(tag) && l.contains(op))
+                .unwrap_or_else(|| panic!("no {tag} {op} line in\n{text}"))
+                .split_whitespace()
+                .skip(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(line("defer", "CloneSeq"), "0.000 0.100 -");
+        assert_eq!(line("wait", "CloneSeq"), "0.100 0.000 100");
+        assert_eq!(line("wait", "Run"), "1.000 0.000 300");
+        assert_eq!(line("defer", "(all)"), "1.000 0.100 100 tok");
+        assert!(!text.contains("local"), "a run without workers has no lines");
+        assert!(report_text(&samples).contains("RPC calls per generated token"));
     }
 
     #[test]
