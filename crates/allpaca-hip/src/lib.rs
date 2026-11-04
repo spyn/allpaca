@@ -695,6 +695,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_kquant_i8_lanes(qt: i32, n: i32) -> i32;
+        pub fn allpaca_kquant_i8_set_loads_first(mode: i32) -> i32;
         pub fn allpaca_gemm_nt_q2_0(
             a: *const f32,
             b: *const u8,
@@ -5412,6 +5413,31 @@ pub fn kquant_i8_lanes(device: i32, qt: i32, n: i32) -> Result<usize, AllpacaErr
         let _ = (device, qt, n);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP kquant_i8_lanes unavailable".into(),
+        )))
+    }
+}
+
+/// Forces whether the Q3_K..Q6_K int8 GEMV issues every row's activation
+/// loads before the row math (`Some(true)`), or not (`Some(false)`), at any
+/// row count; `None` restores the launcher's pick (on for 2+ rows on wave32
+/// cards, board P6). Process-wide. Both give the same bits, so this only
+/// serves tests and benches.
+pub fn set_kquant_i8_loads_first(on: Option<bool>) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let mode = match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        let rc = unsafe { ffi::allpaca_kquant_i8_set_loads_first(mode) };
+        status(rc, "kquant_i8_set_loads_first")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = on;
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP kquant_i8_set_loads_first unavailable".into(),
         )))
     }
 }
@@ -14595,32 +14621,54 @@ mod tests {
             for w in w40 {
                 device_free(w, p40.len());
             }
-            // Q4_K, 144-byte super-blocks.
-            let p4: Vec<u8> = (0..n * k / 256 * 144)
-                .map(|i| match i % 144 {
-                    0 | 2 => 0x00,
-                    1 | 3 => 0x1c,
-                    j => (i * 7 % 251 + j) as u8,
-                })
-                .collect();
-            let w4: Vec<*mut u8> = (0..copies_for(p4.len()))
-                .map(|_| {
-                    let w = device_malloc(p4.len(), dev).unwrap();
-                    memcpy(w, p4.as_ptr(), p4.len(), MEMCPY_H2D).unwrap();
-                    w
-                })
-                .collect();
-            for m in [1i32, 4, 8] {
-                let mut i = 0usize;
-                let us = time_us(200, &mut || {
-                    gemm_nt_q4_k_device(x.cast(), w4[i % w4.len()], y.cast(), m, n as i32, k as i32).unwrap();
-                    i += 1;
-                });
-                push("q4_k gemv", format!("n={n} k={k} m={m}"), p4.len(), us);
+            // K-quants at every verify row count 1..=8 (P6): Q4_K/Q5_K/Q6_K
+            // are what Qwen3.8-27B UD-Q5_K_XL's layers use. 5120² (attention
+            // out, D3's baseline shape) and the FFN gate/up shape.
+            type KqDev = fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>;
+            let kquants: [(&str, usize, &[usize], &[usize], KqDev); 3] = [
+                ("q4_k gemv", 144, &[0, 2], &[1, 3], gemm_nt_q4_k_device),
+                ("q5_k gemv", 176, &[0, 2], &[1, 3], gemm_nt_q5_k_device),
+                ("q6_k gemv", 210, &[208], &[209], gemm_nt_q6_k_device),
+            ];
+            let yk = device_malloc(8 * 17408 * 4, dev).unwrap();
+            for (kname, bb, zero, scale, gemm) in kquants {
+                for (kn, kk) in [(n, k), (17408usize, 5120usize)] {
+                    if kname == "q4_k gemv" && kn != n {
+                        continue;
+                    }
+                    let pk: Vec<u8> = (0..kn * kk / 256 * bb)
+                        .map(|i| {
+                            let j = i % bb;
+                            if zero.contains(&j) {
+                                0x00
+                            } else if scale.contains(&j) {
+                                0x1c
+                            } else {
+                                (i * 7 % 251 + j) as u8
+                            }
+                        })
+                        .collect();
+                    let wk: Vec<*mut u8> = (0..copies_for(pk.len()))
+                        .map(|_| {
+                            let w = device_malloc(pk.len(), dev).unwrap();
+                            memcpy(w, pk.as_ptr(), pk.len(), MEMCPY_H2D).unwrap();
+                            w
+                        })
+                        .collect();
+                    for m in 1i32..=8 {
+                        let mut i = 0usize;
+                        let us = time_us(200, &mut || {
+                            gemm(x.cast(), wk[i % wk.len()], yk.cast(), m, kn as i32, kk as i32).unwrap();
+                            i += 1;
+                        });
+                        push(kname, format!("n={kn} k={kk} m={m}"), pk.len(), us);
+                    }
+                    for w in wk {
+                        device_free(w, pk.len());
+                    }
+                }
             }
-            for w in w4 {
-                device_free(w, p4.len());
-            }
+            device_free(yk, 8 * 17408 * 4);
             // Q2_0, 18-byte blocks of 64 (P5). Same rotation as the K-quant rows.
             let p2: Vec<u8> = (0..n * k / 64 * 18)
                 .map(|i| match i % 18 {
@@ -14804,6 +14852,97 @@ mod tests {
             table += "\n";
         }
         eprintln!("\n{table}");
+        if let Ok(path) = std::env::var("BENCH_OUT") {
+            std::fs::write(&path, csv).unwrap();
+            eprintln!("wrote {path}");
+        }
+    }
+
+    /// Board P6: the Q4_K/Q5_K/Q6_K int8 GEMV at m = 1..=8 on Qwen3.8-27B's
+    /// layer shapes, per device, with the launcher's pick (`auto`) and with
+    /// loads-first forced `off` (the build before P6) and `on`. Weights rotate
+    /// past 192 MB. Lines are `kqlf,<type>,n=.. k=.. m=..,<dev>,<arch>,<variant>,<µs>`;
+    /// `BENCH_OUT=file.csv` writes them too:
+    /// `cargo test --release -p allpaca-hip --features hip --lib bench_kquant_loads_first -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_kquant_loads_first() {
+        let devs: Vec<i32> = match std::env::var("BENCH_DEVICES") {
+            Ok(list) => list.split(',').filter_map(|d| d.trim().parse().ok()).collect(),
+            Err(_) => (0..device_count()).collect(),
+        };
+        const ROTATE_BYTES: usize = 192 << 20;
+        let mut csv = String::from("kernel,shape,device,arch,variant,us\n");
+        type KqDev = fn(*const f32, *const u8, *mut f32, i32, i32, i32) -> Result<(), AllpacaError>;
+        let kquants: [(&str, usize, &[usize], &[usize], KqDev); 3] = [
+            ("q4_k", 144, &[0, 2], &[1, 3], gemm_nt_q4_k_device),
+            ("q5_k", 176, &[0, 2], &[1, 3], gemm_nt_q5_k_device),
+            ("q6_k", 210, &[208], &[209], gemm_nt_q6_k_device),
+        ];
+        let shapes = [(1024usize, 5120usize), (5120, 5120), (5120, 6144), (10240, 5120), (17408, 5120), (5120, 17408)];
+        let variants = [("auto", None), ("off", Some(false)), ("on", Some(true))];
+        for &dev in &devs {
+            set_device(dev).unwrap();
+            let arch = device_gcn_arch(dev).map(|(a, _)| a).unwrap_or_default();
+            let kmax = 17408usize;
+            let x = device_malloc(8 * kmax * 4, dev).unwrap();
+            let y = device_malloc(8 * kmax * 4, dev).unwrap();
+            let xs: Vec<f32> = (0..8 * kmax).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+            memcpy(x, xs.as_ptr().cast(), 8 * kmax * 4, MEMCPY_H2D).unwrap();
+            for (kname, bb, zero, scale, gemm) in kquants {
+                for (n, k) in shapes {
+                    let pk: Vec<u8> = (0..n * k / 256 * bb)
+                        .map(|i| {
+                            let j = i % bb;
+                            if zero.contains(&j) {
+                                0x00
+                            } else if scale.contains(&j) {
+                                0x1c
+                            } else {
+                                (i * 7 % 251 + j) as u8
+                            }
+                        })
+                        .collect();
+                    let wk: Vec<*mut u8> = (0..ROTATE_BYTES.div_ceil(pk.len()).clamp(1, 64))
+                        .map(|_| {
+                            let w = device_malloc(pk.len(), dev).unwrap();
+                            memcpy(w, pk.as_ptr(), pk.len(), MEMCPY_H2D).unwrap();
+                            w
+                        })
+                        .collect();
+                    for m in 1i32..=8 {
+                        for (tag, lf) in variants {
+                            set_kquant_i8_loads_first(lf).unwrap();
+                            let mut i = 0usize;
+                            let mut f = || {
+                                gemm(x.cast(), wk[i % wk.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                                i += 1;
+                            };
+                            for _ in 0..10 {
+                                f();
+                            }
+                            stream_synchronize().unwrap();
+                            let t = std::time::Instant::now();
+                            for _ in 0..200 {
+                                f();
+                            }
+                            stream_synchronize().unwrap();
+                            let us = t.elapsed().as_secs_f64() * 1e6 / 200.0;
+                            let line = format!("{kname},n={n} k={k} m={m},{dev},{arch},{tag},{us:.2}");
+                            eprintln!("kqlf,{line}");
+                            csv += &line;
+                            csv.push('\n');
+                        }
+                    }
+                    set_kquant_i8_loads_first(None).unwrap();
+                    for w in wk {
+                        device_free(w, pk.len());
+                    }
+                }
+            }
+            device_free(x, 8 * kmax * 4);
+            device_free(y, 8 * kmax * 4);
+        }
         if let Ok(path) = std::env::var("BENCH_OUT") {
             std::fs::write(&path, csv).unwrap();
             eprintln!("wrote {path}");
@@ -20535,6 +20674,65 @@ mod tests {
                     let mut out = vec![0.0f32; m * n];
                     run(&a, &mut out, m as i32);
                     assert_rows_match_single(name, run, &a, &out, m, n, k);
+                }
+            }
+        }
+    }
+
+    /// Verify batches (board P6): the int8 K-quant GEMV issues every row's
+    /// activation loads first at 2+ rows (decode keeps the compiler's pick).
+    /// Under the launcher's pick and with loads-first forced off or on, every
+    /// row of a 2..=9- or 16-row batch equals the decode (m = 1, default) GEMV
+    /// of that row bit for bit, at the 27B's input width (k = 5120) and with
+    /// partial column blocks.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn int8_gemv_loads_first_rows_match_decode_rows() {
+        if device_count() == 0 || std::env::var("ALLPACA_Q8_F32_GEMV").is_ok_and(|v| v == "1") {
+            return;
+        }
+        struct LaunchersPick;
+        impl Drop for LaunchersPick {
+            fn drop(&mut self) {
+                let _ = set_kquant_i8_loads_first(None);
+            }
+        }
+        let _pick = LaunchersPick;
+        for (n, k) in [(37usize, 512usize), (200, 5120), (1000, 1024)] {
+            for m in (2usize..=9).chain([16]) {
+                let (a, _, _) = fill_q5k_gemm_case(m + 7, m, n, k);
+                let b3 = fill_q3k_blocks(m, n, k);
+                let (_, b4, _) = fill_q4k_gemm_case(m, 1, n, k);
+                let (_, b5, _) = fill_q5k_gemm_case(m, 1, n, k);
+                let (_, b6, _) = fill_q6k_gemm_case(m, 1, n, k);
+                type Gemm =
+                    fn(&[f32], &[u8], &mut [f32], i32, i32, i32) -> Result<(), AllpacaError>;
+                let kinds: [(&str, &[u8], Gemm); 4] = [
+                    ("q3_k", &b3, gemm_nt_q3_k),
+                    ("q4_k", &b4, gemm_nt_q4_k),
+                    ("q5_k", &b5, gemm_nt_q5_k),
+                    ("q6_k", &b6, gemm_nt_q6_k),
+                ];
+                for (name, b, gemm) in kinds {
+                    // Decode: one row at a time, the launcher's own pick.
+                    set_kquant_i8_loads_first(None).unwrap();
+                    let mut decode = vec![0.0f32; m * n];
+                    for r in 0..m {
+                        gemm(&a[r * k..(r + 1) * k], b, &mut decode[r * n..(r + 1) * n], 1, n as i32, k as i32)
+                            .expect(name);
+                    }
+                    for lf in [None, Some(false), Some(true)] {
+                        set_kquant_i8_loads_first(lf).unwrap();
+                        let mut batch = vec![0.0f32; m * n];
+                        gemm(&a, b, &mut batch, m as i32, n as i32, k as i32).expect(name);
+                        for r in 0..m {
+                            let (got, want) = (&batch[r * n..(r + 1) * n], &decode[r * n..(r + 1) * n]);
+                            assert!(
+                                got.iter().zip(want).all(|(g, w)| g.to_bits() == w.to_bits()),
+                                "{name} loads_first={lf:?} row {r} of {m}x{n}x{k} differs from decode"
+                            );
+                        }
+                    }
                 }
             }
         }
