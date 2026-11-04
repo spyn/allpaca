@@ -98,10 +98,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .or_else(|| std::env::var_os("ALLPACA_WORKER_CACHE").map(Into::into))
                     .map(|dir| allpaca_core::qwen4_remote::WeightCache::new(dir, cli.cache_gib << 30));
                 // Coordinators' prompt caches keep Flash-Next blocks' state here too.
-                vec![allpaca_core::qwen4_remote::worker_extension_saving(
-                    cache,
-                    (cli.prompt_cache_gib << 30) as usize,
-                )]
+                vec![
+                    allpaca_core::qwen4_remote::worker_extension_saving(
+                        cache.clone(),
+                        (cli.prompt_cache_gib << 30) as usize,
+                    ),
+                    allpaca_core::qwen3next_remote::worker_extension(cache),
+                ]
             }
             _ => Vec::new(),
         };

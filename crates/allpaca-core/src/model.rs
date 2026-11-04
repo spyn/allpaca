@@ -53,6 +53,8 @@ pub struct DeviceDecodeSide<'a> {
     pub write_logits: bool,
     /// M-RoPE layout of a Request with images (rotary position != KV position).
     pub mrope: Option<&'a MropeLayout>,
+    /// Match host routing and F16 reply rounding of separate remote experts.
+    pub separate_moe_compat: bool,
 }
 
 impl<'a> DeviceDecodeSide<'a> {
@@ -66,6 +68,7 @@ impl<'a> DeviceDecodeSide<'a> {
             last_hidden: None,
             write_logits: true,
             mrope: None,
+            separate_moe_compat: false,
         }
     }
 }
@@ -474,7 +477,7 @@ impl ModelConfig {
                 .iter()
                 .any(|t| t.name.contains(".ssm_") || t.name.contains(".attn_compressor_kv.")),
             nextn_predict_layers: nextn,
-            gguf_layer_base: 0,
+            gguf_layer_base: file.meta_u32("allpaca.gguf_layer_base").unwrap_or(0) as usize,
             router_kind: if arch == "deepseek2"
                 && file
                     .meta_u32(&format!("{arch}.expert_gating_func"))
@@ -1783,8 +1786,9 @@ impl ResidentModel {
             }
             let reported = report
                 .layers
-                .get(i)
-                .map(|l| l.block)
+                .iter()
+                .find(|layer| layer.index == i)
+                .map(|layer| layer.block)
                 .unwrap_or(HybridLayerKind::Attention);
             // NextN/MTP is dense attn+FFN even when the trunk is hybrid SSM.
             let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some() {
@@ -2661,12 +2665,15 @@ fn relu_sqr(v: f32) -> f32 {
     }
 }
 
+/// Host sigmoid with `det_expf`: the platform `exp` (MSVC CRT vs glibc)
+/// differs in the last bit for some inputs, which split hosted RPC spans
+/// from the separate path. Same bits on every coordinator and worker.
 fn sigmoid_stable(v: f32) -> f32 {
     if v >= 0.0 {
-        let z = (-v).exp();
+        let z = allpaca_cpu::det_expf(-v);
         1.0 / (1.0 + z)
     } else {
-        let z = v.exp();
+        let z = allpaca_cpu::det_expf(v);
         z / (1.0 + z)
     }
 }
@@ -2979,7 +2986,7 @@ pub(crate) fn topk_from_logits(
         }
         let mut sum = 0.0f32;
         for (e, w) in weights.iter_mut().enumerate() {
-            *w = if off(e) { 0.0 } else { (*w - max).exp() };
+            *w = if off(e) { 0.0 } else { allpaca_cpu::det_expf(*w - max) };
             sum += *w;
         }
         let sum = sum.max(1e-9);
@@ -2990,7 +2997,7 @@ pub(crate) fn topk_from_logits(
         let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for w in weights.iter_mut() {
-            *w = (*w - max).exp();
+            *w = allpaca_cpu::det_expf(*w - max);
             sum += *w;
         }
         let sum = sum.max(1e-9);
@@ -4661,6 +4668,10 @@ pub struct TinyModel {
     pub expert_controls: Arc<crate::expert_controls::ExpertControls>,
     /// Residual rows entering chosen layers, for a DFlash2 draft (off by default).
     pub layer_capture: Arc<crate::dflash2::LayerCapture>,
+    /// Set on a worker's hosted `q3n-layers` span: its routed MoE rounds like
+    /// a separate `MoeFfn` reply (host top-k, F16 routed sum), so hosted
+    /// output equals the separate expert-parallel path bit for bit.
+    pub hosted_moe_compat: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4840,6 +4851,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         }
     }
 
@@ -5885,7 +5897,9 @@ impl TinyModel {
         // host routing for it changed its tokens (the two routings round
         // differently), so concurrent output drifted from solo output.
         // `moe_norm` snapshots then come only from host-routed layers.
-        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1)? {
+        let separate_moe_compat =
+            self.hosted_moe_compat || side.as_ref().is_some_and(|s| s.separate_moe_compat);
+        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, 1, separate_moe_compat)? {
             record_elementwise(Some(metrics));
             return Ok(());
         }
@@ -5901,6 +5915,7 @@ impl TinyModel {
             ds_queue,
             last_hidden: None,
             write_logits: s.write_logits,
+            separate_moe_compat: s.separate_moe_compat,
         });
         if let Some(s) = side.as_mut() {
             if let Some(norm) = s.moe_norm.as_mut() {
@@ -6074,6 +6089,9 @@ impl TinyModel {
                 hip.copy_h2d_f32(buf.proj, &scratch)?;
                 hip.residual_add(buf.attn, buf.proj, dim as i32)?;
             }
+        }
+        if separate_moe_compat {
+            hip.round_f16(buf.attn, dim)?;
         }
         if off.w_shared_up.n > 0
             && off.w_shared_down.n > 0
@@ -6259,6 +6277,7 @@ impl TinyModel {
         host_layer: &LayerWeights,
         buf: DeviceDecode,
         n_tok: usize,
+        separate_moe_compat: bool,
     ) -> Result<bool, AllpacaError> {
         let cfg = &self.config;
         let (dim, ff, n_exp) = (cfg.dim, cfg.ff_dim, cfg.n_experts);
@@ -6268,6 +6287,7 @@ impl TinyModel {
             && !cfg.moe_sqrt_softplus
             && (cfg.expert_weights_scale == 0.0 || cfg.expert_weights_scale == 1.0);
         if !softmax_router
+            || separate_moe_compat
             || k > 64
             || off.w_router.n != n_exp * dim
             || self.edge0.is_some()
@@ -6334,6 +6354,9 @@ impl TinyModel {
             buf.attn,
         )?;
         drop(scratch);
+        if separate_moe_compat {
+            hip.round_f16(buf.attn, n_tok * dim)?;
+        }
         if has_shared {
             let scale = (!shexp_gate.is_null()).then_some(routes.shexp_scale.cast_const());
             self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &[], n_tok, scale)?;
@@ -6520,7 +6543,16 @@ impl TinyModel {
         record_elementwise(Some(metrics));
         // Same GPU routing as single-token decode, so verify spans and decode
         // produce identical tokens.
-        if self.gpu_routed_local_moe(layer_idx, hip, resident, off, host_layer, buf, n_tok)? {
+        if self.gpu_routed_local_moe(
+            layer_idx,
+            hip,
+            resident,
+            off,
+            host_layer,
+            buf,
+            n_tok,
+            self.hosted_moe_compat,
+        )? {
             record_elementwise(Some(metrics));
             return Ok(());
         }
@@ -6654,6 +6686,9 @@ impl TinyModel {
                     hip.residual_add(buf.attn_row(t, dim), src, dim as i32)?;
                 }
             }
+        }
+        if self.hosted_moe_compat {
+            hip.round_f16(buf.attn, n_tok * dim)?;
         }
         if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
             self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, n_tok, None)?;
@@ -6860,11 +6895,16 @@ impl TinyModel {
         let name = file.meta_str("general.name").unwrap_or("gguf").to_string();
         for i in 0..cfg.n_layers {
             let i = cfg.gguf_blk(i);
-            let info = report.layers.get(i).cloned().unwrap_or(HybridLayerInfo {
-                index: i,
-                block: HybridLayerKind::Attention,
-                moe: cfg.n_experts > 0,
-            });
+            let info = report
+                .layers
+                .iter()
+                .find(|layer| layer.index == i)
+                .cloned()
+                .unwrap_or(HybridLayerInfo {
+                    index: i,
+                    block: HybridLayerKind::Attention,
+                    moe: cfg.n_experts > 0,
+                });
             match info.block {
                 HybridLayerKind::Ssm => {
                     if file.tensor(&format!("blk.{i}.ssm_in.weight")).is_none()
@@ -7015,11 +7055,16 @@ impl TinyModel {
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let i = cfg.gguf_blk(i);
-            let info = report.layers.get(i).cloned().unwrap_or(HybridLayerInfo {
-                index: i,
-                block: HybridLayerKind::Attention,
-                moe: cfg.n_experts > 0,
-            });
+            let info = report
+                .layers
+                .iter()
+                .find(|layer| layer.index == i)
+                .cloned()
+                .unwrap_or(HybridLayerInfo {
+                    index: i,
+                    block: HybridLayerKind::Attention,
+                    moe: cfg.n_experts > 0,
+                });
             // Compat may mark MTP blocks as Ssm if neighboring heuristics misfire; prefer Attention
             // when Q projections exist (Qwen3.5 NextN is dense attn + FFN).
             let block = if file.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
@@ -7313,6 +7358,7 @@ impl TinyModel {
             mla_cache,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7346,7 +7392,7 @@ impl TinyModel {
         let layers = (0..cfg.n_layers)
             .map(|local| {
                 let i = cfg.gguf_blk(local);
-                let info = report.layers.get(i);
+                let info = report.layers.iter().find(|layer| layer.index == i);
                 let reported = info.map(|l| l.block).unwrap_or(HybridLayerKind::Attention);
                 let block = if file
                     .map(|f| {
@@ -7476,6 +7522,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         }
     }
 
@@ -7614,6 +7661,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         })
     }
 
@@ -7731,6 +7779,7 @@ impl TinyModel {
             mla_cache: None,
             expert_controls: Default::default(),
             layer_capture: Default::default(),
+            hosted_moe_compat: false,
         })
     }
 
@@ -7851,6 +7900,7 @@ impl TinyModel {
                     side.as_deref_mut(),
                     recurrent.as_deref_mut(),
                     soft_x,
+                    None,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
@@ -7894,7 +7944,11 @@ impl TinyModel {
             if let Some(rpc) = &self.rpc {
                 if rpc.is_remote(layer_idx) {
                     if rpc.is_span_start(layer_idx) {
-                        rpc.run_layer(layer_idx, pos, &mut x)?;
+                        if rpc.is_hosted(layer_idx) {
+                            rpc.run_hosted(layer_idx, pos, recurrent.as_deref_mut(), &mut x)?;
+                        } else {
+                            rpc.run_layer(layer_idx, pos, &mut x)?;
+                        }
                     }
                     continue;
                 }
@@ -9589,6 +9643,52 @@ impl TinyModel {
         Ok(true)
     }
 
+    /// Run the model's layers on an already-computed residual row and return
+    /// that row after the last layer, without the final norm or LM head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_hidden_token_device(
+        &self,
+        pos: usize,
+        x: &mut [f32],
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        recurrent: &mut RecurrentState,
+        request_id: u64,
+    ) -> Result<(), AllpacaError> {
+        if x.len() != self.config.dim {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "hidden input has {} floats, expected {}",
+                x.len(),
+                self.config.dim
+            ))));
+        }
+        let mut out = Vec::new();
+        let mut side = DeviceDecodeSide::new(request_id);
+        side.separate_moe_compat = true;
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.forward_token_device(
+            0,
+            pos,
+            page_ids,
+            kv,
+            metrics,
+            &mut logits,
+            hip,
+            resident,
+            false,
+            None,
+            Some(&mut side),
+            Some(recurrent),
+            Some(x),
+            Some(&mut out),
+        )?;
+        x.copy_from_slice(&out);
+        Ok(())
+    }
+
     fn forward_token_device(
         &self,
         token: u32,
@@ -9604,6 +9704,7 @@ impl TinyModel {
         mut side: Option<&mut DeviceDecodeSide<'_>>,
         mut recurrent: Option<&mut RecurrentState>,
         soft_x: Option<&[f32]>,
+        mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
         let dim = cfg.dim;
@@ -9689,7 +9790,11 @@ impl TinyModel {
                         if rpc.is_span_start(layer_idx) {
                             let mut host_x = vec![0.0f32; dim];
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
-                            rpc.run_layer(layer_idx, pos, &mut host_x)?;
+                            if rpc.is_hosted(layer_idx) {
+                                rpc.run_hosted(layer_idx, pos, recurrent.as_deref_mut(), &mut host_x)?;
+                            } else {
+                                rpc.run_layer(layer_idx, pos, &mut host_x)?;
+                            }
                             hip.copy_h2d_f32(buf.x, &host_x)?;
                         }
                         normed_ready = false;
@@ -10115,6 +10220,11 @@ impl TinyModel {
                 record_elementwise(Some(metrics));
             }
 
+            if let Some(out) = hidden_out.as_deref_mut() {
+                out.resize(dim, 0.0);
+                hip.copy_d2h_f32(buf.x, out)?;
+                return Ok(());
+            }
             Self::switch_local_gpu(
                 primary_hip.device,
                 &mut hip,
@@ -10194,9 +10304,95 @@ impl TinyModel {
         resident: &ResidentModel,
         write_logits: bool,
         row_logits: Option<&mut [f32]>,
-        mut out_row_hiddens: Option<&mut Vec<f32>>,
+        out_row_hiddens: Option<&mut Vec<f32>>,
         vision: Option<&VisionSeq>,
     ) -> Result<(), AllpacaError> {
+        self.forward_tokens_device_impl(
+            tokens,
+            segs,
+            kv,
+            metrics,
+            logits,
+            hip,
+            resident,
+            write_logits,
+            row_logits,
+            out_row_hiddens,
+            vision,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_hidden_tokens_device(
+        &self,
+        start_pos: usize,
+        x: &mut [f32],
+        page_ids: &[Vec<u64>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        recurrent: &mut RecurrentState,
+        request_id: u64,
+    ) -> Result<(), AllpacaError> {
+        let dim = self.config.dim;
+        if x.is_empty() || x.len() % dim != 0 {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "hidden rows must be a non-empty multiple of the model dimension".into(),
+            )));
+        }
+        let tokens = vec![0; x.len() / dim];
+        let mut segs = [SeqRows {
+            start_pos,
+            n_rows: tokens.len(),
+            page_ids,
+            request_id,
+            recurrent: Some(recurrent),
+        }];
+        // Hosted rows need the same arithmetic as the coordinator's RPC prefill.
+        let _exact_rows = allpaca_hip::ExactRows::enable();
+        self.forward_tokens_device_impl(
+            &tokens,
+            &mut segs,
+            kv,
+            metrics,
+            &mut [],
+            hip,
+            resident,
+            false,
+            None,
+            None,
+            None,
+            Some(x),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tokens_device_impl(
+        &self,
+        tokens: &[u32],
+        segs: &mut [SeqRows<'_>],
+        kv: &mut KvTierManager,
+        metrics: &Metrics,
+        logits: &mut [f32],
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        write_logits: bool,
+        row_logits: Option<&mut [f32]>,
+        mut out_row_hiddens: Option<&mut Vec<f32>>,
+        vision: Option<&VisionSeq>,
+        hidden_rows: Option<&mut [f32]>,
+    ) -> Result<(), AllpacaError> {
+        // Remote RPC prefill must use the same row arithmetic on every worker
+        // arch; a local tensor split keeps its existing single-machine path.
+        // Expert-parallel counts: without exact rows its local prefill takes
+        // the BLAS/WMMA paths, and those changed text from run to run. MoE
+        // models also take exact rows when nothing is remote: Ling-mini's
+        // local prefill changed text between fresh starts without it (S2).
+        let moe = self.config.n_experts > 0;
+        let _exact_rows = (moe || self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote()))
+            .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()
             || segs.iter().map(|s| s.n_rows).sum::<usize>() != tokens.len()
@@ -10285,13 +10481,17 @@ impl TinyModel {
             let mut buf = buf;
             let mut xfer = vec![0.0f32; n_tok * dim];
             let mut normed_ready = false;
-            resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
-            record_elementwise(Some(metrics));
-            if let Some(v) = vision {
-                // Soft (image) rows replace their placeholder token embeddings.
-                for t in 0..n_tok {
-                    if let Some(row) = v.soft_row(start_pos + t, dim) {
-                        hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+            if let Some(input) = hidden_rows.as_deref() {
+                hip.copy_h2d_f32(buf.x, input)?;
+            } else {
+                resident.embed_gather_rows(hip, tokens, buf.x, dim as i32)?;
+                record_elementwise(Some(metrics));
+                if let Some(v) = vision {
+                    // Soft (image) rows replace their placeholder token embeddings.
+                    for t in 0..n_tok {
+                        if let Some(row) = v.soft_row(start_pos + t, dim) {
+                            hip.copy_h2d_f32(buf.x_row(t, dim), row)?;
+                        }
                     }
                 }
             }
@@ -10304,7 +10504,28 @@ impl TinyModel {
                             let mut host_x = vec![0.0f32; n_tok * dim];
                             hip.copy_d2h_f32(buf.x, &mut host_x)?;
                             let consecutive = row_pos.windows(2).all(|w| w[1] == w[0] + 1);
-                            if consecutive {
+                            if rpc.is_hosted(layer_idx) {
+                                if consecutive && segs.len() == 1 {
+                                    rpc.run_hosted_rows(
+                                        layer_idx,
+                                        row_pos[0],
+                                        segs[0].recurrent.as_deref_mut(),
+                                        &mut host_x,
+                                    )?;
+                                } else {
+                                    for (si, seg) in segs.iter_mut().enumerate() {
+                                        for t in 0..seg.n_rows {
+                                            let r = seg_row0[si] + t;
+                                            rpc.run_hosted(
+                                                layer_idx,
+                                                row_pos[r],
+                                                seg.recurrent.as_deref_mut(),
+                                                &mut host_x[r * dim..(r + 1) * dim],
+                                            )?;
+                                        }
+                                    }
+                                }
+                            } else if consecutive {
                                 // One prompt: the worker runs the rows together.
                                 rpc.run_rows(layer_idx, row_pos[0], dim, &mut host_x)?;
                             } else {
@@ -10849,7 +11070,9 @@ impl TinyModel {
                 logits_rows,
             )?;
 
-            if row_logits.is_some() {
+            if let Some(out) = hidden_rows {
+                hip.copy_d2h_f32(buf.x, out)?;
+            } else if row_logits.is_some() {
                 rmsnorm_device_rows(
                     hip,
                     buf.x,
@@ -12664,6 +12887,129 @@ pub fn ensure_pages(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "hip"))]
+mod moe_prefill_rows_tests {
+    use super::*;
+    use allpaca_gguf::{write_gguf_quant, GgmlType, GgufWriteQuantTensor};
+
+    /// A local MoE model at a width the wide GEMMs take (dim and ff 256) with
+    /// stacked Q8_0 experts, like a real K-quant / Q8_0 MoE file.
+    fn tiny_q8_moe(dir: &std::path::Path) -> std::path::PathBuf {
+        let f32_src = dir.join("f32.gguf");
+        crate::calib::tests::write_tiny_qwen35moe_gguf_sized(&f32_src, 4, false, 256, 32, 256);
+        let f32_file = GgufFile::open(&f32_src).unwrap();
+        let quant: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = f32_file
+            .tensors
+            .iter()
+            .map(|info| {
+                if info.name.ends_with("_exps.weight") {
+                    let data = f32_file.tensor_f32(&info.name).unwrap();
+                    (info.name.clone(), info.dims.clone(), GgmlType::Q8_0, allpaca_gguf::quantize_q8_0(&data))
+                } else {
+                    let bytes = f32_file.tensor_bytes(&info.name).unwrap().to_vec();
+                    (info.name.clone(), info.dims.clone(), info.ggml_type, bytes)
+                }
+            })
+            .collect();
+        let tensors: Vec<GgufWriteQuantTensor<'_>> = quant
+            .iter()
+            .map(|(name, dims, ggml_type, bytes)| GgufWriteQuantTensor {
+                name: name.clone(),
+                dims: dims.clone(),
+                ggml_type: *ggml_type,
+                bytes,
+            })
+            .collect();
+        let path = dir.join("q8.gguf");
+        write_gguf_quant(&path, &f32_file.metadata, &[], &tensors).unwrap();
+        path
+    }
+
+    /// Local MoE prefill (no RPC) gives each row the bits it gets alone.
+    /// Without exact rows the wide GEMMs sum in another order, and the same
+    /// prompt changed text between fresh starts on Ling-mini (S2, measured).
+    #[test]
+    fn local_moe_prefill_rows_equal_token_by_token() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-moe-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = GgufFile::open(&tiny_q8_moe(&dir)).unwrap();
+        let model = TinyModel::from_gguf(&file).unwrap();
+        assert!(model.config.n_experts > 0 && model.rpc.is_none());
+        let resident = ResidentModel::upload_gguf(&file, &model.config, 0).unwrap();
+        let hip = allpaca_hip::HipWorkspace::new(0, 8 * 1024 * 1024, 256).unwrap();
+        let cfg = &model.config;
+        let tokens: Vec<u32> = (0..64u32).map(|i| 1 + (i * 7 + i / 3) % 5).collect();
+        let run = |batched: bool, request_id: u64| -> Vec<f32> {
+            let metrics = Metrics::default();
+            let mut kv = crate::kv_tier::KvTierManager::with_hip(64 << 20, 64 << 20, 0.75, Some(hip.device));
+            let keeps = kv_layer_mask(&model);
+            let pages = alloc_pages_for_seq_masked(&mut kv, cfg, 128, tokens.len() + 1, Some(&keeps), &metrics).unwrap();
+            let mut recurrent = crate::anchors::RecurrentState::zeros(cfg.n_layers, cfg.dim);
+            let mut logits = vec![0.0f32; cfg.vocab_size];
+            if batched {
+                let mut segs = [SeqRows {
+                    start_pos: 0,
+                    n_rows: tokens.len(),
+                    page_ids: &pages,
+                    request_id,
+                    recurrent: Some(&mut recurrent),
+                }];
+                model
+                    .forward_tokens_device(
+                        &tokens, &mut segs, &mut kv, &metrics, &mut logits, &hip, &resident, true, None,
+                        None, None,
+                    )
+                    .unwrap();
+            } else {
+                for (pos, &tok) in tokens.iter().enumerate() {
+                    model
+                        .forward_token_device(
+                            tok, pos, &pages, &mut kv, &metrics, &mut logits, &hip, &resident, true, None,
+                            None, Some(&mut recurrent), None, None,
+                        )
+                        .unwrap();
+                }
+            }
+            hip.gdn_clear_request(request_id);
+            logits
+        };
+        let one_by_one = run(false, 11);
+        let rows = run(true, 12);
+        let differ = one_by_one.iter().zip(&rows).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(differ, 0, "batched MoE prefill changed {differ} of {} logits", rows.len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod host_exp_tests {
+    use super::*;
+
+    /// The shared-expert gate and host routing use `sigmoid_stable` on the
+    /// coordinator and on workers. The platform `exp` (MSVC CRT vs glibc)
+    /// differed in the last bit at one decode step of Qwen3-Coder-Next and
+    /// split hosted RPC spans from the separate path, so these bits are
+    /// pinned: they must hold on Windows and Linux alike.
+    #[test]
+    fn host_sigmoid_has_the_same_bits_on_every_platform() {
+        let expect = [
+            (-7.25f32, 0x3a3a_092d_u32),
+            (-1.5, 0x3e3a_cdc1),
+            (-0.3, 0x3ed9_e2ab),
+            (0.0, 0x3f00_0000),
+            (0.7, 0x3f2b_0e5a),
+            (2.25, 0x3f67_972d),
+            (9.5, 0x3f7f_fb18),
+        ];
+        for (v, bits) in expect {
+            assert_eq!(sigmoid_stable(v).to_bits(), bits, "sigmoid({v})");
+        }
+    }
 }
 
 #[cfg(test)]

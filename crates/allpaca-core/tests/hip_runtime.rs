@@ -5938,6 +5938,13 @@ fn hip_gated_delta_step_matches_host_warp_k128() {
             state_h[i]
         );
     }
+    let digest = |v: &[f32]| {
+        v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+        })
+    };
+    assert_eq!(digest(&out), 0xa8ca08248c574d69, "delta output bits");
+    assert_eq!(digest(&state), 0x8b64af77fdd441ae, "delta state bits");
 }
 
 /// Transitional H2D scratch path used by `forward_token_device` must match host math.
@@ -6634,7 +6641,90 @@ fn hip_gdn_decode_step_resident_matches_host_without_qkv_d2h() {
             gated_h[i]
         );
     }
+    let digest = gated.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+    });
+    assert_eq!(digest, 590683133665046509, "cross-card GDN digest");
     hip.gdn_clear_request(req);
+}
+
+#[cfg(feature = "hip")]
+#[test]
+fn hip_gdn_decode_step_real_shape_has_stable_cross_card_bits() {
+    if allpaca_hip::device_count() == 0 {
+        return;
+    }
+    let hip = allpaca_hip::HipWorkspace::new(0, 8 << 20, 8).unwrap();
+    let (n_k, n_v, head_k, head_v, conv_k) = (16usize, 32usize, 128usize, 128usize, 4usize);
+    let key_dim = n_k * head_k;
+    let qkv_dim = 2 * key_dim + n_v * head_v;
+    let value_dim = n_v * head_v;
+    let vector = |n: usize, seed: usize| {
+        (0..n)
+            .map(|i| ((i * 17 + seed * 31) % 257) as f32 / 128.0 - 1.0)
+            .collect::<Vec<f32>>()
+    };
+    let qkv = vector(qkv_dim, 1);
+    let z = vector(value_dim, 2);
+    let alpha = vector(n_v, 3);
+    let beta = vector(n_v, 4);
+    let conv_w = vector(conv_k * qkv_dim, 5);
+    let dt = vector(n_v, 6);
+    let a = vector(n_v, 7);
+    let norm = vector(head_v, 8);
+    let mut host_state = vector(n_v * head_v * head_k, 9);
+    let mut host_conv = vector((conv_k - 1) * qkv_dim, 10);
+    let parts = [
+        &qkv, &z, &alpha, &beta, &conv_w, &dt, &a, &norm,
+    ];
+    let total = parts.iter().map(|v| v.len()).sum::<usize>() + value_dim;
+    let blob = allpaca_hip::DeviceWeights::alloc(0, total * 4).unwrap();
+    let mut off = 0usize;
+    let mut put = |src: &[f32]| {
+        let p = blob.ptr_at(off) as *mut f32;
+        hip.copy_h2d_f32(p, src).unwrap();
+        off += src.len() * 4;
+        p
+    };
+    let qkv_d = put(&qkv);
+    let z_d = put(&z);
+    let alpha_d = put(&alpha);
+    let beta_d = put(&beta);
+    let conv_w_d = put(&conv_w);
+    let dt_d = put(&dt);
+    let a_d = put(&a);
+    let norm_d = put(&norm);
+    let out_d = put(&vec![0.0f32; value_dim]);
+    hip.gdn_decode_step_resident(
+        41,
+        41,
+        &mut host_state,
+        &mut host_conv,
+        qkv_d,
+        z_d,
+        alpha_d,
+        beta_d,
+        conv_w_d,
+        dt_d,
+        a_d,
+        norm_d,
+        out_d,
+        n_v as i32,
+        n_k as i32,
+        head_v as i32,
+        head_k as i32,
+        conv_k as i32,
+        1e-6,
+        true,
+    )
+    .unwrap();
+    let mut out = vec![0.0f32; value_dim];
+    hip.copy_d2h_f32(out_d, &mut out).unwrap();
+    let digest = out.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x100_0000_01b3)
+    });
+    assert_eq!(digest, 18417993370823597083, "real-shape cross-card GDN digest");
+    hip.gdn_clear_request(41);
 }
 
 /// Device GDN clone/rewind must restore state+conv after an extra step without D2H.
