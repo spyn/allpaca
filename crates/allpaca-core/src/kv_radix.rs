@@ -80,6 +80,79 @@ impl RadixCheckpoint {
     }
 }
 
+/// A rate from recent samples, each one weighing half as much as the next.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RateEma {
+    amount: f64,
+    secs: f64,
+}
+
+impl RateEma {
+    /// `amount` done in `secs`. Empty or untimed samples are ignored.
+    pub(crate) fn record(&mut self, amount: f64, secs: f64) {
+        if !(amount > 0.0 && secs > 0.0 && amount.is_finite() && secs.is_finite()) {
+            return;
+        }
+        self.amount = self.amount * 0.5 + amount;
+        self.secs = self.secs * 0.5 + secs;
+    }
+
+    /// Amount per second; None until a sample came in.
+    pub(crate) fn per_sec(&self) -> Option<f64> {
+        (self.secs > 0.0).then(|| self.amount / self.secs)
+    }
+}
+
+/// When a checkpoint that only the disk tier (or a worker) still holds is
+/// worth reading back, rather than prefilling the tokens it would skip.
+#[derive(Debug, Clone, Copy)]
+pub struct FetchRule {
+    /// Read it back only if that takes under `1 / min_speedup` of the time
+    /// to prefill the tokens it gains. 0 = always read it back.
+    pub min_speedup: f64,
+    /// Measured prefill time per token; None = not measured yet
+    /// ([`PRIOR_PREFILL_TOKENS_PER_SEC`] stands in).
+    pub prefill_secs_per_token: Option<f64>,
+    /// Tokens the caller already restores another way (anchors): a
+    /// checkpoint gains only the tokens past them.
+    pub resume_floor: usize,
+}
+
+impl FetchRule {
+    /// Read back whatever is found, as before the rule.
+    #[cfg(test)]
+    pub const ALWAYS: Self = Self {
+        min_speedup: 0.0,
+        prefill_secs_per_token: None,
+        resume_floor: 0,
+    };
+}
+
+/// Store reads smaller than this are mostly fixed cost; they don't set the
+/// store's rate.
+const MIN_RATE_SAMPLE: usize = 64 << 10;
+
+/// Rates assumed until measured, so the first request after a start does
+/// not read a whole checkpoint file back to skip a token or two. The store
+/// is set below xeres's NVMe (~2 GB/s cold, measured) and above a 2 Gbit/s
+/// worker link; prefill is set low for a GPU.
+const PRIOR_STORE_BYTES_PER_SEC: f64 = 1e9;
+const PRIOR_PREFILL_TOKENS_PER_SEC: f64 = 1000.0;
+
+/// How long a checkpoint read back that RAM can't hold stays shared.
+const SHARE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A checkpoint read back from the store that is bigger than the RAM
+/// budget, kept for requests that arrive together and need it too.
+#[derive(Debug)]
+struct Shared {
+    path: Vec<u32>,
+    /// Its file.
+    name: String,
+    cp: RadixCheckpoint,
+    used: std::time::Instant,
+}
+
 /// A checkpoint's file in the disk tier.
 #[derive(Debug)]
 struct OnDisk {
@@ -390,6 +463,14 @@ pub struct KvRadixForest {
     /// How checkpoints hold keys and values.
     codec: KvCodec,
     disk: Option<Disk>,
+    /// Bytes per second the store reads back and decodes.
+    pub(crate) store_rate: RateEma,
+    /// Checkpoints read back from the store.
+    fetches: u64,
+    /// Checkpoints left in the store because prefill was faster.
+    fetch_skips: u64,
+    shared: Option<Shared>,
+    pub(crate) share_window: std::time::Duration,
 }
 
 impl Default for KvRadixForest {
@@ -424,6 +505,11 @@ impl KvRadixForest {
             evictions: 0,
             codec: KvCodec::F32,
             disk: None,
+            store_rate: RateEma::default(),
+            fetches: 0,
+            fetch_skips: 0,
+            shared: None,
+            share_window: SHARE_WINDOW,
         }
     }
 
@@ -493,6 +579,8 @@ impl KvRadixForest {
         self.nodes = 0;
         self.checkpoint_bytes = 0;
         self.disk = None;
+        self.shared = None;
+        self.store_rate = RateEma::default();
     }
 
     /// A checkpoint of `kv` (per layer) in this forest's codec.
@@ -523,6 +611,16 @@ impl KvRadixForest {
         self.evictions
     }
 
+    /// Checkpoints read back from the disk tier or worker.
+    pub fn fetches(&self) -> u64 {
+        self.fetches
+    }
+
+    /// Checkpoints left in the disk tier because prefilling was faster.
+    pub fn fetch_skips(&self) -> u64 {
+        self.fetch_skips
+    }
+
     pub fn checkpoint_bytes(&self) -> usize {
         self.checkpoint_bytes
     }
@@ -540,6 +638,7 @@ impl KvRadixForest {
 
     /// Evict cold checkpoints until `checkpoint_bytes <= target`. Returns bytes freed.
     pub fn trim_to_bytes(&mut self, target: usize) -> usize {
+        self.shared = None;
         let before = self.checkpoint_bytes;
         while self.checkpoint_bytes > target {
             if !self.evict_coldest_checkpoint() {
@@ -566,7 +665,22 @@ impl KvRadixForest {
         if let Some(d) = self.disk.as_mut() {
             d.store.remove(&file.name);
         }
+        if self.shared.as_ref().is_some_and(|s| s.name == file.name) {
+            self.shared = None;
+        }
         self.disk_sub(file.bytes);
+    }
+
+    /// Drop the shared read-back once no request has used it for the window.
+    fn expire_shared(&mut self) {
+        if self.shared.as_ref().is_some_and(|s| s.used.elapsed() >= self.share_window) {
+            self.shared = None;
+        }
+    }
+
+    /// RAM can hold a checkpoint of `bytes` without dropping all the rest.
+    fn fits_ram(&self, bytes: usize) -> bool {
+        self.max_bytes == 0 || bytes <= self.max_bytes
     }
 
     fn disk_sub(&mut self, bytes: usize) {
@@ -600,10 +714,20 @@ impl KvRadixForest {
             }
         });
         let new_bytes = cp.approx_bytes();
+        // Bigger than the whole RAM budget: holding it would drop every
+        // other checkpoint and then itself. The file (if any) keeps it.
+        let keep = self.fits_ram(new_bytes);
+        if self.shared.as_ref().is_some_and(|s| s.path == tokens) {
+            self.shared = None;
+        }
         let stamp = self.touch();
         let before = self.nodes;
         let node = node_insert(&mut self.root, &mut self.nodes, tokens);
-        let old_cp = node.checkpoint.replace(cp);
+        let old_cp = if keep {
+            node.checkpoint.replace(cp)
+        } else {
+            node.checkpoint.take()
+        };
         node.used_at = stamp;
         let (old_file, new_file) = match written {
             Some(w) => {
@@ -616,12 +740,17 @@ impl KvRadixForest {
         if let Some(old) = old_cp {
             self.checkpoint_bytes = self.checkpoint_bytes.saturating_sub(old.approx_bytes());
         }
-        self.checkpoint_bytes = self.checkpoint_bytes.saturating_add(new_bytes);
+        if keep {
+            self.checkpoint_bytes = self.checkpoint_bytes.saturating_add(new_bytes);
+        }
         if let Some(old) = old_file {
             // Same tokens, same name: the new file replaced it.
             self.disk_sub(old.bytes);
         }
         self.disk_add(new_file);
+        if !keep {
+            self.prune(tokens);
+        }
         self.evict_to_cap();
         self.trim_disk();
         added
@@ -799,14 +928,19 @@ impl KvRadixForest {
     /// with `depth <= max_depth` (use `max_depth = tokens.len()-1` to leave logits work).
     #[cfg(test)]
     pub fn lookup_checkpoint(&mut self, tokens: &[u32]) -> Option<(usize, RadixCheckpoint)> {
-        self.lookup_checkpoint_capped(tokens, usize::MAX)
+        self.lookup_checkpoint_capped(tokens, usize::MAX, FetchRule::ALWAYS)
     }
 
+    /// As [`Self::lookup_checkpoint`], no deeper than `max_depth`, reading a
+    /// checkpoint back from the disk tier only when `rule` says it beats
+    /// prefilling the tokens it gains over the next checkpoint RAM holds.
     pub fn lookup_checkpoint_capped(
         &mut self,
         tokens: &[u32],
         max_depth: usize,
+        rule: FetchRule,
     ) -> Option<(usize, RadixCheckpoint)> {
+        self.expire_shared();
         // Walk: every node on the path that holds a checkpoint, and how far
         // the tokens follow the tree at all.
         let mut node = &self.root;
@@ -848,12 +982,41 @@ impl KvRadixForest {
                 }
             }
         }
-        let mut found = sliced.and_then(|path| Some((shared, self.load(&path)?.prefix(shared))));
-        for &d in held.iter().rev() {
+        // Deepest first: the sliced one, then each held checkpoint.
+        let candidates: Vec<(usize, Option<Vec<u32>>)> = sliced
+            .map(|path| (shared, Some(path)))
+            .into_iter()
+            .chain(held.iter().rev().map(|&d| (d, None)))
+            .collect();
+        let fetch_bytes: Vec<usize> = candidates
+            .iter()
+            .map(|(d, sliced)| match sliced {
+                Some(path) => self.fetch_bytes(path),
+                None => self.resume_fetch_bytes(&tokens[..*d]),
+            })
+            .collect();
+        let mut found = None;
+        for (i, (depth, sliced)) in candidates.iter().enumerate() {
+            if fetch_bytes[i] > 0 {
+                // What RAM resumes without the store.
+                let fallback = candidates[i + 1..]
+                    .iter()
+                    .zip(&fetch_bytes[i + 1..])
+                    .find(|(_, &bytes)| bytes == 0)
+                    .map_or(0, |((d, _), _)| *d)
+                    .max(rule.resume_floor);
+                if !self.worth_fetching(fetch_bytes[i], depth.saturating_sub(fallback), rule) {
+                    self.fetch_skips += 1;
+                    continue;
+                }
+            }
+            found = match sliced {
+                Some(path) => self.load(path).map(|cp| (*depth, cp.prefix(*depth))),
+                None => self.resume_at(&tokens[..*depth]),
+            };
             if found.is_some() {
                 break;
             }
-            found = self.resume_at(&tokens[..d]);
         }
         match found {
             Some((cut, cp)) => {
@@ -882,6 +1045,52 @@ impl KvRadixForest {
         Some((path.len(), cp))
     }
 
+    /// Bytes the store must read for the checkpoint at `path` (0 when RAM
+    /// or the shared read-back holds it).
+    fn fetch_bytes(&self, path: &[u32]) -> usize {
+        let Some(node) = node_at(&self.root, path) else {
+            return 0;
+        };
+        if node.checkpoint.is_some() || self.shared.as_ref().is_some_and(|s| s.path == path) {
+            return 0;
+        }
+        node.on_disk.as_ref().map_or(0, |d| d.bytes)
+    }
+
+    /// [`Self::fetch_bytes`] of what [`Self::resume_at`] reads: a state
+    /// checkpoint's keys and values come from the checkpoint below it.
+    fn resume_fetch_bytes(&self, path: &[u32]) -> usize {
+        let mut bytes = self.fetch_bytes(path);
+        let Some(node) = node_at(&self.root, path) else {
+            return bytes;
+        };
+        let state_only = match (&node.checkpoint, &node.on_disk) {
+            (Some(cp), _) => cp.state_only,
+            (None, Some(d)) => d.state_only,
+            (None, None) => false,
+        };
+        if state_only {
+            if let Some(rest) = kv_below(node) {
+                let mut below = path.to_vec();
+                below.extend(rest);
+                bytes += self.fetch_bytes(&below);
+            }
+        }
+        bytes
+    }
+
+    /// Reading `bytes` back beats prefilling `gained` tokens by `rule`'s margin.
+    fn worth_fetching(&self, bytes: usize, gained: usize, rule: FetchRule) -> bool {
+        if rule.min_speedup <= 0.0 {
+            return true;
+        }
+        let rate = self.store_rate.per_sec().unwrap_or(PRIOR_STORE_BYTES_PER_SEC);
+        let per_token = rule
+            .prefill_secs_per_token
+            .unwrap_or(1.0 / PRIOR_PREFILL_TOKENS_PER_SEC);
+        bytes as f64 / rate * rule.min_speedup < per_token * gained as f64
+    }
+
     /// The checkpoint at `path`, read back from disk when RAM no longer has
     /// it; touches it for the LRU.
     fn load(&mut self, path: &[u32]) -> Option<RadixCheckpoint> {
@@ -891,12 +1100,18 @@ impl KvRadixForest {
         if let Some(cp) = node.checkpoint.as_ref() {
             return Some(cp.clone());
         }
+        if let Some(shared) = self.shared.as_mut().filter(|s| s.path == path) {
+            shared.used = std::time::Instant::now();
+            return Some(shared.cp.clone());
+        }
         let name = node.on_disk.as_ref()?.name.clone();
-        let cp = self
-            .disk
-            .as_mut()
-            .and_then(|d| d.store.get(&name))
-            .and_then(|bytes| decode_file(&bytes, path));
+        let started = std::time::Instant::now();
+        let read = self.disk.as_mut().and_then(|d| d.store.get(&name));
+        let read_bytes = read.as_ref().map_or(0, Vec::len);
+        let cp = read.and_then(|bytes| decode_file(&bytes, path));
+        if cp.is_some() && read_bytes >= MIN_RATE_SAMPLE {
+            self.store_rate.record(read_bytes as f64, started.elapsed().as_secs_f64());
+        }
         let Some(cp) = cp else {
             tracing::warn!(name, "prompt cache: checkpoint file gone or unreadable");
             if let Some(file) = node.on_disk.take() {
@@ -905,7 +1120,20 @@ impl KvRadixForest {
             self.prune(path);
             return None;
         };
-        self.checkpoint_bytes = self.checkpoint_bytes.saturating_add(cp.approx_bytes());
+        self.fetches += 1;
+        let bytes = cp.approx_bytes();
+        if self.max_bytes > 0 && bytes > self.max_bytes {
+            // RAM can't hold it without dropping everything else: keep one
+            // copy aside for requests that arrive together.
+            self.shared = Some(Shared {
+                path: path.to_vec(),
+                name,
+                cp: cp.clone(),
+                used: std::time::Instant::now(),
+            });
+            return Some(cp);
+        }
+        self.checkpoint_bytes = self.checkpoint_bytes.saturating_add(bytes);
         node.checkpoint = Some(cp.clone());
         self.evict_to_cap();
         Some(cp)
@@ -1295,6 +1523,8 @@ mod tests {
     struct SlowStore {
         files: std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
         delay: std::time::Duration,
+        /// Reads served.
+        gets: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl CheckpointStore for SlowStore {
@@ -1305,6 +1535,7 @@ mod tests {
         }
 
         fn get(&mut self, name: &str) -> Option<Vec<u8>> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.files.lock().unwrap().get(name).cloned()
         }
 
@@ -1386,6 +1617,143 @@ mod tests {
         forest.insert_checkpoint(&[1, 2, 3], empty_cp());
         assert!(forest.lookup_checkpoint(&[9, 8, 7]).is_none());
         assert!(forest.misses >= 1);
+    }
+
+    fn rule(min_speedup: f64, prefill_secs_per_token: Option<f64>) -> FetchRule {
+        FetchRule { min_speedup, prefill_secs_per_token, resume_floor: 0 }
+    }
+
+    /// `[1, 2, 3, 4]` held only in the store, `[1, 2]` in RAM too.
+    fn deep_on_disk_shallow_in_ram() -> (KvRadixForest, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let store = SlowStore::default();
+        let gets = store.gets.clone();
+        let mut forest = KvRadixForest::new().with_store(Box::new(store), 0).unwrap();
+        forest.insert_checkpoint(&[1, 2, 3, 4], fat_cp(64));
+        forest.insert_checkpoint(&[1, 2], fat_cp(8));
+        let small = fat_cp(8).approx_bytes();
+        forest.trim_to_bytes(small);
+        assert_eq!(forest.checkpoint_bytes(), small, "RAM keeps only [1, 2]");
+        (forest, gets)
+    }
+
+    fn gets(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        n.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn fetch_rule_recomputes_when_reading_back_is_slower() {
+        let (mut forest, store_gets) = deep_on_disk_shallow_in_ram();
+        // ~1 KB file at 1 KB/s is ~1 s; the 2 tokens it gains prefill in 20 ms.
+        forest.store_rate.record(1000.0, 1.0);
+        let (n, _) = forest
+            .lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, Some(0.01)))
+            .expect("the RAM checkpoint");
+        assert_eq!(n, 2, "resumes from RAM and prefills [3, 4]");
+        assert_eq!(gets(&store_gets), 0, "the file is not read");
+        assert_eq!(forest.fetch_skips(), 1);
+    }
+
+    #[test]
+    fn fetch_rule_reads_back_when_prefill_is_slower() {
+        let (mut forest, store_gets) = deep_on_disk_shallow_in_ram();
+        forest.store_rate.record(1000.0, 1.0);
+        // The 2 tokens it gains take 20 s to prefill.
+        let (n, _) = forest
+            .lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, Some(10.0)))
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(gets(&store_gets), 1);
+        assert_eq!(forest.fetch_skips(), 0);
+        assert_eq!(forest.fetches(), 1);
+    }
+
+    #[test]
+    fn fetch_rule_needs_twice_the_speed_by_default() {
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        // Reading back takes exactly as long as prefilling the 2 tokens:
+        // faster, but not twice as fast.
+        let bytes = node_at(&forest.root, &[1, 2, 3, 4]).unwrap().on_disk.as_ref().unwrap().bytes;
+        forest.store_rate.record(bytes as f64, 1.0);
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, Some(0.5)));
+        assert_eq!(found.map(|f| f.0), Some(2));
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(0.9, Some(0.5)));
+        assert_eq!(found.map(|f| f.0), Some(4), "a lower bar reads it back");
+    }
+
+    #[test]
+    fn fetch_rule_assumes_rates_until_they_are_measured() {
+        // The ~1 KB file at the assumed 1 GB/s takes ~1 us.
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, Some(1e-3)));
+        assert_eq!(found.map(|f| f.0), Some(4), "2 tokens at 1 ms beat ~1 us");
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, Some(1e-9)));
+        assert_eq!(found.map(|f| f.0), Some(2), "2 tokens at 1 ns don't");
+        // The assumed 1000 tok/s against a measured 1 B/s store.
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        forest.store_rate.record(1.0, 1.0);
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, rule(2.0, None));
+        assert_eq!(found.map(|f| f.0), Some(2));
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        forest.store_rate.record(1.0, 1.0);
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, FetchRule::ALWAYS);
+        assert_eq!(found.map(|f| f.0), Some(4), "min_speedup 0 always reads back");
+    }
+
+    #[test]
+    fn fetch_rule_counts_only_tokens_past_the_resume_floor() {
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        let bytes = node_at(&forest.root, &[1, 2, 3, 4]).unwrap().on_disk.as_ref().unwrap().bytes;
+        // Reading back costs 1 s; 2 tokens past [1, 2] are worth 3 s, but
+        // 1 token past an anchor at 3 is worth only 1.5 s.
+        forest.store_rate.record(bytes as f64, 1.0);
+        let mut r = rule(2.0, Some(1.5));
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, r);
+        assert_eq!(found.map(|f| f.0), Some(4));
+        let (mut forest, _) = deep_on_disk_shallow_in_ram();
+        forest.store_rate.record(bytes as f64, 1.0);
+        r.resume_floor = 3;
+        let found = forest.lookup_checkpoint_capped(&[1, 2, 3, 4, 5], 4, r);
+        assert_eq!(found.map(|f| f.0), Some(2), "the RAM checkpoint, which the caller then ignores");
+    }
+
+    #[test]
+    fn a_read_back_bigger_than_ram_keeps_ram_and_serves_the_next_request() {
+        let store = SlowStore::default();
+        let store_gets = store.gets.clone();
+        let small = fat_cp(8).approx_bytes();
+        let big = fat_cp(4096).approx_bytes();
+        let mut forest = KvRadixForest::with_limits(0, big / 2)
+            .with_store(Box::new(store), 0)
+            .unwrap();
+        forest.insert_checkpoint(&[5, 6], fat_cp(4096));
+        assert_eq!(forest.checkpoint_bytes(), 0, "too big for RAM: on disk only");
+        forest.insert_checkpoint(&[1], fat_cp(8));
+        assert_eq!(forest.checkpoint_bytes(), small);
+        assert_eq!(forest.lookup_checkpoint(&[5, 6, 7]).map(|f| f.0), Some(2));
+        assert_eq!(gets(&store_gets), 1);
+        assert_eq!(forest.checkpoint_bytes(), small, "reading it back did not evict [1]");
+        assert_eq!(forest.lookup_checkpoint(&[1, 2]).map(|f| f.0), Some(1));
+        // A second request for the same prefix shares the first one's read.
+        assert_eq!(forest.lookup_checkpoint(&[5, 6, 8]).map(|f| f.0), Some(2));
+        assert_eq!(gets(&store_gets), 1, "one read for both requests");
+        assert_eq!(forest.fetches(), 1);
+        // Once the window has passed, the copy is gone.
+        forest.share_window = std::time::Duration::ZERO;
+        assert_eq!(forest.lookup_checkpoint(&[5, 6, 9]).map(|f| f.0), Some(2));
+        assert_eq!(gets(&store_gets), 2);
+    }
+
+    #[test]
+    fn a_new_checkpoint_bigger_than_ram_without_a_disk_keeps_ram() {
+        let small = fat_cp(8).approx_bytes();
+        let big = fat_cp(4096).approx_bytes();
+        let mut forest = KvRadixForest::with_limits(0, big / 2);
+        forest.insert_checkpoint(&[1], fat_cp(8));
+        forest.insert_checkpoint(&[5, 6], fat_cp(4096));
+        assert_eq!(forest.checkpoint_bytes(), small, "[1] stays");
+        assert!(forest.lookup_checkpoint(&[1, 2]).is_some());
+        assert!(forest.lookup_checkpoint(&[5, 6, 7]).is_none(), "nowhere to keep it");
     }
 
     #[test]

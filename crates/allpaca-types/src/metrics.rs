@@ -271,6 +271,13 @@ pub struct StatsSnapshot {
     /// Radix forest nodes evicted to stay under the node/byte caps.
     #[serde(default)]
     pub radix_evictions: u64,
+    /// Prompt-cache checkpoints read back from the disk tier or worker.
+    #[serde(default)]
+    pub radix_fetches: u64,
+    /// Prompt-cache checkpoints left on disk because prefilling their
+    /// tokens was faster than reading them back.
+    #[serde(default)]
+    pub radix_fetch_skips: u64,
     /// Approximate checkpoint bytes currently held in the radix forest.
     #[serde(default)]
     pub radix_bytes: u64,

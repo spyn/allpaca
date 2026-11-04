@@ -804,6 +804,10 @@ pub struct PromptCacheSection {
     /// this many more tokens, so an edit inside a long prompt resumes from
     /// the last such point. 0 = only at the end of a prompt.
     pub boundary_tokens: usize,
+    /// A checkpoint that only the disk tier (or worker) still holds is read
+    /// back only if that is this many times faster than prefilling the
+    /// tokens it gains, by measured rates. 0 = always read it back.
+    pub min_fetch_speedup: f64,
 }
 
 impl Default for PromptCacheSection {
@@ -815,6 +819,7 @@ impl Default for PromptCacheSection {
             disk_bytes: 16 << 30,
             worker: false,
             boundary_tokens: 2048,
+            min_fetch_speedup: 2.0,
         }
     }
 }

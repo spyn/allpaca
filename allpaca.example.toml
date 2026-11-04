@@ -131,6 +131,7 @@ codec = "q8"                 # 1/4 of f32's KV bytes at the same KL; "f32", "f16
 disk_bytes = 17179869184     # 16 GiB
 worker = false               # keep them on an RPC worker's store instead of disk_dir
 boundary_tokens = 2048       # hybrids also keep their state every this many tokens
+min_fetch_speedup = 2.0      # read a checkpoint back from disk/worker only if 2x faster than prefill (measured); 0 = always
 
 [early_exit]
 enabled = false
