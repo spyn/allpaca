@@ -4526,6 +4526,7 @@ impl Engine {
                     token_id: tok,
                     text: piece,
                     finish_reason: finish,
+                    prompt_tokens: active.prompt_len,
                 });
             }
             self.metrics
