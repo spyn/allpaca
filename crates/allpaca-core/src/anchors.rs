@@ -248,28 +248,29 @@ pub fn restore_kv(
         .get(pages.iter().find_map(|l| l.first()).copied().unwrap_or(0))
         .map(|p| p.capacity_tokens)
         .unwrap_or(128);
+    let page_tokens = (page_tokens as usize).max(1);
+    let (mut k, mut v) = (Vec::new(), Vec::new());
     for (layer, layer_rows) in rows.iter().enumerate() {
         let layer_pages = pages.get(layer).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::InvalidConfig(
                 "anchor restore missing KV layer".into(),
             ))
         })?;
-        for (pos, row) in layer_rows.iter().enumerate() {
-            let page_index = pos / page_tokens as usize;
-            let slot = (pos % page_tokens as usize) as u32;
+        // One write per page: rows one at a time cost two synchronous
+        // device copies each.
+        for (page_index, page_rows) in layer_rows.chunks(page_tokens).enumerate() {
             let page_id = *layer_pages.get(page_index).ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::OutOfMemory(
                     "anchor restore missing KV page".into(),
                 ))
             })?;
-            kv.write_slot(
-                page_id,
-                slot,
-                cfg.n_kv_heads,
-                cfg.head_dim(),
-                &row.k,
-                &row.v,
-            )?;
+            k.clear();
+            v.clear();
+            for row in page_rows {
+                k.extend_from_slice(&row.k);
+                v.extend_from_slice(&row.v);
+            }
+            kv.write_slots(page_id, 0, cfg.n_kv_heads, cfg.head_dim(), &k, &v)?;
         }
     }
     Ok(())

@@ -3282,6 +3282,7 @@ impl Engine {
             // Decision scores are checked against a reference: they resume
             // only from checkpoints that hold the rows as they were.
             let exact_only = probe.is_some() && inner.kv_radix.codec() != allpaca_types::KvCodec::F32;
+            let mut lookup_started = Instant::now();
             let found = if exact_only {
                 None
             } else {
@@ -3290,10 +3291,12 @@ impl Engine {
                     prefill_secs_per_token: inner.prefill_rate.per_sec().map(|tok_per_sec| 1.0 / tok_per_sec),
                     resume_floor: prefill_pos,
                 };
+                lookup_started = Instant::now();
                 inner
                     .kv_radix
                     .lookup_checkpoint_capped(&tokens, tokens.len().saturating_sub(1), rule)
             };
+            let lookup_ms = lookup_started.elapsed().as_secs_f64() * 1e3;
             // A qwen4exp checkpoint whose hosted blocks' state the worker
             // has lost is a miss.
             let found = match found {
@@ -3310,7 +3313,18 @@ impl Engine {
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
                     resumed_draft = cp.draft.clone();
-                    restore_kv(&mut inner.kv, &pages, &cp.kv_rows(), &target.config)?;
+                    let decode_started = Instant::now();
+                    let rows = cp.kv_rows();
+                    let decode_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+                    let upload_started = Instant::now();
+                    restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
+                    tracing::info!(
+                        tokens = n,
+                        lookup_ms,
+                        decode_ms,
+                        upload_ms = upload_started.elapsed().as_secs_f64() * 1e3,
+                        "prompt cache: restored a checkpoint"
+                    );
                     if let Some(dst) = recurrent.as_mut() {
                         *dst = cp.recurrent;
                     } else if target.config.recurrent {
