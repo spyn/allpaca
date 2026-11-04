@@ -794,7 +794,7 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
-        pub fn allpaca_hip_set_exact_rows(on: i32);
+        pub fn allpaca_hip_set_exact_rows(on: i32) -> i32;
         pub fn allpaca_copy_f32_kernel(dst: *mut f32, src: *const f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_moe_route_softmax_topk(
             logits: *const f32,
@@ -1187,6 +1187,7 @@ mod ffi {
             n: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_round_f16(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
         pub fn allpaca_bias_act_rows(
             x: *mut f32,
             bias: *const f32,
@@ -4022,25 +4023,34 @@ impl MoeGroups {
 
 /// Row-exact GEMMs on this thread while the guard lives: every row of an
 /// M-row GEMM equals that row computed alone (wide M runs as row chunks on
-/// the small-M GEMV kernels instead of the tiled / BLAS GEMMs). For batched
-/// forwards over several sequences, whose rows must match their solo runs.
-pub struct ExactRows(());
+/// the small-M GEMV kernels instead of the tiled / BLAS GEMMs). Used for
+/// multi-sequence forwards and RPC prefill across different GPU architectures.
+pub struct ExactRows {
+    #[cfg_attr(not(all(feature = "hip", allpaca_hip_runtime)), allow(dead_code))]
+    prev: i32,
+}
 
 impl ExactRows {
     pub fn enable() -> Self {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
-        unsafe {
-            ffi::allpaca_hip_set_exact_rows(1);
+        {
+            // SAFETY: sets a thread-local flag.
+            let prev = unsafe { ffi::allpaca_hip_set_exact_rows(1) };
+            ExactRows { prev }
         }
-        ExactRows(())
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            ExactRows { prev: 0 }
+        }
     }
 }
 
 impl Drop for ExactRows {
     fn drop(&mut self) {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        // SAFETY: restores this thread's previous flag.
         unsafe {
-            ffi::allpaca_hip_set_exact_rows(0);
+            ffi::allpaca_hip_set_exact_rows(self.prev);
         }
     }
 }
@@ -10357,6 +10367,29 @@ impl HipWorkspace {
         }
     }
 
+    /// Round `n` device floats through IEEE F16 and back, in place.
+    pub fn round_f16(&self, ptr: *mut f32, n: usize) -> Result<(), AllpacaError> {
+        if n == 0 || ptr.is_null() {
+            return Ok(());
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                // SAFETY: `ptr` addresses `n` writable floats on this device;
+                // the launch is ordered on its default stream.
+                let rc = unsafe { ffi::allpaca_round_f16(ptr, n as i32, std::ptr::null_mut()) };
+                status(rc, "round_f16")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP round_f16 unavailable".into(),
+            )))
+        }
+    }
+
     pub fn residual_add(
         &self,
         x: *mut f32,
@@ -14008,6 +14041,42 @@ mod tests {
         assert!(after > before);
     }
 
+    #[cfg(feature = "hip")]
+    #[test]
+    fn round_f16_matches_host_round_to_nearest_even() {
+        if device_count() == 0 {
+            return;
+        }
+        let input = [
+            0.0,
+            -0.0,
+            1.0 + 2.0f32.powi(-11),
+            1.0 + 3.0 * 2.0f32.powi(-11),
+            -1.0 - 2.0f32.powi(-11),
+            2.0f32.powi(-24),
+            65504.0,
+            0.333_333_34,
+        ];
+        let expected = [
+            0.0,
+            -0.0,
+            1.0,
+            1.001_953_125,
+            -1.0,
+            2.0f32.powi(-24),
+            65504.0,
+            0.333_251_953_125,
+        ];
+        let hip = HipWorkspace::new(0, 1 << 20, 8).unwrap();
+        let dev = device_malloc(input.len() * 4, 0).unwrap();
+        hip.copy_h2d_f32(dev.cast(), &input).unwrap();
+        hip.round_f16(dev.cast(), input.len()).unwrap();
+        let mut got = vec![0.0; input.len()];
+        hip.copy_d2h_f32(dev.cast(), &mut got).unwrap();
+        device_free(dev, input.len() * 4);
+        assert_eq!(got, expected);
+    }
+
     /// Small host<->device copy latency: pageable `hipMemcpy` vs a pinned
     /// staging buffer. `cargo test --release -p allpaca-hip --features hip --lib bench_small_copies -- --ignored --nocapture`
     #[test]
@@ -14088,6 +14157,17 @@ mod tests {
         device_free(dev, bytes);
     }
 
+    #[cfg(feature = "hip")]
+    #[test]
+    fn q8_narrow_gemv_keeps_float_activations_on_every_card() {
+        if device_count() == 0 {
+            return;
+        }
+        set_device(0).unwrap();
+        assert!(!q8_0_gemv_rounds_activations(1, 8192, 2048));
+        assert!(!q8_0_gemv_rounds_activations(1, 4096, 4096));
+    }
+
     /// GPU cost of the Qwen3-Next GDN decode GEMVs, pipelined (1000 launches
     /// then one sync). `cargo test --release -p allpaca-hip --features hip --lib bench_gdn_gemv -- --ignored --nocapture`
     /// A shared expert's gate + up as one paired Q8_0 launch gives the bits of
@@ -14130,8 +14210,7 @@ mod tests {
         };
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
         assert!(read(outs[0]).iter().any(|v| *v != 0.0));
-        // Small weights stay on the f32 GEMV, so the pair launch applies,
-        // except where the int8 GEMV takes every width (the MI50).
+        // Small weights stay on the f32 GEMV, so the pair launch applies.
         set_device(0).expect("bind");
         let int8 = q8_0_gemv_rounds_activations(1, n as i32, k as i32);
         assert_eq!(paired, !int8, "m == 1 must take the paired launch on the f32 GEMV");
@@ -14443,6 +14522,52 @@ mod tests {
             }
             for w in w8 {
                 device_free(w, staged.len());
+            }
+            // Narrow-input Q8 projections must keep the same activation
+            // precision on gfx9 and gfx12.
+            let (nn, kk) = (8192usize, 2048usize);
+            let pn: Vec<u8> = (0..nn * kk / 32 * 34)
+                .map(|i| match i % 34 {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    _ => (i * 7 % 251) as u8,
+                })
+                .collect();
+            let staged_n = stage_q8_0_blocks(&pn).unwrap();
+            let wn: Vec<*mut u8> = (0..copies_for(staged_n.len()))
+                .map(|_| {
+                    let w = device_malloc(staged_n.len(), dev).unwrap();
+                    memcpy(w, staged_n.as_ptr(), staged_n.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            let mut i = 0usize;
+            let us = time_us(200, &mut || {
+                gemm_nt_q8_0_device(x.cast(), wn[i % wn.len()], y.cast(), 1, nn as i32, kk as i32).unwrap();
+                i += 1;
+            });
+            push("q8_0 gemv", format!("n={nn} k={kk} m=1"), staged_n.len(), us);
+            for w in wn {
+                device_free(w, staged_n.len());
+            }
+            // The GDN alpha/beta projection uses fixed 32-lane sums.
+            let (nf, kf) = (64usize, 2048usize);
+            let wf: Vec<f32> = (0..nf * kf).map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.01).collect();
+            let wfs: Vec<*mut u8> = (0..ROTATE_BYTES.div_ceil(wf.len() * 4))
+                .map(|_| {
+                    let w = device_malloc(wf.len() * 4, dev).unwrap();
+                    memcpy(w, wf.as_ptr().cast(), wf.len() * 4, MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            let mut i = 0usize;
+            let us = time_us(200, &mut || {
+                gemm_nt_device(x.cast(), wfs[i % wfs.len()].cast(), y.cast(), 1, nf as i32, kf as i32).unwrap();
+                i += 1;
+            });
+            push("f32 gemv", format!("n={nf} k={kf} m=1"), wf.len() * 4, us);
+            for w in wfs {
+                device_free(w, wf.len() * 4);
             }
             // Q4_0, native 18-byte blocks (P1 MTP draft head).
             let p40: Vec<u8> = (0..n * k / 32 * 18)
@@ -15334,8 +15459,8 @@ mod tests {
 
     /// The activations a Q8_0 GEMV of `m` rows over an `n x k` weight
     /// actually multiplies on device 0: int8-quantized on the int8 GEMV
-    /// (m <= 16 and k >= 5120, or any k on a 64-lane-wavefront card; whole
-    /// 32-value blocks), as given otherwise or with ALLPACA_Q8_F32_GEMV=1.
+    /// (m <= 16 and k >= 5120 on every card; whole 32-value blocks),
+    /// as given otherwise or with ALLPACA_Q8_F32_GEMV=1.
     #[cfg(feature = "hip")]
     fn q8_0_gemv_activations(a: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         set_device(0).expect("bind");
@@ -18454,6 +18579,40 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "hip")]
+    #[test]
+    fn f32_gemv_uses_fixed_32_lane_reduction_on_every_card() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, n, k) = (1usize, 64usize, 2048usize);
+        let (a, _, b) = fill_q5k_gemm_case(19, m, n, k);
+        let mut expected = vec![0.0f32; n];
+        for col in 0..n {
+            let mut groups = [0.0f32; 8];
+            for (g, group) in groups.iter_mut().enumerate() {
+                let mut lanes = [0.0f32; 32];
+                for (lane, sum) in lanes.iter_mut().enumerate() {
+                    let tid = g * 32 + lane;
+                    for i in (tid..k).step_by(256) {
+                        *sum = a[i].mul_add(b[col * k + i], *sum);
+                    }
+                }
+                for off in [16, 8, 4, 2, 1] {
+                    let old = lanes;
+                    for i in 0..32 - off {
+                        lanes[i] = old[i] + old[i + off];
+                    }
+                }
+                *group = lanes[0];
+            }
+            expected[col] = groups.iter().fold(0.0, |sum, v| sum + v);
+        }
+        let mut got = vec![0.0f32; n];
+        gemm_nt(&a, &b, &mut got, m as i32, n as i32, k as i32).unwrap();
+        assert_eq!(got, expected);
+    }
+
     /// §12: tiled Q4_K GEMV matches untiled baseline; before/after wall times recorded.
     #[cfg(feature = "hip")]
     #[test]
@@ -20020,10 +20179,14 @@ mod tests {
                 }
                 assert_eq!(run(1), 0, "device {dev}: one query row must not take WMMA");
                 {
-                    let _exact = ExactRows::enable();
-                    assert!(!prefill_wmma_active(), "ExactRows wins over the prefill scope");
-                    assert_eq!(run(n_q), 0, "device {dev}: WMMA launched under ExactRows");
+                    let _outer_exact = ExactRows::enable();
+                    {
+                        let _inner_exact = ExactRows::enable();
+                    }
+                    assert!(!prefill_wmma_active(), "nested ExactRows must restore the outer scope");
+                    assert_eq!(run(n_q), 0, "device {dev}: WMMA launched after nested ExactRows");
                 }
+                assert!(prefill_wmma_active(), "ExactRows must restore the prefill scope");
             }
             assert!(!prefill_wmma_active());
             assert_eq!(run(n_q), 0, "device {dev}: WMMA launched after the scope ended");

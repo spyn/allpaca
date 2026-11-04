@@ -347,9 +347,10 @@ __global__ void gemv_nt_tiled_kernel(const float *a, const float *b, float *c, i
 }
 
 /* F32 GEMV for few rows and at most a couple of thousand columns: one block
- * per output (column, row), threads stride K so loads coalesce, then a block
- * reduction. The 64-column tiled kernel put a whole 32-output GEMV (GDN
- * alpha/beta) on one CU with per-thread strided rows: ~30 us for 256 KB. */
+ * per output (column, row), threads stride K so loads coalesce, then fixed
+ * 32-lane groups reduce on both wave32 and wave64 cards. The 64-column tiled
+ * kernel put a whole 32-output GEMV (GDN alpha/beta) on one CU with per-thread
+ * strided rows: ~30 us for 256 KB. */
 __global__ void gemv_nt_colblock_kernel(const float *a, const float *b, float *c, int m, int n,
                                         int k) {
     __shared__ float part[32];
@@ -363,9 +364,9 @@ __global__ void gemv_nt_colblock_kernel(const float *a, const float *b, float *c
     const float *brow = b + static_cast<size_t>(col) * static_cast<size_t>(k);
     float acc = 0.f;
     for (int i = tid; i < k; i += static_cast<int>(blockDim.x)) {
-        acc += arow[i] * brow[i];
+        acc = fmaf(arow[i], brow[i], acc);
     }
-    const int ws = warpSize;
+    const int ws = 32;
     for (int off = ws / 2; off > 0; off >>= 1) {
         acc += __shfl_down(acc, off, ws);
     }
@@ -2936,7 +2937,11 @@ static int launch_gemm_nt_hipblaslt(const float *a, const float *b, float *c, in
  * kernels. Host-side and per calling thread, like the launches it steers. */
 static thread_local int g_exact_rows = 0;
 
-extern "C" void allpaca_hip_set_exact_rows(int32_t on) { g_exact_rows = on != 0; }
+extern "C" int32_t allpaca_hip_set_exact_rows(int32_t on) {
+    const int prev = g_exact_rows;
+    g_exact_rows = on != 0;
+    return prev;
+}
 
 template <typename F>
 static int exact_row_chunks(int32_t m, int32_t chunk, F &&launch) {
@@ -3421,11 +3426,11 @@ static bool q8_0_i8_enabled() {
 
 static bool kq_wave64();
 
-/* On the MI50 (64-lane wavefronts) every width gains: the f32 kernel ran a
- * 640x2560 weight as 5 blocks (31.8 us; 9 us on int8 with the rounding). */
+/* Activation precision must not depend on the card: narrow-row integer gains
+ * on the MI50 otherwise change a worker's output from the gfx12 path. */
 static bool q8_0_uses_i8(int32_t n, int32_t k) {
     (void)n;
-    return q8_0_i8_enabled() && (k >= Q8_I8_MIN_K || kq_wave64());
+    return q8_0_i8_enabled() && k >= Q8_I8_MIN_K;
 }
 
 extern "C" int allpaca_q8_0_gemv_rounds_activations(int32_t m, int32_t n, int32_t k) {
@@ -8986,9 +8991,9 @@ __global__ void gated_delta_step_parallel_kernel(float *q, float *k, const float
     const float kv0 = (j < head_k) ? k_h[j] : 0.f;
     const float ss_q = gdn_block_sum(qv0 * qv0, smem);
     const float ss_k = gdn_block_sum(kv0 * kv0, smem);
-    const float inv_q = rsqrtf(ss_q + eps);
-    const float inv_k = rsqrtf(ss_k + eps);
-    const float q_scale = rsqrtf(static_cast<float>(head_k));
+    const float inv_q = det_rsqrtf(ss_q + eps);
+    const float inv_k = det_rsqrtf(ss_k + eps);
+    const float q_scale = det_rsqrtf(static_cast<float>(head_k));
     const float qv = qv0 * inv_q * q_scale;
     const float kv = kv0 * inv_k;
     if (j < head_k) {
@@ -9026,19 +9031,19 @@ __global__ void gdn_qk_l2norm_kernel(float *q, float *k, int n_heads, int head_k
     float *k_h = k + static_cast<size_t>(h) * head_k;
     float ss_q = 0.f, ss_k = 0.f;
     for (int j = lane; j < head_k; j += 32) {
-        ss_q += q_h[j] * q_h[j];
-        ss_k += k_h[j] * k_h[j];
+        ss_q = fmaf(q_h[j], q_h[j], ss_q);
+        ss_k = fmaf(k_h[j], k_h[j], ss_k);
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        ss_q += __shfl_xor(ss_q, off, 32);
-        ss_k += __shfl_xor(ss_k, off, 32);
+        ss_q = __fadd_rn(ss_q, __shfl_xor(ss_q, off, 32));
+        ss_k = __fadd_rn(ss_k, __shfl_xor(ss_k, off, 32));
     }
-    const float sq = rsqrtf(ss_q + eps) * rsqrtf(static_cast<float>(head_k));
-    const float sk = rsqrtf(ss_k + eps);
+    const float sq = __fmul_rn(det_rsqrtf(ss_q + eps), det_rsqrtf(static_cast<float>(head_k)));
+    const float sk = det_rsqrtf(ss_k + eps);
     for (int j = lane; j < head_k; j += 32) {
-        q_h[j] *= sq;
-        k_h[j] *= sk;
+        q_h[j] = __fmul_rn(q_h[j], sq);
+        k_h[j] = __fmul_rn(k_h[j], sk);
     }
 }
 
@@ -9086,24 +9091,24 @@ __global__ void gated_delta_step_warp_kernel(const float *q, const float *k, con
         float acc = 0.f;
 #pragma unroll
         for (int t = 0; t < NJ; ++t) {
-            s[t] = row[t] * g;
-            acc += s[t] * kv[t];
+            s[t] = __fmul_rn(row[t], g);
+            acc = fmaf(s[t], kv[t], acc);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
-            acc += __shfl_xor(acc, off, 32);
+            acc = __fadd_rn(acc, __shfl_xor(acc, off, 32));
         }
-        const float delta = b * (v[static_cast<size_t>(h) * head_v + i] - acc);
+        const float delta = __fmul_rn(b, __fsub_rn(v[static_cast<size_t>(h) * head_v + i], acc));
         float y = 0.f;
 #pragma unroll
         for (int t = 0; t < NJ; ++t) {
-            s[t] += delta * kv[t];
+            s[t] = __fadd_rn(s[t], __fmul_rn(delta, kv[t]));
             row[t] = s[t];
-            y += s[t] * qv[t];
+            y = fmaf(s[t], qv[t], y);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
-            y += __shfl_xor(y, off, 32);
+            y = __fadd_rn(y, __shfl_xor(y, off, 32));
         }
         if (lane == 0) {
             out[static_cast<size_t>(h) * head_v + i] = y;
@@ -9130,9 +9135,9 @@ __global__ void gated_delta_step_kernel(float *q, float *k, const float *v, cons
         ss_q += q_h[j] * q_h[j];
         ss_k += k_h[j] * k_h[j];
     }
-    const float inv_q = rsqrtf(ss_q + eps);
-    const float inv_k = rsqrtf(ss_k + eps);
-    const float q_scale = rsqrtf(static_cast<float>(head_k));
+    const float inv_q = det_rsqrtf(ss_q + eps);
+    const float inv_k = det_rsqrtf(ss_k + eps);
+    const float q_scale = det_rsqrtf(static_cast<float>(head_k));
     for (int j = 0; j < head_k; ++j) {
         q_h[j] *= inv_q * q_scale;
         k_h[j] *= inv_k;
@@ -9429,10 +9434,12 @@ extern "C" int allpaca_gated_delta_step(float *q, float *k, const float *v, cons
     return hip_status(hipGetLastError());
 }
 
-__device__ inline float gdn_silu(float x) { return x / (1.0f + expf(-x)); }
+__device__ inline float gdn_silu(float x) {
+    return __fdiv_rn(x, __fadd_rn(1.0f, det_expf(-x)));
+}
 
 __device__ inline float gdn_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    return (x > 20.0f) ? x : det_logf(__fadd_rn(1.0f, det_expf(x)));
 }
 
 __global__ void gdn_conv1d_compute_kernel(const float *x, const float *kernel,
@@ -9486,8 +9493,8 @@ __global__ void gdn_decay_beta_kernel(const float *alpha, const float *dt_bias, 
     if (i >= n) {
         return;
     }
-    decay[i] = expf(gdn_softplus(alpha[i] + dt_bias[i]) * a[i]);
-    beta[i] = 1.0f / (1.0f + expf(-beta[i]));
+    decay[i] = det_expf(__fmul_rn(gdn_softplus(__fadd_rn(alpha[i], dt_bias[i])), a[i]));
+    beta[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, det_expf(-beta[i])));
 }
 
 /* One GDN decode step's element-wise front: thread c < qkv_dim runs the
@@ -9502,8 +9509,8 @@ __global__ void gdn_step_prep_kernel(const float *x, const float *kernel, float 
     if (i >= qkv_dim) {
         const int h = i - qkv_dim;
         if (h < n_v) {
-            decay[h] = expf(gdn_softplus(alpha[h] + dt_bias[h]) * a[h]);
-            beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+            decay[h] = det_expf(__fmul_rn(gdn_softplus(__fadd_rn(alpha[h], dt_bias[h])), a[h]));
+            beta[h] = __fdiv_rn(1.0f, __fadd_rn(1.0f, det_expf(-beta[h])));
         }
         return;
     }
@@ -9590,8 +9597,8 @@ __global__ void gdn_steps_prep_kernel(float *x, const float *kernel, float *conv
         if (h < n_v) {
             for (int r = 0; r < rows; ++r) {
                 const size_t at = static_cast<size_t>(r) * n_v + h;
-                alpha[at] = expf(gdn_softplus(alpha[at] + dt_bias[h]) * a[h]);
-                beta[at] = 1.0f / (1.0f + expf(-beta[at]));
+                alpha[at] = det_expf(__fmul_rn(gdn_softplus(__fadd_rn(alpha[at], dt_bias[h])), a[h]));
+                beta[at] = __fdiv_rn(1.0f, __fadd_rn(1.0f, det_expf(-beta[at])));
             }
         }
         return;
@@ -9629,19 +9636,19 @@ __global__ void gdn_qk_l2norm_rows_kernel(float *q, float *k, int n_heads, int h
     float *k_h = k + off + static_cast<size_t>(h) * head_k;
     float ss_q = 0.f, ss_k = 0.f;
     for (int j = lane; j < head_k; j += 32) {
-        ss_q += q_h[j] * q_h[j];
-        ss_k += k_h[j] * k_h[j];
+        ss_q = fmaf(q_h[j], q_h[j], ss_q);
+        ss_k = fmaf(k_h[j], k_h[j], ss_k);
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        ss_q += __shfl_xor(ss_q, o, 32);
-        ss_k += __shfl_xor(ss_k, o, 32);
+        ss_q = __fadd_rn(ss_q, __shfl_xor(ss_q, o, 32));
+        ss_k = __fadd_rn(ss_k, __shfl_xor(ss_k, o, 32));
     }
-    const float sq = rsqrtf(ss_q + eps) * rsqrtf(static_cast<float>(head_k));
-    const float sk = rsqrtf(ss_k + eps);
+    const float sq = __fmul_rn(det_rsqrtf(ss_q + eps), det_rsqrtf(static_cast<float>(head_k)));
+    const float sk = det_rsqrtf(ss_k + eps);
     for (int j = lane; j < head_k; j += 32) {
-        q_h[j] *= sq;
-        k_h[j] *= sk;
+        q_h[j] = __fmul_rn(q_h[j], sq);
+        k_h[j] = __fmul_rn(k_h[j], sk);
     }
 }
 
@@ -9700,24 +9707,24 @@ __global__ void gated_delta_steps_warp_kernel(const float *qkv, int stride, int 
             float acc = 0.f;
 #pragma unroll
             for (int t = 0; t < NJ; ++t) {
-                s[t] = st[r][t] * g;
-                acc += s[t] * kv[t];
+                s[t] = __fmul_rn(st[r][t], g);
+                acc = fmaf(s[t], kv[t], acc);
             }
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {
-                acc += __shfl_xor(acc, o, 32);
+                acc = __fadd_rn(acc, __shfl_xor(acc, o, 32));
             }
-            const float delta = b * (v[static_cast<size_t>(h) * head_v + i] - acc);
+            const float delta = __fmul_rn(b, __fsub_rn(v[static_cast<size_t>(h) * head_v + i], acc));
             float y = 0.f;
 #pragma unroll
             for (int t = 0; t < NJ; ++t) {
-                s[t] += delta * kv[t];
+                s[t] = __fadd_rn(s[t], __fmul_rn(delta, kv[t]));
                 st[r][t] = s[t];
-                y += s[t] * qv[t];
+                y = fmaf(s[t], qv[t], y);
             }
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {
-                y += __shfl_xor(y, o, 32);
+                y = __fadd_rn(y, __shfl_xor(y, o, 32));
             }
             if (lane == 0) {
                 out_t[static_cast<size_t>(h) * head_v + i] = y;
@@ -10552,6 +10559,13 @@ __global__ void residual_add_kernel(float *x, const float *residual, int n) {
     x[idx] += residual[idx];
 }
 
+__global__ void round_f16_kernel(float *x, int n) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx < n) {
+        x[idx] = static_cast<float>(static_cast<_Float16>(x[idx]));
+    }
+}
+
 __global__ void scatter_add_scale_rows_kernel(const float *src, const int32_t *idx, const float *w,
                                               float *acc, int m, int dim, int n_tok) {
     const int row = static_cast<int>(blockIdx.y);
@@ -10970,6 +10984,18 @@ extern "C" int allpaca_residual_add(float *x, const float *residual, int32_t n,
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(residual_add_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, residual, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_round_f16(float *x, int32_t n, allpaca_stream_t stream) {
+    if (!x || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(round_f16_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), x, n);
     return hip_status(hipGetLastError());
 }
 
@@ -11874,7 +11900,7 @@ extern "C" int allpaca_det_silu_mul(const float *, const float *, float *, int32
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
-extern "C" void allpaca_hip_set_exact_rows(int32_t) {}
+extern "C" int32_t allpaca_hip_set_exact_rows(int32_t) { return 0; }
 
 extern "C" int allpaca_moe_ffn_kquant(const float *, const int8_t *, const float *, int32_t, int32_t, int32_t, int32_t,
                                       const int32_t *, const int32_t *, const float *,
@@ -12411,6 +12437,10 @@ extern "C" int allpaca_embed_gather_f16_rows(const uint16_t *, const int32_t *, 
 }
 
 extern "C" int allpaca_residual_add(float *, const float *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_round_f16(float *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

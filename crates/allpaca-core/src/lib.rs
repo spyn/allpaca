@@ -45,6 +45,7 @@ mod numa;
 mod otel;
 mod packed;
 mod qwen4exp;
+pub mod qwen3next_remote;
 pub mod gptq;
 pub mod gsq;
 pub(crate) mod host_experts;

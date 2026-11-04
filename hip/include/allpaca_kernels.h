@@ -31,8 +31,9 @@ uint64_t allpaca_hip_kernel_launches(void);
 /* gfx1200 / gfx1201, cached per device (0 without HIP). */
 int32_t allpaca_hip_device_is_gfx12(int32_t device);
 
-/* Prefill WMMA scope on the calling thread (experimental.row_variant_kernels).
- * set returns the previous value; active is the scope and not exact-row mode. */
+/* Exact-row and prefill WMMA scopes on the calling thread. Setters return the
+ * previous value; WMMA is active only outside exact-row mode. */
+int32_t allpaca_hip_set_exact_rows(int32_t on);
 int32_t allpaca_hip_set_prefill_wmma(int32_t on);
 int32_t allpaca_hip_prefill_wmma_active(void);
 
@@ -452,6 +453,9 @@ int allpaca_embed_gather_f16_rows(const uint16_t *table, const int32_t *tokens, 
                                   int32_t n_tok, int32_t dim, allpaca_stream_t stream);
 
 int allpaca_residual_add(float *x, const float *residual, int32_t n, allpaca_stream_t stream);
+
+/* Round each value through IEEE F16 and back to F32, in place. */
+int allpaca_round_f16(float *x, int32_t n, allpaca_stream_t stream);
 
 /* acc[idx[i], :] += src[i, :] * w[i]. Concurrent rows (and dual streams) use
  * atomicAdd so two experts can land on the same token. */

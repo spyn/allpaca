@@ -34,6 +34,8 @@ pub struct RecurrentState {
     /// Per-layer keys and values of the CPU Qwen3.5 attention
     /// ([`crate::qwen35_host`]); empty when unused.
     pub host_kv: Vec<(Vec<f32>, Vec<f32>)>,
+    /// State of a Qwen3-Coder-Next span kept on an RPC worker.
+    pub remote: Option<crate::qwen3next_remote::RemoteSeq>,
 }
 
 impl RecurrentState {
@@ -49,6 +51,7 @@ impl RecurrentState {
             g4: Default::default(),
             trace: None,
             host_kv: vec![Default::default(); n_layers],
+            remote: None,
         }
     }
 

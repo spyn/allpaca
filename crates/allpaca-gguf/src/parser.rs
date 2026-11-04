@@ -680,11 +680,13 @@ impl GgufFile {
                     .map(|i| i + 1)
                     .unwrap_or(0)
             }) as usize;
+        let layer_base = self.meta_u32("allpaca.gguf_layer_base").unwrap_or(0) as usize;
         let mut ssm_layers = 0usize;
         let mut attention_layers = 0usize;
         let mut moe_layers = 0usize;
         let mut layers = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
+        for local in 0..n_layers {
+            let i = layer_base + local;
             let ssm = self.tensor(&format!("blk.{i}.ssm_in.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some()
                 || self.tensor(&format!("blk.{i}.ssm_out.weight")).is_some();
@@ -2371,6 +2373,39 @@ mod tests {
             .reject_reason
             .expect("incomplete Mamba-2 must reject");
         assert!(reject.contains("missing Mamba-2"), "{reject}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compat_report_uses_gguf_layer_base() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_gguf_layer_base_probe_{}.gguf",
+            std::process::id()
+        ));
+        let mut meta = HashMap::new();
+        meta.insert(
+            "general.architecture".into(),
+            GgufValue::String("qwen3next".into()),
+        );
+        meta.insert("qwen3next.block_count".into(), GgufValue::Uint32(1));
+        meta.insert("allpaca.gguf_layer_base".into(), GgufValue::Uint32(41));
+        let ssm = vec![0.0f32; 4];
+        write_gguf(
+            &path,
+            &meta,
+            &[GgufWriteTensor {
+                name: "blk.41.ssm_out.weight".into(),
+                dims: vec![4, 1],
+                data: &ssm,
+            }],
+        )
+        .unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        let report = file.compat_report();
+        assert_eq!(report.ssm_layers, 1);
+        assert_eq!(report.layers.len(), 1);
+        assert_eq!(report.layers[0].index, 41);
+        assert_eq!(report.layers[0].block, HybridLayerKind::Ssm);
         let _ = std::fs::remove_file(path);
     }
 
