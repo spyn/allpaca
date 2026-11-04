@@ -272,9 +272,18 @@ impl DraftModelProvider {
     }
 }
 
+/// The qwen4exp (Flash-Next) NextN head as a drafter, with llama.cpp
+/// `draft-mtp` pairing: [`process`](Self::process) runs token `k` with the
+/// target's hidden streams for `k - 1` at position `k`, so its logits predict
+/// token `k + 1`. Once the target has forwarded the whole context, the last
+/// `process` step's logits give the first draft; each later draft feeds the
+/// one before at the next position with the head's own streams.
 pub struct Qwen4MtpProvider {
     model: TinyModel,
     memory: crate::qwen4exp::Qwen4Memory,
+    /// Logits of the last `process` step: the prediction for the token after
+    /// the processed context.
+    last_logits: Vec<f32>,
 }
 
 impl Qwen4MtpProvider {
@@ -282,6 +291,7 @@ impl Qwen4MtpProvider {
         Self {
             model,
             memory: crate::qwen4exp::Qwen4Memory::default(),
+            last_logits: Vec::new(),
         }
     }
 
@@ -294,13 +304,17 @@ impl Qwen4MtpProvider {
         }
         let dim = self.model.config.dim;
         let hidden_width = self.model.q4x.as_ref().map_or(dim, |q4| q4.spec.hc * dim);
-        self.memory.nextn_seed = Some(if pos == 0 && hidden.len() == dim && hidden_width != dim {
+        self.memory.nextn_seed = Some(if hidden.len() == hidden_width {
+            hidden.to_vec()
+        } else if pos == 0 {
+            // Nothing precedes the first token: llama.cpp pairs it with zeros.
             vec![0.0; hidden_width]
         } else {
-            hidden.to_vec()
+            // A hidden of the wrong width would mislead every later draft.
+            return Ok(());
         });
-        let mut logits = vec![0.0f32; self.model.config.vocab_size];
-        crate::qwen4exp::forward_qwen4_token(&self.model, token, pos, &mut logits, &mut self.memory)?;
+        self.last_logits.resize(self.model.config.vocab_size, 0.0);
+        crate::qwen4exp::forward_qwen4_token(&self.model, token, pos, &mut self.last_logits, &mut self.memory)?;
         metrics.draft_gpu_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
@@ -309,17 +323,33 @@ impl Qwen4MtpProvider {
         self.propose_inner(ctx, None, max_tokens, temperature, metrics)
     }
 
-    pub fn propose_after(&mut self, ctx: &[u32], forced: u32, max_tokens: usize, temperature: f32, metrics: &Metrics) -> Result<Vec<u32>, AllpacaError> {
-        self.propose_inner(ctx, Some(forced), max_tokens, temperature, metrics)
+    /// Drafts after a correction `forced` that the target has not run yet:
+    /// `[forced, d1, ..]`. `target_hidden` is the target's hidden streams for
+    /// the last token of `ctx`.
+    pub fn propose_after(
+        &mut self,
+        ctx: &[u32],
+        forced: u32,
+        target_hidden: &[f32],
+        max_tokens: usize,
+        temperature: f32,
+        metrics: &Metrics,
+    ) -> Result<Vec<u32>, AllpacaError> {
+        self.propose_inner(ctx, Some((forced, target_hidden)), max_tokens, temperature, metrics)
     }
 
-    fn propose_inner(&mut self, ctx: &[u32], forced: Option<u32>, max_tokens: usize, temperature: f32, metrics: &Metrics) -> Result<Vec<u32>, AllpacaError> {
-        if ctx.is_empty() || self.memory.tokens() != ctx.len() {
+    fn propose_inner(
+        &mut self,
+        ctx: &[u32],
+        forced: Option<(u32, &[f32])>,
+        max_tokens: usize,
+        temperature: f32,
+        metrics: &Metrics,
+    ) -> Result<Vec<u32>, AllpacaError> {
+        let vocab = self.model.config.vocab_size;
+        if ctx.is_empty() || max_tokens == 0 || self.memory.tokens() != ctx.len() || self.last_logits.len() != vocab {
             return Ok(Vec::new());
         }
-        let mut memory = self.memory.clone();
-        let mut out = Vec::with_capacity(max_tokens);
-        let mut window = ctx.to_vec();
         let params = GenerationParams {
             temperature,
             top_k: 1,
@@ -328,24 +358,39 @@ impl Qwen4MtpProvider {
             ..GenerationParams::default()
         };
         let mut rng = rng_from_params(&params, Some(1));
-        for i in 0..max_tokens {
-            let token = match (i, forced) {
-                (0, Some(tok)) => tok,
-                (0, None) => ctx[ctx.len() - 1],
-                _ => out[out.len() - 1],
-            };
-            let mut logits = vec![0.0f32; self.model.config.vocab_size];
-            crate::qwen4exp::forward_qwen4_token(&self.model, token, window.len(), &mut logits, &mut memory)?;
+        let mut memory = self.memory.clone();
+        let mut out = Vec::with_capacity(max_tokens);
+        let mut logits = vec![0.0f32; vocab];
+        // The position of the next token the head runs.
+        let mut pos = ctx.len();
+        let step = |token: u32, pos: usize, logits: &mut [f32], memory: &mut crate::qwen4exp::Qwen4Memory| {
             metrics.draft_gpu_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let next = if let (0, Some(tok)) = (i, forced) {
-                tok
-            } else if temperature <= 1e-5 {
+            crate::qwen4exp::forward_qwen4_token(&self.model, token, pos, logits, memory)
+        };
+        match forced {
+            Some((tok, target_hidden)) => {
+                // The head's streams from `process` stand in only when the
+                // target's are missing or of another width.
+                if memory.nextn_seed.as_ref().is_some_and(|s| s.len() == target_hidden.len()) {
+                    memory.nextn_seed = Some(target_hidden.to_vec());
+                }
+                out.push(tok);
+                step(tok, pos, &mut logits, &mut memory)?;
+                pos += 1;
+            }
+            None => logits.copy_from_slice(&self.last_logits),
+        }
+        while out.len() < max_tokens {
+            let next = if temperature <= 1e-5 {
                 argmax(&logits)
             } else {
                 sample(&mut logits, None, &params, &mut rng)
             };
             out.push(next);
-            window.push(next);
+            if out.len() < max_tokens {
+                step(next, pos, &mut logits, &mut memory)?;
+                pos += 1;
+            }
         }
         metrics.draft_tokens_drafted.fetch_add(
             (out.len() - usize::from(forced.is_some())) as u64,

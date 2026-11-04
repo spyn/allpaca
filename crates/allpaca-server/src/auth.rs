@@ -154,10 +154,25 @@ fn passwords_match(expected: &str, given: &str) -> bool {
         == 0
 }
 
+/// Credential from `Authorization: Bearer`, or from `x-api-key` when that
+/// header is absent. Anthropic clients send the API key in `x-api-key`.
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    raw.strip_prefix("Bearer ")
-        .or_else(|| raw.strip_prefix("bearer "))
+    if let Some(raw) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(token) = raw
+            .strip_prefix("Bearer ")
+            .or_else(|| raw.strip_prefix("bearer "))
+            .filter(|token| !token.is_empty())
+        {
+            return Some(token);
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|token| !token.is_empty())
 }
 
 pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<String> {

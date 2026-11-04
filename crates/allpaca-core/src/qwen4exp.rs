@@ -1240,26 +1240,30 @@ fn ple_embedding(q4: &Qwen4Weights, ple: &PleSpec, token: u32, earlier: &[i64]) 
     Ok(emb)
 }
 
+/// The NextN block's starting streams for `token` after the hidden streams
+/// `hidden` (`hc * dim`, as the trunk leaves them before its output mixer):
+/// per stream `s`, `eh_proj([enorm(e) ; hnorm_s(h_s)])`, each stream normed
+/// on its own (llama.cpp `graph_mtp`). The result is `hc * dim` wide.
 fn nextn_seed(q4: &Qwen4Weights, cfg: &ModelConfig, token: u32, hidden: &[f32]) -> Result<Vec<f32>, AllpacaError> {
-    let dim = cfg.dim;
+    let (dim, hc) = (cfg.dim, q4.spec.hc);
     let blk = cfg.gguf_blk(0);
     let hnorm = q4.w(&format!("blk.{blk}.nextn.hnorm.weight"))?;
-    if hidden.len() != hnorm.len() {
+    if hidden.len() != hc * dim || hnorm.len() != hc * dim {
         return Err(load_err("NextN hidden state has the wrong width".into()));
     }
     let tok = q4.rows("token_embd.weight", token as usize, 1, dim)?;
     let mut e_norm = vec![0.0f32; dim];
-    let mut h_norm = vec![0.0f32; hidden.len()];
     rmsnorm(&tok, &q4.w(&format!("blk.{blk}.nextn.enorm.weight"))?, cfg.eps, &mut e_norm)?;
-    rmsnorm(hidden, &hnorm, cfg.eps, &mut h_norm)?;
-    if h_norm.len() != dim {
-        h_norm = mix(q4, &format!("blk.{blk}.nextn.hc_head"), false, &h_norm, dim, cfg.eps)?.0;
+    // One `[e_norm ; h_norm_s]` row per stream.
+    let mut concat = vec![0.0f32; hc * 2 * dim];
+    for (s, row) in concat.chunks_mut(2 * dim).enumerate() {
+        let (e_row, h_row) = row.split_at_mut(dim);
+        e_row.copy_from_slice(&e_norm);
+        let stream = s * dim..(s + 1) * dim;
+        rmsnorm(&hidden[stream.clone()], &hnorm[stream], cfg.eps, h_row)?;
     }
-    let mut concat = Vec::with_capacity(2 * dim);
-    concat.extend_from_slice(&e_norm);
-    concat.extend_from_slice(&h_norm);
-    let mut seed = vec![0.0f32; dim];
-    matmul_nt(&concat, &q4.w(&format!("blk.{blk}.nextn.eh_proj.weight"))?, &mut seed, 1, dim, 2 * dim)?;
+    let mut seed = vec![0.0f32; hc * dim];
+    matmul_nt(&concat, &q4.w(&format!("blk.{blk}.nextn.eh_proj.weight"))?, &mut seed, hc, dim, 2 * dim)?;
     Ok(seed)
 }
 
@@ -1309,7 +1313,7 @@ fn forward_qwen4_tokens_impl(
         let rpc = model.rpc.as_deref();
         if let Some(host) = gpu.hosted().filter(|_| row_logits.is_none() && tokens.len() > crate::qwen4_gpu::MAX_ROWS) {
             let host = host.clone();
-            return forward_pipelined(q4, gpu, rpc, &host, cfg, tokens, start_pos, logits, mem);
+            return forward_pipelined(q4, gpu, rpc, &host, cfg, tokens, start_pos, logits, out_row_hiddens, mem);
         }
         for (pass, chunk) in tokens.chunks(crate::qwen4_gpu::MAX_ROWS).enumerate() {
             let first = pass * crate::qwen4_gpu::MAX_ROWS;
@@ -1366,7 +1370,8 @@ pub(crate) fn forward_qwen4_tokens_with_hiddens(
 /// next pass's blocks up to them. Each block still sees the passes in
 /// order, so the result is that of one pass after the other. A pass goes
 /// to the worker only once the one before is back, so a single pass is in
-/// flight whatever its size. `logits` gets the last token's.
+/// flight whatever its size. `logits` gets the last token's;
+/// `out_row_hiddens`, when given, every token's hidden streams in order.
 #[allow(clippy::too_many_arguments)]
 fn forward_pipelined(
     q4: &Arc<Qwen4Weights>,
@@ -1377,13 +1382,14 @@ fn forward_pipelined(
     tokens: &[u32],
     start_pos: usize,
     logits: &mut [f32],
+    mut out_row_hiddens: Option<&mut Vec<f32>>,
     mem: &mut Qwen4Memory,
 ) -> Result<(), AllpacaError> {
     let (vocab, rows) = (cfg.vocab_size, crate::qwen4_gpu::MAX_ROWS);
     host.pipeline(|pipe| {
         // The pass whose hosted blocks the worker has, with its tokens and position.
         let mut in_flight: Option<(&[u32], usize, DevicePass)> = None;
-        let finish = |pipe: &mut crate::qwen4_remote::Pipe<'_>, mem: &mut Qwen4Memory, logits: &mut [f32], done: Option<(&[u32], usize, DevicePass)>| {
+        let mut finish = |pipe: &mut crate::qwen4_remote::Pipe<'_>, mem: &mut Qwen4Memory, logits: &mut [f32], done: Option<(&[u32], usize, DevicePass)>| {
             let Some((chunk, pos, mut pass)) = done else {
                 return Ok(());
             };
@@ -1393,10 +1399,13 @@ fn forward_pipelined(
             if let Some(times) = mem.times.as_mut() {
                 times.ffn_rpc += clock.elapsed().as_secs_f32();
             }
-            match forward_device(q4, gpu, rpc, cfg, chunk, pos, &mut logits[..vocab], None, mem, Some(Some(pass)))? {
-                Some(_) => Err(load_err("qwen4exp: a second run of hosted blocks in one pass".into())),
-                None => Ok(()),
+            if forward_device(q4, gpu, rpc, cfg, chunk, pos, &mut logits[..vocab], None, mem, Some(Some(pass)))?.is_some() {
+                return Err(load_err("qwen4exp: a second run of hosted blocks in one pass".into()));
             }
+            if let (Some(out), Some(captured)) = (out_row_hiddens.as_deref_mut(), mem.row_hiddens.take()) {
+                out.extend(captured);
+            }
+            Ok(())
         };
         for (i, chunk) in tokens.chunks(rows).enumerate() {
             let pos = start_pos + i * rows;
@@ -1518,11 +1527,11 @@ fn forward_host(
         *slot += clock.elapsed().as_secs_f32();
         clock = std::time::Instant::now();
     };
-    let embed = match mem.nextn_seed.as_deref() {
+    let mut streams = match mem.nextn_seed.as_deref() {
         Some(hidden) => nextn_seed(q4, cfg, token, hidden)?,
-        None => q4.rows("token_embd.weight", token as usize, 1, dim)?,
+        // The trunk starts from hc copies of the embedding.
+        None => q4.rows("token_embd.weight", token as usize, 1, dim)?.repeat(hc),
     };
-    let mut streams = embed.repeat(hc);
     for layer in 0..cfg.n_layers {
         if mem.trace.as_mut().is_some_and(|t| t.enter(pos, layer, cfg.n_layers, &mut streams)) {
             continue;
@@ -2013,12 +2022,14 @@ fn forward_device(
         None => {
             let mut streams = Vec::with_capacity(rows * hc * dim);
             for &token in tokens {
-                let embed = match mem.nextn_seed.as_deref() {
-                    Some(hidden) => nextn_seed(q4, cfg, token, hidden)?,
-                    None => q4.rows("token_embd.weight", token as usize, 1, dim)?,
-                };
-                for _ in 0..hc {
-                    streams.extend_from_slice(&embed);
+                match mem.nextn_seed.as_deref() {
+                    Some(hidden) => streams.extend(nextn_seed(q4, cfg, token, hidden)?),
+                    None => {
+                        let embed = q4.rows("token_embd.weight", token as usize, 1, dim)?;
+                        for _ in 0..hc {
+                            streams.extend_from_slice(&embed);
+                        }
+                    }
                 }
             }
             (streams, gpu.card_of(cfg.gguf_blk(0)), 0)
@@ -2932,6 +2943,52 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// The NextN drafter pairs each prompt token with the target's hidden
+    /// streams for the token before, so a prompt read in overlapping passes
+    /// through a worker that hosts blocks still hands back every row's
+    /// hidden streams, the same as one token at a time.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_prompt_passes_on_the_worker_keep_every_rows_hidden_streams() {
+        use allpaca_rpc::{serve_connection_ext, HipWorker, WorkerBackend};
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let backend = WorkerBackend::Hip(HipWorker::new(0).expect("HipWorker"));
+            serve_connection_ext(stream, backend, None, vec![crate::qwen4_remote::worker_extension(None)]).unwrap();
+        });
+        let tokens: Vec<u32> = (0..40u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+        let mut remote = tiny_packed_model();
+        let rt = Arc::new(crate::rpc_runtime::RpcRuntime::connect(&[addr], None).expect("connect"));
+        remote.rpc = Some(rt.clone());
+        crate::qwen4_gpu::attach(&remote, &hip, None, Some(&[2]), None).expect("attach");
+        assert!(tokens.len() > crate::qwen4_gpu::MAX_ROWS, "the prompt goes in overlapping passes");
+        let hc_dim = remote.q4x.as_ref().unwrap().spec.hc * remote.config.dim;
+        let vocab = remote.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+
+        let mut one_at_a_time = Vec::new();
+        let mut mem = Qwen4Memory::default();
+        for (pos, &t) in tokens.iter().enumerate() {
+            forward_qwen4_tokens_with_hiddens(&remote, &[t], pos, &mut logits, None, &mut one_at_a_time, &mut mem).expect("token");
+        }
+        assert_eq!(one_at_a_time.len(), tokens.len() * hc_dim);
+        // A memory with a sequence on the worker keeps its connection open.
+        drop(mem);
+
+        let (mut passes, mut mem) = (Vec::new(), Qwen4Memory::default());
+        forward_qwen4_tokens_with_hiddens(&remote, &tokens, 0, &mut logits, None, &mut passes, &mut mem).expect("prompt");
+        assert_eq!(passes.len(), one_at_a_time.len(), "a hidden row per prompt token");
+        assert_eq!(passes, one_at_a_time);
+        drop((mem, remote, rt));
+        worker.join().unwrap();
+    }
+
     /// Several sequences in one batched forward, pipelined through the
     /// worker that hosts blocks, each get the logits of their own forward:
     /// one token each, and a span of several rows next to a single one.
@@ -3255,6 +3312,134 @@ mod tests {
         let second = seeded(&swapped);
         assert!(first.iter().all(|v| v.is_finite()));
         assert!(max_diff(&first, &second) > 1e-5, "the NextN seed must mix all hidden streams");
+    }
+
+    /// llama.cpp's qwen4exp MTP graph: the NextN block starts from one
+    /// residual per stream, `eh_proj([enorm(e) ; hnorm(h_s)])`, with each
+    /// stream of the hidden RMS-normed on its own. No mixer folds the
+    /// streams together first.
+    #[test]
+    fn tiny_qwen4exp_nextn_block_starts_from_a_residual_per_stream() {
+        let model = tiny_model();
+        let q4 = model.q4x.as_ref().unwrap();
+        let (dim, hc, eps) = (model.config.dim, q4.spec.hc, model.config.eps);
+        // Streams of very different sizes: one norm over all of them is not
+        // one norm per stream.
+        let hidden: Vec<f32> = (0..hc * dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * (1 + 4 * (i / dim)) as f32 * 0.1)
+            .collect();
+        let mut mem = Qwen4Memory {
+            nextn_seed: Some(hidden.clone()),
+            trace: Some(crate::sensitivity::LayerTrace::Record { saved: Vec::new(), ran: 0 }),
+            ..Default::default()
+        };
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        forward_qwen4_token(&model, 3, 0, &mut logits, &mut mem).expect("NextN forward");
+        let Some(crate::sensitivity::LayerTrace::Record { saved, .. }) = mem.trace else {
+            panic!("the trace records block inputs");
+        };
+
+        let tok = q4.rows("token_embd.weight", 3, 1, dim).unwrap();
+        let (enorm, hnorm) = (q4.w("blk.0.nextn.enorm.weight").unwrap(), q4.w("blk.0.nextn.hnorm.weight").unwrap());
+        let eh_proj = q4.w("blk.0.nextn.eh_proj.weight").unwrap();
+        let mut e_norm = vec![0.0f32; dim];
+        rmsnorm(&tok, &enorm, eps, &mut e_norm).unwrap();
+        let mut want = Vec::with_capacity(hc * dim);
+        for s in 0..hc {
+            let mut h_norm = vec![0.0f32; dim];
+            rmsnorm(&hidden[s * dim..(s + 1) * dim], &hnorm[s * dim..(s + 1) * dim], eps, &mut h_norm).unwrap();
+            let concat = [e_norm.as_slice(), h_norm.as_slice()].concat();
+            let mut out = vec![0.0f32; dim];
+            matmul_nt(&concat, &eh_proj, &mut out, 1, dim, 2 * dim).unwrap();
+            want.extend(out);
+        }
+        let got = &saved[..hc * dim];
+        assert!(max_diff(got, &want) < 1e-5, "NextN block input differs by {}", max_diff(got, &want));
+    }
+
+    /// The hidden streams the target hands the NextN head for position `k`.
+    fn target_hiddens(hc_dim: usize, n: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|k| (0..hc_dim).map(|i| ((i * 7 + k * 13) % 11) as f32 * 0.2 - 1.0).collect())
+            .collect()
+    }
+
+    /// The head's greedy chain from `mem`: each draft goes back in at the
+    /// next position with the head's own streams as its hidden.
+    fn head_chain(model: &TinyModel, mem: &mut Qwen4Memory, first: u32, pos: usize, n: usize) -> Vec<u32> {
+        let mut out = vec![first];
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        while out.len() < n {
+            let at = pos + out.len() - 1;
+            forward_qwen4_token(model, out[out.len() - 1], at, &mut logits, mem).expect("head step");
+            out.push(crate::sampling::argmax(&logits));
+        }
+        out
+    }
+
+    /// llama.cpp `draft-mtp`: `process` pairs token `k` with the target's
+    /// hidden for `k - 1` at position `k`, and its logits predict token
+    /// `k + 1`. With the context forwarded through the target, the first
+    /// draft is that prediction for the last context token; each draft after
+    /// it feeds the one before at the next position.
+    #[test]
+    fn tiny_qwen4exp_mtp_drafts_follow_the_last_processed_pair() {
+        let model = tiny_model();
+        let hc_dim = model.q4x.as_ref().unwrap().spec.hc * model.config.dim;
+        let ctx = [3u32, 4, 5, 6, 7, 3, 4];
+        let hiddens = target_hiddens(hc_dim, ctx.len());
+        let metrics = crate::telemetry::Metrics::default();
+        let mut provider = crate::draft::Qwen4MtpProvider::new(model.clone());
+        let mut want = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        for (k, &tok) in ctx.iter().enumerate() {
+            let h_prev = if k == 0 { vec![0.0; hc_dim] } else { hiddens[k - 1].clone() };
+            provider.process(tok, k, &h_prev, &metrics).expect("process");
+            want.nextn_seed = Some(h_prev);
+            forward_qwen4_token(&model, tok, k, &mut logits, &mut want).expect("reference process");
+        }
+        let first = crate::sampling::argmax(&logits);
+        let expected = head_chain(&model, &mut want, first, ctx.len(), 3);
+
+        let drafts = provider.propose_on(&ctx, 3, 0.0, &metrics).expect("propose");
+        assert_eq!(drafts, expected);
+    }
+
+    /// After a rejected draft the target's correction is known but not yet
+    /// forwarded. Like llama.cpp's first draft step `(id_last, pending_h)`,
+    /// the head runs the correction with the target's hidden streams for the
+    /// last context token, at the position after the context.
+    #[test]
+    fn tiny_qwen4exp_mtp_correction_drafts_from_the_targets_last_hidden() {
+        let model = tiny_model();
+        let hc_dim = model.q4x.as_ref().unwrap().spec.hc * model.config.dim;
+        let ctx = [3u32, 4, 5, 6, 7, 3, 4];
+        let hiddens = target_hiddens(hc_dim, ctx.len());
+        let metrics = crate::telemetry::Metrics::default();
+        let mut provider = crate::draft::Qwen4MtpProvider::new(model.clone());
+        let mut want = Qwen4Memory::default();
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        for (k, &tok) in ctx.iter().enumerate() {
+            let h_prev = if k == 0 { vec![0.0; hc_dim] } else { hiddens[k - 1].clone() };
+            provider.process(tok, k, &h_prev, &metrics).expect("process");
+            want.nextn_seed = Some(h_prev);
+            forward_qwen4_token(&model, tok, k, &mut logits, &mut want).expect("reference process");
+        }
+        let last_hidden = &hiddens[ctx.len() - 1];
+        // Every token as the correction: an 8-token vocabulary often agrees
+        // on one by chance.
+        for correction in 0..model.config.vocab_size as u32 {
+            let mut after = want.clone();
+            after.nextn_seed = Some(last_hidden.clone());
+            forward_qwen4_token(&model, correction, ctx.len(), &mut logits, &mut after).expect("correction step");
+            let mut expected = vec![correction];
+            expected.extend(head_chain(&model, &mut after, crate::sampling::argmax(&logits), ctx.len() + 1, 3));
+
+            let drafts = provider
+                .propose_after(&ctx, correction, last_hidden, 4, 0.0, &metrics)
+                .expect("propose after a correction");
+            assert_eq!(drafts, expected, "correction {correction}");
+        }
     }
 
     #[test]

@@ -34,6 +34,8 @@ const fn ep(method: &'static str, path: &'static str, auth: bool, summary: &'sta
 
 pub const ENDPOINTS: &[Endpoint] = &[
     ep("POST", "/v1/chat/completions", true, "OpenAI-compatible chat completion; `stream: true` answers as server-sent events"),
+    ep("POST", "/v1/messages", true, "Anthropic Messages; `stream: true` answers as server-sent events"),
+    ep("POST", "/v1/responses", true, "OpenAI Responses; `stream: true` answers as server-sent events"),
     ep("POST", "/v1/systemone", true, "Decision models: typed questions (`choice`, `score`, `noul`) about a `state`, answered with probabilities"),
     ep("GET", "/v1/models", true, "The served model, in OpenAI list format"),
     ep("GET", "/v1/status", true, "Engine stats, devices, remote GPUs, host load and reload state"),
