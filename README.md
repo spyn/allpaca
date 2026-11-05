@@ -269,18 +269,65 @@ The numbers come from different builds and dates; see `docs/BENCHMARK.md` for th
 
 ## Sources and acknowledgements
 
-Ideas and formats studied and re-implemented on our own kernel ABI. DirectStorage is the one exception: its redistributable runtime is restored from Microsoft's pinned NuGet package at build time.
+Allpaca stands on a lot of other people's work. The ideas and formats below were studied and re-implemented on our own kernel ABI; no third-party GPU runtime is linked in. DirectStorage is the one exception: its redistributable runtime is restored from Microsoft's pinned NuGet package at build time.
 
-| Source | What we took |
+### Papers we implemented or built on
+
+| Paper | What we took |
 |---|---|
-| [llama.cpp](https://github.com/ggerganov/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) | GGUF layout, quant block formats, the numeric reference we test against |
-| [FreeToken](https://arxiv.org/abs/2608.16157) | Edge MoE: host expert pool, GPU LRU slots, CPU/PCIe miss split, elastic VRAM |
-| kimi-k3-in-c and related dense-offload work | Pin-prefix + ring for dense layer streaming |
-| Speculative decoding literature (MTP, DFlash / DSpark, tree verify) | Draft providers and verification |
-| [AMD ROCm / HIP](https://rocm.docs.amd.com/) | Runtime, multi-device and peer copies |
+| [FreeToken](https://arxiv.org/abs/2608.16157) ([code](https://github.com/FlashML-org/FreeToken)) | Edge MoE serving: host expert pool, GPU LRU slots, the PCIe/CPU miss split (`q* ≈ m·B_P/B_H`), elastic VRAM, FTW-style weight banks, semantic anchors |
+| [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192) (Leviathan et al.) | Draft-then-verify decoding that keeps the target model's output |
+| [SpecInfer](https://arxiv.org/abs/2305.09781) | Tree-based candidate generation and verification |
+| [Medusa](https://arxiv.org/abs/2401.10774) | Multiple decoding heads and tree verify |
+| [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) | Multi-token prediction (MTP / NextN) heads as a drafter |
+| [LayerSkip](https://arxiv.org/abs/2404.16710) | Early exit and self-speculation, only for models trained for it (`allpaca.early_exit.*`) |
+| [Transformers are SSMs (Mamba-2)](https://arxiv.org/abs/2405.21060) | The SSD scan in the `nemotron_h_moe` hybrid |
+| [Gated Delta Networks](https://arxiv.org/abs/2412.06464) | The Gated DeltaNet layers of Qwen3-Coder-Next and Flash-Next |
+| [StreamingLLM](https://arxiv.org/abs/2309.17453) and [H₂O](https://arxiv.org/abs/2306.14048) | Attention sinks and cold-KV trimming for expert headroom |
+| [GPTQ](https://arxiv.org/abs/2210.17323) | Column-by-column error-compensated rounding onto `Q2_0` |
+| [GSQ (Gumbel-Softmax Quantization)](https://arxiv.org/abs/2604.18556) | 2-bit grid quantisation onto `Q2_0`, and the Flash-Next GSQ files |
+| [RCO (Riemannian Constrained Optimization)](https://arxiv.org/abs/2605.00649) | Search-time bit widths per layer and expert pruning under a budget |
+
+### Papers we studied (research notes; not adopted, or parked)
+
+| Paper | Why we looked |
+|---|---|
+| [NCM](https://arxiv.org/abs/2610.14162) ([code](https://github.com/HazyResearch/ncm)) | Coarse-to-fine generation in one pass per level; no chat checkpoint to run |
+| [HySparse2](https://arxiv.org/abs/2609.26368) | Hybrid sparse attention with two-level KV sharing; needs a model trained with it |
+| [FlashMap](https://arxiv.org/abs/2610.24365) | One-pass 16-token block drafter, a DFlash alternative |
+| [SSD-LLaMA](https://arxiv.org/abs/2609.18110) and [SGLang SSD Expert Pack](https://lmsys.org/blog/2026-08-29-sglang-ssd-expert-pack/) | Serving experts from NVMe as whole aligned blocks with a pinned staging pool |
+| [WiCi](https://arxiv.org/abs/2608.24204) ([articles](https://wici.ai/article/nearby-gpu-feel-local)) | Remote GPUs over the network; we kept our own RPC, but took "don't wait for replies you don't need" |
+| [LiliCorr](https://arxiv.org/abs/2608.20530) | Rescoring DFlash draft candidates |
+| [ExpertFlow](https://arxiv.org/abs/2510.26730), [ProMoE](https://arxiv.org/abs/2410.22134), [Pre-gated MoE](https://arxiv.org/abs/2308.12066) | Predicting which experts a token will need before its router runs |
+| [HPIM](https://arxiv.org/abs/2509.12993) and [CXL-PNM KV management](https://arxiv.org/abs/2511.00321) | Processing-in-memory for long context; hardware research, not something a desktop can switch on |
+
+### Projects and code
+
+| Project | What we took or compared against |
+|---|---|
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) | GGUF layout, quant block formats, tokenizer pre-split rules, and the numeric reference every model is checked against. Many of its PRs informed DFlash2, MTP and the kernels |
+| [Unsloth](https://huggingface.co/unsloth) | The UD GGUF quants most of our test models use |
+| [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) | Pin-prefix + ring for streaming a dense trunk (never LRU a cyclic layer walk) |
+| [ROCmFPX](https://github.com/ROCmFPX/ROCmFPX) and the community ROCmFP4 GGUF work | ROCmFP4 (types 100/101) and ROCmFPX Q8 (type 103) formats |
+| [HaloFPX](https://github.com/julianmb/halofpx) | Strix Halo build and quantisation recipes for ROCmFPX (e.g. keep MTP heads at FP16/Q8_0) |
+| [MoESQ](https://github.com/IST-DASLab/MoESQ) (IST-DASLab) | The paired-4:8 sparse FP4 expert format (our type 200) |
+| [LMCache](https://github.com/LMCache/LMCache) | Ideas for the radix prompt cache: codecs, background writes, a remote store |
+| [Strata](https://github.com/Niko1221/Strata) | Per-expert GPU cache with CPU misses and adaptive swaps |
+| [llama-wackMall](https://github.com/miltos22/llama-wackMall) | Expert caching on AMD; the int8 kernel rows-per-block fix came out of reviewing it |
+| [buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) | Per-expert cache baseline for our own expert cache work |
+| [Avalon](https://github.com/freriadoc/Avalon), [Infernix](https://github.com/wallawalla47/infernix), [Betelgeuse](https://github.com/Betelgeuse-AI/Betelgeuse) | Community Flash-Next / MoE engines: expert caching on one RX 7900 XT, a DFlash2 drafter on an RTX 5090, expert streaming with a host victim cache on an RTX 3060 |
+| [EAGLE-4](https://github.com/eagle-hq/EAGLE-4) | Its speculation cost model and low-rank candidate head |
+| [DeepInfer](https://github.com/deepseek-ai/DeepInfer) and [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) | DeepSeek-V4 reference behaviour (parity checks), and where a prompt cache should checkpoint |
+| [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang), [AITER](https://github.com/ROCm/aiter), [TransformerEngine](https://github.com/ROCm/TransformerEngine) | Kernel and serving techniques for AMD GPUs |
+| [2x R9700 RDNA4 SGLang inference](https://github.com/mattbucci/2x-R9700-RDNA4-GFX1201-sglang-inference) | RDNA4 (gfx1201) peer-access and attention-split findings |
+| [triton-gfx906](https://github.com/nlzy/triton-gfx906) | The gfx906 BF16 GEMM tile shape that our HIP kernel copied |
+| [Edge0](https://github.com/Edge0-AI/edge0) | HF checkpoint loading and the CPU MLA reference |
+| [AMD ROCm / HIP](https://rocm.docs.amd.com/) and [TheRock](https://github.com/ROCm/TheRock) | Runtime, multi-device, peer copies; ROCm 10.1 builds |
 | [Microsoft DirectStorage](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directstorage) | File → D3D12 → HIP uploads on Windows |
 | [Hugging Face Tokenizers](https://github.com/huggingface/tokenizers), [Hub](https://huggingface.co/docs/hub) and [SafeTensors](https://huggingface.co/docs/safetensors) | Tokenizers, downloads, weights |
 | [llguidance](https://github.com/guidance-ai/llguidance) | Constrained JSON Schema / Lark decoding |
+
+Internal research notes behind the cut list: [`docs/EXECUTIVE_RESEARCH.md`](docs/EXECUTIVE_RESEARCH.md), [`docs/GEM_RESEARCH.md`](docs/GEM_RESEARCH.md), [`docs/OPPORTUNITY_DESIGN.md`](docs/OPPORTUNITY_DESIGN.md).
 
 ## License
 
