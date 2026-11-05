@@ -231,13 +231,23 @@ fn e4m3(x: f32) -> f32 {
     value(best).copysign(x)
 }
 
+/// 2^ceil(log2(x)) for a positive normal `x`, read from the float's bits as
+/// DeepSeek's kernels do (inference/kernel.py `fast_round_scale`), so a value
+/// a hair above a power of two is never rounded down to it.
+fn pow2_ceil(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0);
+    2f32.powi(exp)
+}
+
 /// Round the first `nope` values of a key to FP8 (E4M3) with a power-of-two
 /// scale per 64 values, as the model's KV cache stores them.
 pub fn fp8_quantize(row: &mut [f32], nope: usize) {
+    const INV_MAX: f32 = 1.0 / 448.0;
     let nope = nope.min(row.len());
     for block in row[..nope].chunks_mut(64) {
         let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0e-4);
-        let scale = 2f32.powi((amax / 448.0).log2().ceil() as i32);
+        let scale = pow2_ceil(amax * INV_MAX);
         for v in block {
             *v = e4m3((*v / scale).clamp(-448.0, 448.0)) * scale;
         }
@@ -573,6 +583,21 @@ mod tests {
         fp8_quantize(&mut tail, 64);
         assert_eq!(tail[63], 3.25);
         assert_eq!(tail[64], 3.3);
+    }
+
+    #[test]
+    fn fp8_scale_is_the_exact_power_of_two_ceiling_of_amax_over_448() {
+        // DeepSeek's act_quant (inference/kernel.py fast_round_scale) takes
+        // ceil(log2(amax * (1/448))) from the float's bits. Just above
+        // amax = 1.75 that is 2^-7; a float log2 rounds to exactly -8 and
+        // picks 2^-8, which moves small values to a finer subnormal grid.
+        let mut row = vec![0.0f32; 64];
+        row[0] = 1.75 + 2f32.powi(-23);
+        row[1] = 5.0 * 2f32.powi(-19);
+        fp8_quantize(&mut row, 64);
+        // 5 * 2^-19 / 2^-7 = 0.625 * 2^-9 rounds to one E4M3 subnormal step.
+        assert_eq!(row[1], 2f32.powi(-16));
+        assert_eq!(row[0], 1.75);
     }
 
     #[test]
