@@ -3957,7 +3957,7 @@ __device__ inline uint32_t allpaca_vsub4(uint32_t a, uint32_t b) {
 }
 
 /* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`. */
-template <int QT, int MR, int LPC>
+template <int QT, int MR, int LPC, bool LF = ALLPACA_I8_LOADS_FIRST != 0>
 __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const uint8_t *b,
                                        float *c, int m, int n, int k, int bx, int row0) {
     constexpr int BB = KqBlock<QT>::bytes;
@@ -4113,38 +4113,38 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                     }
                     const float s = d * static_cast<float>(sc[h * 8 + j0 / 16 + 2 * g]);
                     const int bi = ib * 8 + h * 4 + g;
-#if ALLPACA_I8_LOADS_FIRST
-                    uint32_t av[MR][NC];
-                    float ds[MR];
+                    if constexpr (LF) {
+                        uint32_t av[MR][NC];
+                        float ds[MR];
 #pragma unroll
-                    for (int r = 0; r < MR; ++r) {
-                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av[r]);
-                        ds[r] = drow[r][bi];
-                    }
-#pragma unroll
-                    for (int r = 0; r < MR; ++r) {
-                        int32_t dot = 0, sum = 0;
-#pragma unroll
-                        for (int t = 0; t < NC; ++t) {
-                            dot = i8dot4(av[r][t], q[t], dot);
-                            sum = i8dot4(av[r][t], ONES, sum);
+                        for (int r = 0; r < MR; ++r) {
+                            kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av[r]);
+                            ds[r] = drow[r][bi];
                         }
-                        acc[r] += s * ds[r] * static_cast<float>(dot - 32 * sum);
-                    }
-#else
 #pragma unroll
-                    for (int r = 0; r < MR; ++r) {
-                        uint32_t av[NC];
-                        kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
-                        int32_t dot = 0, sum = 0;
+                        for (int r = 0; r < MR; ++r) {
+                            int32_t dot = 0, sum = 0;
 #pragma unroll
-                        for (int t = 0; t < NC; ++t) {
-                            dot = i8dot4(av[t], q[t], dot);
-                            sum = i8dot4(av[t], ONES, sum);
+                            for (int t = 0; t < NC; ++t) {
+                                dot = i8dot4(av[r][t], q[t], dot);
+                                sum = i8dot4(av[r][t], ONES, sum);
+                            }
+                            acc[r] += s * ds[r] * static_cast<float>(dot - 32 * sum);
                         }
-                        acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
+                    } else {
+#pragma unroll
+                        for (int r = 0; r < MR; ++r) {
+                            uint32_t av[NC];
+                            kq_load_u32s<NC>(arow[r] + bi * 32 + j0, av);
+                            int32_t dot = 0, sum = 0;
+#pragma unroll
+                            for (int t = 0; t < NC; ++t) {
+                                dot = i8dot4(av[t], q[t], dot);
+                                sum = i8dot4(av[t], ONES, sum);
+                            }
+                            acc[r] += s * drow[r][bi] * static_cast<float>(dot - 32 * sum);
+                        }
                     }
-#endif
                 }
             } else {
                 const float d = allpaca_f16le_to_f32(blk);
@@ -4177,51 +4177,51 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                 const float dh = d * static_cast<float>(sc2);
                 const float mh = dmin * static_cast<float>(m2);
                 const int bl = ib * 8 + 2 * g;
-#if ALLPACA_I8_LOADS_FIRST
-                uint32_t alo[MR][NC], ahi[MR][NC];
-                float dsl[MR], dsh[MR];
+                if constexpr (LF) {
+                    uint32_t alo[MR][NC], ahi[MR][NC];
+                    float dsl[MR], dsh[MR];
 #pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo[r]);
-                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi[r]);
-                    dsl[r] = drow[r][bl];
-                    dsh[r] = drow[r][bl + 1];
-                }
-#pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
-#pragma unroll
-                    for (int t = 0; t < NC; ++t) {
-                        il = i8dot4(alo[r][t], lo[t], il);
-                        sl_ = i8dot4(alo[r][t], ONES, sl_);
-                        ih = i8dot4(ahi[r][t], hi[t], ih);
-                        sh = i8dot4(ahi[r][t], ONES, sh);
+                    for (int r = 0; r < MR; ++r) {
+                        kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo[r]);
+                        kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi[r]);
+                        dsl[r] = drow[r][bl];
+                        dsh[r] = drow[r][bl + 1];
                     }
-                    acc[r] += dsl[r] * (dl * static_cast<float>(il) -
-                                        ml * static_cast<float>(sl_)) +
-                              dsh[r] * (dh * static_cast<float>(ih) -
-                                        mh * static_cast<float>(sh));
-                }
-#else
 #pragma unroll
-                for (int r = 0; r < MR; ++r) {
-                    uint32_t alo[NC], ahi[NC];
-                    kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo);
-                    kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi);
-                    int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+                    for (int r = 0; r < MR; ++r) {
+                        int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
 #pragma unroll
-                    for (int t = 0; t < NC; ++t) {
-                        il = i8dot4(alo[t], lo[t], il);
-                        sl_ = i8dot4(alo[t], ONES, sl_);
-                        ih = i8dot4(ahi[t], hi[t], ih);
-                        sh = i8dot4(ahi[t], ONES, sh);
+                        for (int t = 0; t < NC; ++t) {
+                            il = i8dot4(alo[r][t], lo[t], il);
+                            sl_ = i8dot4(alo[r][t], ONES, sl_);
+                            ih = i8dot4(ahi[r][t], hi[t], ih);
+                            sh = i8dot4(ahi[r][t], ONES, sh);
+                        }
+                        acc[r] += dsl[r] * (dl * static_cast<float>(il) -
+                                            ml * static_cast<float>(sl_)) +
+                                  dsh[r] * (dh * static_cast<float>(ih) -
+                                            mh * static_cast<float>(sh));
                     }
-                    acc[r] += drow[r][bl] * (dl * static_cast<float>(il) -
-                                             ml * static_cast<float>(sl_)) +
-                              drow[r][bl + 1] * (dh * static_cast<float>(ih) -
-                                                 mh * static_cast<float>(sh));
+                } else {
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        uint32_t alo[NC], ahi[NC];
+                        kq_load_u32s<NC>(arow[r] + bl * 32 + j0, alo);
+                        kq_load_u32s<NC>(arow[r] + bl * 32 + 32 + j0, ahi);
+                        int32_t il = 0, sl_ = 0, ih = 0, sh = 0;
+#pragma unroll
+                        for (int t = 0; t < NC; ++t) {
+                            il = i8dot4(alo[t], lo[t], il);
+                            sl_ = i8dot4(alo[t], ONES, sl_);
+                            ih = i8dot4(ahi[t], hi[t], ih);
+                            sh = i8dot4(ahi[t], ONES, sh);
+                        }
+                        acc[r] += drow[r][bl] * (dl * static_cast<float>(il) -
+                                                 ml * static_cast<float>(sl_)) +
+                                  drow[r][bl + 1] * (dh * static_cast<float>(ih) -
+                                                     mh * static_cast<float>(sh));
+                    }
                 }
-#endif
             }
         }
     }
@@ -4239,11 +4239,11 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
     }
 }
 
-template <int QT, int MR, int LPC>
+template <int QT, int MR, int LPC, bool LF = ALLPACA_I8_LOADS_FIRST != 0>
 __global__ void gemv_nt_kquant_i8_kernel(const int8_t *aq, const float *ad, const uint8_t *b,
                                          float *c, int m, int n, int k) {
-    kquant_i8_block<QT, MR, LPC>(aq, ad, b, c, m, n, k, static_cast<int>(blockIdx.x),
-                                 static_cast<int>(blockIdx.y) * MR);
+    kquant_i8_block<QT, MR, LPC, LF>(aq, ad, b, c, m, n, k, static_cast<int>(blockIdx.x),
+                                     static_cast<int>(blockIdx.y) * MR);
 }
 
 /* Q3_K..Q6_K int8 GEMV for 9..16 rows (a prefill pass). `kquant_i8_block`
@@ -4621,12 +4621,48 @@ static int kq_i8_lanes(int qt, int n) {
     return 8;
 }
 
-template <int QT, int LPC>
+/* On wave32 cards (RDNA), verify batches (2..8 rows) and prefill blocks
+ * issue every row's activation loads before any of the row's math
+ * (`kquant_i8_block<..., LF = true>`). Same arithmetic in the same order, so
+ * the same bits as the m = 1 decode kernel; only the schedule differs.
+ * Without it clang 21 (HIP SDK 7.1) keeps Q4_K at 8 rows and Q5_K at 5..8
+ * rows in ~60 VGPRs and waits for each row's loads in turn (board P6,
+ * measured, 5120x5120: Q4_K m=8 68 -> 41 us on the RX 9070, 108 -> 66 on the
+ * RX 9060 XT; m=1 is 29 / 53). Decode (m = 1) and wave64 cards (the MI50, not
+ * measured) keep the compiler default. Override: 0 = that pick, 1 = off,
+ * 2 = on; it only serves tests and benches. Without one,
+ * ALLPACA_KQ_LOADS_FIRST=0 runs every row count off (an SDK 7.1 build's
+ * schedule before P6) and =1 on, for A/B runs of a whole server. */
+static std::atomic<int> g_kq_lf_override{0};
+
+static int kq_lf_env() {
+    static const int mode = [] {
+        const char *v = std::getenv("ALLPACA_KQ_LOADS_FIRST");
+        if (v && v[0] == '0') {
+            return 1;
+        }
+        if (v && v[0] == '1') {
+            return 2;
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+extern "C" int allpaca_kquant_i8_set_loads_first(int32_t mode) {
+    if (mode < 0 || mode > 2) {
+        return ALLPACA_ERR_INVALID;
+    }
+    g_kq_lf_override.store(mode, std::memory_order_relaxed);
+    return ALLPACA_OK;
+}
+
+template <int QT, int LPC, bool LF = ALLPACA_I8_LOADS_FIRST != 0>
 static void kq_i8_dispatch(dim3 grid, dim3 block, hipStream_t stream, int mr, const int8_t *aq,
                            const float *ad, const uint8_t *b, float *c, int m, int n, int k) {
 #define KQ_I8_LAUNCH(MRV)                                                                          \
-    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPC>), grid, block, 0, stream, aq, ad,   \
-                       b, c, m, n, k)
+    hipLaunchKernelGGL((gemv_nt_kquant_i8_kernel<QT, MRV, LPC, LF>), grid, block, 0, stream, aq,   \
+                       ad, b, c, m, n, k)
     if (mr == 1) {
         KQ_I8_LAUNCH(1);
     } else if (mr == 2) {
@@ -4677,6 +4713,21 @@ static int launch_kquant_i8(const float *a, const uint8_t *b, float *c, int32_t 
             const dim3 tgrid(gx, static_cast<unsigned>((m + KQ_TILE_ROWS - 1) / KQ_TILE_ROWS));
             hipLaunchKernelGGL((gemv_nt_kquant_i8_tile_kernel<QT, 8>), tgrid, block, 0, stream, aq,
                                ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
+        int lf = g_kq_lf_override.load(std::memory_order_relaxed);
+        if (lf == 0) {
+            lf = kq_lf_env();
+        }
+        if (lf == 0 && m >= 2 && !kq_wave64()) {
+            lf = 2;
+        }
+        if (lf == 2) {
+            kq_i8_dispatch<QT, 8, true>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
+            return hip_status(hipGetLastError());
+        }
+        if (lf == 1) {
+            kq_i8_dispatch<QT, 8, false>(grid, block, stream, mr, aq, ad, b, c, m, n, k);
             return hip_status(hipGetLastError());
         }
     }
@@ -12174,6 +12225,8 @@ extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int
 extern "C" int allpaca_kquant_i8_lanes(int32_t, int32_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
+
+extern "C" int allpaca_kquant_i8_set_loads_first(int32_t) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_gemm_nt_q2_0(const float *, const uint8_t *, float *, int32_t, int32_t,
                                     int32_t, allpaca_stream_t) {
