@@ -395,6 +395,12 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_hip_device_multiprocessors(id: i32, count: *mut i32) -> i32;
         pub fn allpaca_attn_dpt(head_dim: i32) -> i32;
+        pub fn allpaca_attn_chunk_plan(
+            n_keys: i32,
+            mp_count: i32,
+            n_chunks: *mut i32,
+            chunk_len: *mut i32,
+        );
         pub fn allpaca_hip_can_p2p(src: i32, dst: i32, can: *mut i32) -> i32;
         pub fn allpaca_hip_enable_peer_access(src: i32, dst: i32) -> i32;
         pub fn allpaca_hip_malloc(ptr: *mut *mut c_void, bytes: usize, device: i32) -> i32;
@@ -991,6 +997,22 @@ mod ffi {
             n_kv_heads: i32,
             head_dim: i32,
             causal: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_attention_decode_times(
+            q: *const f32,
+            k: *const f32,
+            v: *const f32,
+            out: *mut f32,
+            n_kv: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            causal: i32,
+            n_chunks: *mut i32,
+            chunk_len: *mut i32,
+            split_us: *mut i64,
+            merge_us: *mut i64,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_attention_wmma_prefill(
@@ -1723,6 +1745,36 @@ pub fn device_multiprocessors(id: i32) -> Option<u32> {
         let _ = id;
         None
     }
+}
+
+/// Chunk count and chunk length for a row that can see `n_keys` keys.
+///
+/// Chunks stay 128 keys until `ceil(n_keys / 128)` would exceed the device
+/// processor count (`mp_count`, treated as 1 when it is not positive). Past
+/// that the chunk length grows by multiples of 128 and the count stays within
+/// the cap. A row's plan depends only on the keys it can see, so a one-row
+/// call and that same row inside a longer call share boundaries. One chunk is
+/// the single-pass result.
+///
+/// The add in the ceiling division saturates, so a huge `n_keys` does not wrap.
+#[must_use]
+#[inline]
+pub const fn attn_chunk_plan(n_keys: i32, mp_count: i32) -> (i32, i32) {
+    const UNIT: i32 = 128;
+    const fn ceil_div(n: i32, d: i32) -> i32 {
+        n.saturating_add(d - 1) / d
+    }
+    if n_keys <= UNIT {
+        return (1, UNIT);
+    }
+    let cap = if mp_count > 0 { mp_count } else { 1 };
+    let uncapped = ceil_div(n_keys, UNIT);
+    if uncapped <= cap {
+        return (uncapped, UNIT);
+    }
+    let len = ceil_div(ceil_div(n_keys, cap), UNIT).saturating_mul(UNIT);
+    // `len` is at least UNIT and `n_keys` is greater than UNIT, so the count is at least 1.
+    (ceil_div(n_keys, len), len)
 }
 
 /// Attention-kernel template bucket for a head_dim: ceil(head_dim/32) rounded
@@ -6208,6 +6260,99 @@ pub fn attention_wmma_prefill(
     attention_on(
         0, q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, true,
     )
+}
+
+/// Device time of one decode row on the split and tree-merge path.
+///
+/// [`attention`] does not record events or sync. The first call in a process
+/// pays for loading the kernel and allocating partial scratch; time a later call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct AttnDecodeTime {
+    /// Chunks selected for this row from the device processor count.
+    pub n_chunks: i32,
+    /// Keys in each chunk. A multiple of 128.
+    pub chunk_len: i32,
+    /// Split kernel, microseconds.
+    pub split_us: i64,
+    /// Tree-merge kernels, microseconds.
+    pub merge_us: i64,
+}
+
+/// Time the split and the tree merge of one decode row (`n_q` is 1).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_times(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_kv: i32,
+    n_heads: i32,
+    n_kv_heads: i32,
+    head_dim: i32,
+    causal: bool,
+) -> Result<AttnDecodeTime, AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let q_bytes = q.len() * 4;
+        let k_bytes = k.len() * 4;
+        let v_bytes = v.len() * 4;
+        let o_bytes = out.len() * 4;
+        let dq = device_malloc(q_bytes, 0)?;
+        let dk = device_malloc(k_bytes, 0)?;
+        let dv = device_malloc(v_bytes, 0)?;
+        let dout = device_malloc(o_bytes, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(dq, q.as_ptr().cast(), q_bytes, MEMCPY_H2D)?;
+            memcpy(dk, k.as_ptr().cast(), k_bytes, MEMCPY_H2D)?;
+            memcpy(dv, v.as_ptr().cast(), v_bytes, MEMCPY_H2D)?;
+            let mut n_chunks = 0i32;
+            let mut chunk_len = 0i32;
+            let mut split_us = 0i64;
+            let mut merge_us = 0i64;
+            // SAFETY: the four device buffers match the host slices and are freed
+            // after this call returns. The timed entry syncs before it returns.
+            let rc = unsafe {
+                ffi::allpaca_attention_decode_times(
+                    dq.cast(),
+                    dk.cast(),
+                    dv.cast(),
+                    dout.cast(),
+                    n_kv,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    i32::from(causal),
+                    &mut n_chunks,
+                    &mut chunk_len,
+                    &mut split_us,
+                    &mut merge_us,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "attention decode times")?;
+            memcpy(out.as_mut_ptr().cast(), dout, o_bytes, MEMCPY_D2H)?;
+            Ok(AttnDecodeTime {
+                n_chunks,
+                chunk_len,
+                split_us,
+                merge_us,
+            })
+        })();
+        device_free(dq, q_bytes);
+        device_free(dk, k_bytes);
+        device_free(dv, v_bytes);
+        device_free(dout, o_bytes);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (q, k, v, out, n_kv, n_heads, n_kv_heads, head_dim, causal);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP attention unavailable; use CPU fallback".into(),
+        )))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13614,6 +13759,97 @@ impl Drop for HipWorkspace {
 mod tests {
     use super::*;
 
+    /// Chunks stay 128 keys until a row would launch more of them than the
+    /// device has processors. Past that the chunk grows by multiples of 128
+    /// and the count stays within the cap. A row's plan depends on the keys
+    /// it can see, so a one-row call and that row inside a longer call agree.
+    #[test]
+    fn attn_chunk_plan_keeps_128_until_the_device_cap() {
+        assert_eq!(attn_chunk_plan(1, 28), (1, 128));
+        assert_eq!(attn_chunk_plan(128, 16), (1, 128));
+        assert_eq!(attn_chunk_plan(129, 28), (2, 128));
+        assert_eq!(attn_chunk_plan(1000, 28), (8, 128));
+        assert_eq!(attn_chunk_plan(2049, 28), (17, 128));
+        assert_eq!(attn_chunk_plan(2049, 16), (9, 256));
+        assert_eq!(attn_chunk_plan(32_768, 28), (26, 1280));
+        assert_eq!(attn_chunk_plan(32_768, 16), (16, 2048));
+        assert_eq!(attn_chunk_plan(131_072, 28), (28, 4736));
+        assert_eq!(attn_chunk_plan(131_072, 16), (16, 8192));
+        assert_eq!(attn_chunk_plan(5_000, 1), (1, 5120));
+        for (n_keys, cap) in [(3_000, 16), (32_768, 28), (131_072, 60), (200_000, 28)] {
+            let (n, len) = attn_chunk_plan(n_keys, cap);
+            assert!(n >= 1 && n <= cap, "n={n} cap={cap}");
+            assert_eq!(len % 128, 0, "len={len}");
+            assert!(n * len >= n_keys && (n - 1) * len < n_keys, "n={n} len={len} keys={n_keys}");
+        }
+    }
+
+    /// The HIP kernels use the same chunk plan as [`attn_chunk_plan`].
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn attn_chunk_plan_matches_the_hip_kernel() {
+        let cases = [
+            (1, 28),
+            (128, 16),
+            (129, 28),
+            (1000, 28),
+            (2049, 28),
+            (2049, 16),
+            (32_768, 28),
+            (32_768, 16),
+            (131_072, 28),
+            (131_072, 16),
+            (5_000, 1),
+            (0, 28),
+            (4096, 0),
+        ];
+        for (n_keys, cap) in cases {
+            let mut n = -1;
+            let mut len = -1;
+            unsafe { ffi::allpaca_attn_chunk_plan(n_keys, cap, &mut n, &mut len) };
+            assert_eq!(attn_chunk_plan(n_keys, cap), (n, len), "keys={n_keys} cap={cap}");
+        }
+    }
+
+    /// Long-context decode reports a separate split time and merge time, and
+    /// the chunk plan is the one [`attn_chunk_plan`] computes for this device.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn attention_split_and_merge_are_timed_at_long_context() {
+        if device_count() == 0 {
+            return;
+        }
+        let n_heads = 8i32;
+        let n_kv_heads = 2i32;
+        let head_dim = 128i32;
+        let mp = device_multiprocessors(0).unwrap_or(1);
+        let mp_i = i32::try_from(mp).unwrap_or(1);
+        for n_kv in [32_768i32, 131_072] {
+            let qn = (n_heads * head_dim) as usize;
+            let kn = (n_kv as usize) * (n_kv_heads * head_dim) as usize;
+            let q = vec![0.02f32; qn];
+            let k = vec![0.01f32; kn];
+            let v = vec![0.03f32; kn];
+            let mut out = vec![0.0f32; qn];
+            let _warm = attention_decode_times(
+                &q, &k, &v, &mut out, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("warmup");
+            let t = attention_decode_times(
+                &q, &k, &v, &mut out, n_kv, n_heads, n_kv_heads, head_dim, true,
+            )
+            .expect("time");
+            let (expect_n, expect_len) = attn_chunk_plan(n_kv, mp_i);
+            eprintln!(
+                "attn decode mp={mp_i} n_kv={n_kv} chunks={} len={} split_us={} merge_us={}",
+                t.n_chunks, t.chunk_len, t.split_us, t.merge_us
+            );
+            assert_eq!((t.n_chunks, t.chunk_len), (expect_n, expect_len));
+            assert!(t.split_us > 0, "split time");
+            assert!(t.merge_us > 0, "merge time");
+        }
+    }
+
     /// Q4_K bytes with sane super-block scales, for the int8 GEMV path.
     fn q4_k_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
         (0..n * k / 256 * 144)
@@ -20933,6 +21169,9 @@ mod tests {
             // (split + merge), multi-row calls fold them in the Q-tiled kernel.
             (5, 1000, 8, 2, 128, true),
             (3, 2049, 4, 4, 64, true),
+            // Past both the 9070 (28 WGP) and 9060 XT (16 WGP) caps, so the
+            // chunk is longer than 128 and the tree merge has to agree.
+            (4, 4096, 4, 2, 128, true),
             (2, 700, 4, 1, 128, false),
             (9, 513, 2, 2, 96, true),
             // One-row calls share each key among the query heads of a

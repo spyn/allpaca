@@ -1891,16 +1891,63 @@ __device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int caus
     return causal ? qi + (n_kv > n_q ? n_kv - n_q : 0) : n_kv - 1;
 }
 
-/* A row with more than ATTN_CHUNK keys: the keys split into chunks of
- * ATTN_CHUNK, each an online softmax from an empty state (sinks in chunk 0
- * only), folded in ascending order by attn_fold. Every kernel follows this
- * order, so a row's bits do not depend on which kernel computed it, and a row
- * with one chunk is exactly the single-pass result. Decode runs the chunks of
- * a long row in parallel (attention_split_gqa_kernel + attention_merge_kernel).
- * Inside a chunk the keys go ATTN_KT at a time (attn_tile_step). 128 against
- * 256 took a 2051-key MI50 decode row from 217 to 141 us. */
+/* A row with more than one chunk: the keys split into chunks, each an online
+ * softmax from an empty state (sinks in chunk 0 only), folded by attn_fold in
+ * the fixed tree order (disjoint pairs, odd tail kept, then left to right).
+ * Every chunked kernel follows this order, so a row's bits do not depend on
+ * which kernel computed it, and a row with one chunk is exactly the
+ * single-pass result. Chunks stay ATTN_CHUNK keys until that would launch
+ * more chunks than the device has processors; then the chunk grows by
+ * multiples of ATTN_CHUNK and the count stays within the cap. The plan is a
+ * function of the keys that row can see. Decode runs the chunks of a long row
+ * in parallel (attention_split_gqa_kernel + the pair merge). Inside a chunk
+ * the keys go ATTN_KT at a time (attn_tile_step). The per-row flash kernel is
+ * single-pass: it is the fallback for head dims outside the DPT buckets, not
+ * one of the three chunked kernels. */
 constexpr int ATTN_CHUNK = 128;
 static_assert(ATTN_CHUNK % ATTN_KT == 0, "chunks are whole key tiles");
+/* Deep enough for the carry-stack of any real processor count (peak depth is
+ * about log2(n_chunks) + 1; 16 covers tens of thousands of chunks). */
+constexpr int ATTN_FOLD_STACK = 16;
+
+/* Same arithmetic as `allpaca_hip::attn_chunk_plan`. `mp_count` <= 0 caps at
+ * one chunk. n_keys <= ATTN_CHUNK is one chunk, the single-pass result. */
+__host__ __device__ __forceinline__ void attn_chunk_plan(int n_keys, int mp_count, int &n_chunks,
+                                                        int &chunk_len) {
+    constexpr int unit = ATTN_CHUNK;
+    if (n_keys <= unit) {
+        n_chunks = 1;
+        chunk_len = unit;
+        return;
+    }
+    const int cap = mp_count > 0 ? mp_count : 1;
+    const int uncapped = (n_keys + unit - 1) / unit;
+    if (uncapped <= cap) {
+        n_chunks = uncapped;
+        chunk_len = unit;
+        return;
+    }
+    int len = (n_keys + cap - 1) / cap;
+    len = ((len + unit - 1) / unit) * unit;
+    n_chunks = (n_keys + len - 1) / len;
+    if (n_chunks < 1) {
+        n_chunks = 1;
+    }
+    chunk_len = len;
+}
+
+extern "C" void allpaca_attn_chunk_plan(int32_t n_keys, int32_t mp_count, int32_t *n_chunks,
+                                        int32_t *chunk_len) {
+    int n = 1;
+    int len = ATTN_CHUNK;
+    attn_chunk_plan(static_cast<int>(n_keys), static_cast<int>(mp_count), n, len);
+    if (n_chunks) {
+        *n_chunks = n;
+    }
+    if (chunk_len) {
+        *chunk_len = len;
+    }
+}
 /* Floats per (row, head, chunk) partial: every lane's accumulators, m, l.
  * Sized by the head_dim bucket so the scratch holds only what the launched
  * kernels write; the host launcher uses the same value for one call. */
@@ -1934,6 +1981,47 @@ __device__ __forceinline__ void attn_fold(float &m, float &l, float *acc, float 
         acc[i] = fmaf(acc[i], a, __fmul_rn(acc_b[i], b));
     }
     m = mm;
+}
+
+/* Push one finished chunk and fold while the top two spans match. That is the
+ * carry-sequence of the pair tree: (0⊕1), (2⊕3), … then the next level. */
+template <int DPT>
+__device__ void attn_tree_push(float *stack_acc, float *stack_m, float *stack_l, int *stack_span, int &sp,
+                               const float *acc, float m, float l) {
+#pragma clang fp contract(off)
+    constexpr int dims = attn_row_dims<DPT>();
+    float *dst = stack_acc + static_cast<int>(sp) * dims;
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        dst[i] = acc[i];
+    }
+    stack_m[sp] = m;
+    stack_l[sp] = l;
+    stack_span[sp] = 1;
+    ++sp;
+    while (sp >= 2 && stack_span[sp - 1] == stack_span[sp - 2]) {
+        attn_fold<DPT>(stack_m[sp - 2], stack_l[sp - 2], stack_acc + (sp - 2) * dims, stack_m[sp - 1],
+                       stack_l[sp - 1], stack_acc + (sp - 1) * dims);
+        stack_span[sp - 2] += stack_span[sp - 1];
+        --sp;
+    }
+}
+
+/* Fold whatever the carry left, left to right, into slot 0. */
+template <int DPT>
+__device__ void attn_tree_finish(float *stack_acc, float *stack_m, float *stack_l, int sp, float *acc, float &m,
+                                 float &l) {
+#pragma clang fp contract(off)
+    constexpr int dims = attn_row_dims<DPT>();
+    for (int i = 1; i < sp; ++i) {
+        attn_fold<DPT>(stack_m[0], stack_l[0], stack_acc, stack_m[i], stack_l[i], stack_acc + i * dims);
+    }
+#pragma unroll
+    for (int j = 0; j < dims; ++j) {
+        acc[j] = stack_acc[j];
+    }
+    m = stack_m[0];
+    l = stack_l[0];
 }
 
 /* One warp per (query, head), keys from global memory one at a time
@@ -2013,7 +2101,7 @@ template <int DPT, bool VEC4>
 __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const float *q, const float *k, const float *v, float *out,
                                        int n_q, int n_kv, int n_heads, int n_kv_heads, int head_dim,
                                        int causal, const uint8_t *mask, const float *sinks,
-                                       int tile) {
+                                       int tile, int mp_cap) {
     extern __shared__ float attn_lds[];
     float *k_lds = attn_lds;
     float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
@@ -2040,11 +2128,17 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
     const int block_end = mask ? n_kv : min(n_kv, attn_row_tmax(q_last, n_q, n_kv, causal) + 1);
     AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
-    /* Folded chunks before the current one. */
-    float m_acc[attn_row_dims<DPT>()];
-    float m_m = -1.0e30f, m_l = 0.0f;
-    bool folded = false;
-    int next_fold = ATTN_CHUNK;
+    /* This row's own plan: a prefix row must match a one-row call of t_end keys. */
+    int row_chunks = 1;
+    int chunk_len = ATTN_CHUNK;
+    attn_chunk_plan(t_end, mp_cap, row_chunks, chunk_len);
+    (void)row_chunks;
+    float stack_acc[ATTN_FOLD_STACK * attn_row_dims<DPT>()];
+    float stack_m[ATTN_FOLD_STACK];
+    float stack_l[ATTN_FOLD_STACK];
+    int stack_span[ATTN_FOLD_STACK];
+    int sp = 0;
+    int next_fold = chunk_len;
     for (int t0 = 0; t0 < block_end; t0 += tile) {
         __syncthreads();
         attn_stage_tile(k_lds, v_lds, k, v, t0, n_kv, tile, head_dim, kv_stride, kv_h);
@@ -2052,17 +2146,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
         const int stop = min(t_end, t0 + tile);
         for (int s = t0; s < stop; s += ATTN_KT) {
             if (s == next_fold) {
-                next_fold += ATTN_CHUNK;
-                if (folded) {
-                    attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                        m_acc[i] = r.acc[i];
-                    }
-                    m_m = r.m;
-                    m_l = r.l;
-                    folded = true;
+                next_fold += chunk_len;
+                if (sp < ATTN_FOLD_STACK) {
+                    attn_tree_push<DPT>(stack_acc, stack_m, stack_l, stack_span, sp, r.acc, r.m, r.l);
                 }
                 attn_row_reset(r);
             }
@@ -2074,14 +2160,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
         }
     }
     if (active) {
-        if (folded) {
-            attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-#pragma unroll
-            for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                r.acc[i] = m_acc[i];
-            }
-            r.m = m_m;
-            r.l = m_l;
+        if (sp > 0 && sp < ATTN_FOLD_STACK) {
+            attn_tree_push<DPT>(stack_acc, stack_m, stack_l, stack_span, sp, r.acc, r.m, r.l);
+            attn_tree_finish<DPT>(stack_acc, stack_m, stack_l, sp, r.acc, r.m, r.l);
         }
         attn_row_store(r, oh, lane, head_dim, nvec, vec4);
     }
@@ -2100,7 +2181,8 @@ constexpr int ATTN_GQA_HEADS = 8;
 template <int DPT, bool VEC4>
 __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kernel(
     const float *q, const float *k, const float *v, float *part, float *out, int n_kv, int n_heads,
-    int n_kv_heads, int head_dim, int causal, const uint8_t *mask, const float *sinks, int n_chunks, int tile) {
+    int n_kv_heads, int head_dim, int causal, const uint8_t *mask, const float *sinks, int n_chunks,
+    int chunk_len, int tile) {
     extern __shared__ float attn_lds[];
     float *k_lds = attn_lds;
     float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
@@ -2126,8 +2208,8 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, c == 0 ? sinks : nullptr, active ? h : h0);
     const int t_end = mask ? n_kv : min(n_kv, t_max + 1);
-    const int t1 = min(t_end, (c + 1) * ATTN_CHUNK);
-    for (int t0 = c * ATTN_CHUNK; t0 < t1; t0 += tile) {
+    const int t1 = min(t_end, (c + 1) * chunk_len);
+    for (int t0 = c * chunk_len; t0 < t1; t0 += tile) {
         __syncthreads();
         attn_stage_tile(k_lds, v_lds, k, v, t0, t1, tile, head_dim, kv_stride, kv_h);
         __syncthreads();
@@ -2157,7 +2239,46 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     }
 }
 
-/* Folds a row's chunk partials in ascending order and writes the row. */
+/* One warp per pair. Folds partial `right` into `left` in place. Stride 1 pairs
+ * (0,1), (2,3), …; stride 2 pairs the results; an odd tail stays put. After
+ * every stride < n_chunks, slot 0 holds the tree reduction. */
+template <int DPT>
+__global__ void __launch_bounds__(32) attention_merge_pair_kernel(float *part, int n_heads, int n_chunks, int stride) {
+    const int pair = static_cast<int>(blockIdx.x);
+    const int h = static_cast<int>(blockIdx.y);
+    const int left = pair * (2 * stride);
+    const int right = left + stride;
+    if (h >= n_heads || right >= n_chunks || left < 0) {
+        return;
+    }
+    const int lane = static_cast<int>(threadIdx.x);
+    constexpr int dims = attn_row_dims<DPT>();
+    const int part_floats = attn_part<DPT>();
+    float *base = part + static_cast<size_t>(h) * static_cast<size_t>(n_chunks) * part_floats;
+    float *dst = base + static_cast<size_t>(left) * part_floats;
+    const float *src = base + static_cast<size_t>(right) * part_floats;
+    float acc[dims];
+    float acc_b[dims];
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        acc[i] = dst[lane * dims + i];
+        acc_b[i] = src[lane * dims + i];
+    }
+    float m = dst[32 * dims];
+    float l = dst[32 * dims + 1];
+    attn_fold<DPT>(m, l, acc, src[32 * dims], src[32 * dims + 1], acc_b);
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        dst[lane * dims + i] = acc[i];
+    }
+    if (lane == 0) {
+        dst[32 * dims] = m;
+        dst[32 * dims + 1] = l;
+    }
+}
+
+/* Writes the tree-reduced partial in slot 0. The pair kernel has already folded
+ * the other chunks into it. */
 template <int DPT>
 __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
                                        int head_dim, int n_chunks) {
@@ -2177,15 +2298,7 @@ __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, con
     }
     r.m = src[32 * attn_row_dims<DPT>()];
     r.l = src[32 * attn_row_dims<DPT>() + 1];
-    for (int c = 1; c < n_chunks; ++c) {
-        const float *pc = src + static_cast<size_t>(c) * attn_part<DPT>();
-        float acc_b[attn_row_dims<DPT>()];
-#pragma unroll
-        for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-            acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
-        }
-        attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
-    }
+    (void)n_chunks;
     attn_row_store(r, oh, lane, head_dim, nvec, vec4);
 }
 
@@ -2200,6 +2313,37 @@ struct AttnPartScratch {
     hipStream_t stream = nullptr;
 };
 static AttnPartScratch g_attn_part[ATTN_PART_DEVICES];
+
+/* Processor count, read once per device for the life of the process. 0 means
+ * not yet read. A workspace is not required: the first attention launch on
+ * that device fills it. */
+static std::atomic<int> g_attn_mp_cap[ATTN_PART_DEVICES];
+
+static int attn_device_cap() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= ATTN_PART_DEVICES) {
+        return 1;
+    }
+    const int cached = g_attn_mp_cap[dev].load(std::memory_order_relaxed);
+    if (cached > 0) {
+        return cached;
+    }
+    int count = 1;
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0) {
+        count = prop.multiProcessorCount;
+    }
+    g_attn_mp_cap[dev].store(count, std::memory_order_relaxed);
+    return count;
+}
+
+/* How many disjoint pairs stride `stride` has in `n_chunks` partials. */
+static int attn_merge_pairs(int n_chunks, int stride) {
+    if (stride <= 0 || n_chunks <= stride) {
+        return 0;
+    }
+    return (n_chunks - stride - 1) / (2 * stride) + 1;
+}
 
 /* gfx12 WMMA flash prefill (experimental.row_variant_kernels). One wave owns 16
  * query rows of one head. QK^T and PV are v_wmma_f32_16x16x16_f16 tiles with
@@ -2471,6 +2615,28 @@ static void warn_attn_no_scratch_once() {
     }
 }
 
+/* Filled only by the measurement entry. Production launches pass null and
+ * do not record events or sync. */
+struct AttnTimes {
+    int64_t split_us;
+    int64_t merge_us;
+    int n_chunks;
+    int chunk_len;
+    int status;
+};
+
+static int64_t attn_elapsed_us(hipEvent_t from, hipEvent_t to) {
+    float ms = 0.f;
+    if (hipEventElapsedTime(&ms, from, to) != hipSuccess || !(ms > 0.f)) {
+        return 0;
+    }
+    const double us = static_cast<double>(ms) * 1000.0;
+    if (us < 1.0) {
+        return 1;
+    }
+    return static_cast<int64_t>(us);
+}
+
 /* One query, a head_dim in the DPT bucket: the tiled kernels, sized on DPT.
  * n_q == 1: attention_split_gqa_kernel, its chunks in parallel plus a merge
  * when the row is longer than one chunk. Several rows: the Q-tiled kernel.
@@ -2478,14 +2644,25 @@ static void warn_attn_no_scratch_once() {
 template <int DPT>
 static void launch_attention_tiled(const float *q, const float *k, const float *v, float *out, int n_q,
                                    int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
-                                   const uint8_t *mask, const float *sinks, hipStream_t stream) {
+                                   const uint8_t *mask, const float *sinks, hipStream_t stream,
+                                   AttnTimes *times) {
     /* About 2048 floats of K (and of V) per tile, at least one key tile: 16
      * keys at head_dim 128 or 256. On an MI50 (3199-token prompt, 14 layers)
      * 4096 lost occupancy and 1024 paid more barriers; for a 2051-key decode
      * row at head_dim 256, 32 keys were slower than 16. */
     const int tile = max(ATTN_KT, 2048 / head_dim / ATTN_KT * ATTN_KT);
     const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
-    const int n_chunks = n_kv > ATTN_CHUNK ? (n_kv + ATTN_CHUNK - 1) / ATTN_CHUNK : 1;
+    const int mp_cap = attn_device_cap();
+    int n_chunks = 1;
+    int chunk_len = ATTN_CHUNK;
+    attn_chunk_plan(n_kv, mp_cap, n_chunks, chunk_len);
+    if (times) {
+        times->n_chunks = n_chunks;
+        times->chunk_len = chunk_len;
+        times->split_us = 0;
+        times->merge_us = 0;
+        times->status = 0;
+    }
     /* Heads that share a key/value head read each key once. */
     const int per_kv = n_kv_heads > 0 ? n_heads / n_kv_heads : 1;
     const int per_block = min(per_kv, ATTN_GQA_HEADS);
@@ -2494,10 +2671,28 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
     const bool vec4 = (head_dim % 4) == 0 && (reinterpret_cast<uintptr_t>(q) % 16u) == 0;
     const dim3 split_grid(static_cast<unsigned>(n_kv_heads * groups), static_cast<unsigned>(n_chunks));
     if (n_q == 1 && n_chunks == 1) {
+        hipEvent_t ev0 = nullptr, ev1 = nullptr;
+        const bool stamp = times && hipEventCreate(&ev0) == hipSuccess && hipEventCreate(&ev1) == hipSuccess;
+        if (times && !stamp) {
+            times->status = ALLPACA_ERR_DEVICE;
+        }
+        if (stamp) {
+            (void)hipEventRecord(ev0, stream);
+        }
         hipLaunchKernelGGL((vec4 ? attention_split_gqa_kernel<DPT, true> : attention_split_gqa_kernel<DPT, false>),
                            split_grid, dim3(32 * per_block), lds, stream, q, k, v,
                            static_cast<float *>(nullptr), out, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
-                           sinks, n_chunks, tile);
+                           sinks, n_chunks, chunk_len, tile);
+        if (stamp) {
+            (void)hipEventRecord(ev1, stream);
+            if (hipEventSynchronize(ev1) != hipSuccess) {
+                times->status = ALLPACA_ERR_DEVICE;
+            } else {
+                times->split_us = attn_elapsed_us(ev0, ev1);
+            }
+            (void)hipEventDestroy(ev0);
+            (void)hipEventDestroy(ev1);
+        }
         return;
     }
     if (n_q == 1) {
@@ -2527,16 +2722,53 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
             }
             if (ok) {
                 s.stream = stream;
+                hipEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr;
+                const bool stamp = times && hipEventCreate(&ev0) == hipSuccess &&
+                                   hipEventCreate(&ev1) == hipSuccess && hipEventCreate(&ev2) == hipSuccess;
+                if (times && !stamp) {
+                    times->status = ALLPACA_ERR_DEVICE;
+                }
+                if (stamp) {
+                    (void)hipEventRecord(ev0, stream);
+                }
                 hipLaunchKernelGGL((vec4 ? attention_split_gqa_kernel<DPT, true> : attention_split_gqa_kernel<DPT, false>),
                                    split_grid, dim3(32 * per_block), lds, stream, q, k,
                                    v, s.p, static_cast<float *>(nullptr), n_kv, n_heads, n_kv_heads, head_dim, causal,
-                                   mask, sinks, n_chunks, tile);
+                                   mask, sinks, n_chunks, chunk_len, tile);
+                if (stamp) {
+                    (void)hipEventRecord(ev1, stream);
+                }
+                for (int stride = 1; stride < n_chunks && stride > 0; stride *= 2) {
+                    const int n_pairs = attn_merge_pairs(n_chunks, stride);
+                    if (n_pairs <= 0) {
+                        break;
+                    }
+                    hipLaunchKernelGGL(attention_merge_pair_kernel<DPT>,
+                                       dim3(static_cast<unsigned>(n_pairs), static_cast<unsigned>(n_heads)), dim3(32),
+                                       0, stream, s.p, n_heads, n_chunks, stride);
+                }
                 hipLaunchKernelGGL(attention_merge_kernel<DPT>, dim3(1, static_cast<unsigned>(n_heads)),
                                    dim3(32), 0, stream, q, s.p, out, n_heads, head_dim, n_chunks);
+                if (stamp) {
+                    (void)hipEventRecord(ev2, stream);
+                    if (hipEventSynchronize(ev2) != hipSuccess) {
+                        times->status = ALLPACA_ERR_DEVICE;
+                    } else {
+                        times->split_us = attn_elapsed_us(ev0, ev1);
+                        times->merge_us = attn_elapsed_us(ev1, ev2);
+                    }
+                    (void)hipEventDestroy(ev0);
+                    (void)hipEventDestroy(ev1);
+                    (void)hipEventDestroy(ev2);
+                }
                 return;
             }
         }
-        /* No scratch: the Q-tiled kernel computes the same chunked row. */
+        /* No scratch: the Q-tiled kernel computes the same chunked row.
+         * A measurement asked for the split and merge launches, which did not run. */
+        if (times && times->status == 0) {
+            times->status = ALLPACA_ERR_DEVICE;
+        }
         warn_attn_no_scratch_once();
     }
     dim3 block(32 * ATTN_QTILE);
@@ -2544,7 +2776,7 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
               static_cast<unsigned>(n_heads));
     hipLaunchKernelGGL((vec4 ? attention_qtile_kernel<DPT, true> : attention_qtile_kernel<DPT, false>),
                        grid, block, lds, stream, q, k, v, out, n_q, n_kv,
-                       n_heads, n_kv_heads, head_dim, causal, mask, sinks, tile);
+                       n_heads, n_kv_heads, head_dim, causal, mask, sinks, tile, mp_cap);
 }
 
 /* One query: attention_split_gqa_kernel, its chunks in parallel plus a merge
@@ -2553,22 +2785,30 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
  * non-positive) take the per-row kernel, whichever the row count. */
 static void launch_attention(const float *q, const float *k, const float *v, float *out, int n_q,
                              int n_kv, int n_heads, int n_kv_heads, int head_dim, int causal,
-                             const uint8_t *mask, const float *sinks, hipStream_t stream) {
+                             const uint8_t *mask, const float *sinks, hipStream_t stream,
+                             AttnTimes *times = nullptr) {
     switch (attn_dpt_bucket(head_dim)) {
     case 4:
         launch_attention_tiled<4>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
-                                  sinks, stream);
+                                  sinks, stream, times);
         return;
     case 8:
         launch_attention_tiled<8>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
-                                  sinks, stream);
+                                  sinks, stream, times);
         return;
     case 16:
         launch_attention_tiled<16>(q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, causal, mask,
-                                   sinks, stream);
+                                   sinks, stream, times);
         return;
     default:
         break;
+    }
+    if (times) {
+        times->n_chunks = 1;
+        times->chunk_len = ATTN_CHUNK;
+        times->split_us = 0;
+        times->merge_us = 0;
+        times->status = ALLPACA_ERR_NOT_IMPLEMENTED;
     }
     dim3 block(32);
     dim3 grid(static_cast<unsigned>(n_q), static_cast<unsigned>(n_heads));
@@ -8821,6 +9061,30 @@ extern "C" int allpaca_attention(const float *q, const float *k, const float *v,
     return hip_status(hipGetLastError());
 }
 
+extern "C" int allpaca_attention_decode_times(const float *q, const float *k, const float *v, float *out,
+                                             int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                             int32_t head_dim, int32_t causal, int32_t *n_chunks,
+                                             int32_t *chunk_len, int64_t *split_us, int64_t *merge_us,
+                                             allpaca_stream_t stream) {
+    if (!q || !k || !v || !out || !n_chunks || !chunk_len || !split_us || !merge_us || n_kv <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || (n_heads % n_kv_heads) != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    AttnTimes times{};
+    launch_attention(q, k, v, out, 1, n_kv, n_heads, n_kv_heads, head_dim, causal,
+                     static_cast<const uint8_t *>(nullptr), static_cast<const float *>(nullptr),
+                     as_stream(stream), &times);
+    *n_chunks = times.n_chunks;
+    *chunk_len = times.chunk_len;
+    *split_us = times.split_us;
+    *merge_us = times.merge_us;
+    if (times.status != 0) {
+        return times.status;
+    }
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_attention_wmma_prefill(const float *q, const float *k, const float *v, float *out,
                                              int32_t n_q, int32_t n_kv, int32_t n_heads,
                                              int32_t n_kv_heads, int32_t head_dim, int32_t causal,
@@ -12268,6 +12532,12 @@ extern "C" int allpaca_gemm_nt_bf16_untiled(const float *, const uint16_t *, flo
 
 extern "C" int allpaca_attention(const float *, const float *, const float *, float *, int32_t,
                                  int32_t, int32_t, int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_attention_decode_times(const float *, const float *, const float *, float *,
+                                             int32_t, int32_t, int32_t, int32_t, int32_t, int32_t *,
+                                             int32_t *, int64_t *, int64_t *, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

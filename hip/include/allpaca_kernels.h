@@ -60,6 +60,11 @@ int allpaca_hip_device_multiprocessors(int32_t id, int32_t *count);
  * kernel, so a call's split/merge/Q-tiled launches always agree. */
 int32_t allpaca_attn_dpt(int32_t head_dim);
 
+/* Chunk count and length for a row that can see `n_keys` keys, capped by
+ * `mp_count` (a non-positive count caps at one chunk). Same arithmetic as
+ * `allpaca_hip::attn_chunk_plan`. */
+void allpaca_attn_chunk_plan(int32_t n_keys, int32_t mp_count, int32_t *n_chunks, int32_t *chunk_len);
+
 int allpaca_hip_can_p2p(int32_t src, int32_t dst, int32_t *can);
 
 int allpaca_hip_enable_peer_access(int32_t src, int32_t dst);
@@ -360,6 +365,16 @@ int allpaca_mxfp4_swiglu_gate_up(const float *a, const uint8_t *bg, const uint8_
 int allpaca_attention(const float *q, const float *k, const float *v, float *out, int32_t n_q,
                       int32_t n_kv, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
                       int32_t causal, allpaca_stream_t stream);
+
+/* One decode row (n_q = 1) on the split + tree-merge path. Writes the chunk
+ * plan and the device time of the split launch and of the merge launches,
+ * in microseconds. Records events and syncs the stream. `allpaca_attention`
+ * does not. */
+int allpaca_attention_decode_times(const float *q, const float *k, const float *v, float *out,
+                                   int32_t n_kv, int32_t n_heads, int32_t n_kv_heads,
+                                   int32_t head_dim, int32_t causal, int32_t *n_chunks,
+                                   int32_t *chunk_len, int64_t *split_us, int64_t *merge_us,
+                                   allpaca_stream_t stream);
 
 /* gfx12 WMMA flash prefill: f16 Q/K/P/V tiles (power-of-two scaled, no
  * overflow), f32 accumulate; bits differ from allpaca_attention. Falls back to
