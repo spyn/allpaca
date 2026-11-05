@@ -2659,9 +2659,10 @@ impl Dsv4Gpu {
         x: &[f32],
         dim: usize,
         ff: usize,
+        limit: f32,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<f32>, AllpacaError> {
-        self.shexp_swiglu_rows(file, blk, x, 1, dim, ff, metrics)
+        self.shexp_swiglu_rows(file, blk, x, 1, dim, ff, limit, metrics)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2673,6 +2674,7 @@ impl Dsv4Gpu {
         n_tok: usize,
         dim: usize,
         ff: usize,
+        limit: f32,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<f32>, AllpacaError> {
         if n_tok == 0 {
@@ -2689,7 +2691,7 @@ impl Dsv4Gpu {
             )));
         }
         if let Some((gate, up, down)) = self.shexp_resident_ptrs(blk, dim, ff) {
-            return self.shexp_swiglu_with_ptrs(x, n_tok, dim, ff, gate, up, down, metrics);
+            return self.shexp_swiglu_with_ptrs(x, n_tok, dim, ff, gate, up, down, limit, metrics);
         }
         let hip = self.hip.clone();
         let gate = self.dense_bf16_ptr(
@@ -2728,6 +2730,7 @@ impl Dsv4Gpu {
             n_tok as i32,
             dim as i32,
             ff as i32,
+            limit,
         )?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
         self.used.store(true, Ordering::Relaxed);
@@ -2773,6 +2776,7 @@ impl Dsv4Gpu {
         gate: *const u16,
         up: *const u16,
         down: *const u16,
+        limit: f32,
         metrics: Option<&Metrics>,
     ) -> Result<Vec<f32>, AllpacaError> {
         if n_tok == 0 {
@@ -2796,13 +2800,15 @@ impl Dsv4Gpu {
             n_tok as i32,
             dim as i32,
             ff as i32,
+            limit,
         )?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
         self.used.store(true, Ordering::Relaxed);
         Ok(y)
     }
 
-    /// BF16 shared-expert SwiGLU from device `moe_x` into `moe_acc`.
+    /// BF16 shared-expert SwiGLU from device `moe_x` into `moe_acc`; `limit`
+    /// is the layer's `swiglu_clamp_shexp` (0 = none).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn shexp_accumulate_into_moe(
         &self,
@@ -2812,6 +2818,7 @@ impl Dsv4Gpu {
         gate: *const u16,
         up: *const u16,
         down: *const u16,
+        limit: f32,
         metrics: Option<&Metrics>,
     ) -> Result<(), AllpacaError> {
         if n_tok == 0 {
@@ -2825,7 +2832,7 @@ impl Dsv4Gpu {
         let hip = self.hip.clone();
         hip.bind()?;
         let t = Instant::now();
-        hip.bf16_swiglu_accumulate(gate, up, down, n_tok as i32, dim as i32, ff as i32)?;
+        hip.bf16_swiglu_accumulate(gate, up, down, n_tok as i32, dim as i32, ff as i32, limit)?;
         add_ns(metrics, |m| &m.dsv4_gemv_ns, t);
         self.used.store(true, Ordering::Relaxed);
         Ok(())

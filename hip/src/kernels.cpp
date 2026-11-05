@@ -9309,6 +9309,16 @@ __global__ void silu_mul_kernel(float *gate, const float *up, int n) {
     gate[idx] = det_silu_mul(gate[idx], up[idx]);
 }
 
+/* silu(min(gate, limit)) * clamp(up, -limit, limit): DeepSeek-V4's capped
+ * SwiGLU for the BF16 shared expert, same element math as mxfp4_swiglu. */
+__global__ void silu_mul_limit_kernel(float *gate, const float *up, int n, float limit) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    gate[idx] = mxfp4_swiglu(gate[idx], up[idx], limit);
+}
+
 __global__ void gelu_mul_kernel(float *gate, const float *up, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) {
@@ -10166,6 +10176,20 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_silu_mul_limit(float *gate, const float *up, int32_t n, float limit,
+                                      allpaca_stream_t stream) {
+    if (!gate || !up || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(silu_mul_limit_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n,
+                       limit);
     return hip_status(hipGetLastError());
 }
 
