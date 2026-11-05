@@ -198,6 +198,18 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    /// ggml IQ2_XXS (16): 2.0625 bits per weight, 256-weight blocks.
+    IQ2_XXS = 16,
+    /// ggml IQ2_XS (17): 2.3125 bits per weight.
+    IQ2_XS = 17,
+    /// ggml IQ3_XXS (18): 3.0625 bits per weight.
+    IQ3_XXS = 18,
+    /// ggml IQ1_S (19): 1.5625 bits per weight.
+    IQ1_S = 19,
+    /// ggml IQ2_S (22): 2.5625 bits per weight.
+    IQ2_S = 22,
+    /// ggml IQ1_M (29): 1.75 bits per weight.
+    IQ1_M = 29,
     /// ggml IQ3_S (ggml_type_id=21): Unsloth's UD files keep experts in it.
     IQ3_S = 21,
     /// Unsloth / ggml IQ4_NL (ggml_type_id=20).
@@ -275,6 +287,12 @@ pub fn dequant_packed(
         GgmlType::Q5_K => allpaca_cpu::dequant_q5_k(bytes, n, out),
         GgmlType::Q6_K => allpaca_cpu::dequant_q6_k(bytes, n, out),
         GgmlType::IQ3_S => allpaca_cpu::dequant_iq3_s(bytes, n, out),
+        GgmlType::IQ2_XXS => allpaca_cpu::dequant_iq2_xxs(bytes, n, out),
+        GgmlType::IQ2_XS => allpaca_cpu::dequant_iq2_xs(bytes, n, out),
+        GgmlType::IQ2_S => allpaca_cpu::dequant_iq2_s(bytes, n, out),
+        GgmlType::IQ3_XXS => allpaca_cpu::dequant_iq3_xxs(bytes, n, out),
+        GgmlType::IQ1_S => allpaca_cpu::dequant_iq1_s(bytes, n, out),
+        GgmlType::IQ1_M => allpaca_cpu::dequant_iq1_m(bytes, n, out),
         GgmlType::IQ4_NL => allpaca_cpu::dequant_iq4_nl(bytes, n, out),
         GgmlType::IQ4_XS => allpaca_cpu::dequant_iq4_xs(bytes, n, out),
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
@@ -307,6 +325,12 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            16 => Self::IQ2_XXS,
+            17 => Self::IQ2_XS,
+            18 => Self::IQ3_XXS,
+            19 => Self::IQ1_S,
+            22 => Self::IQ2_S,
+            29 => Self::IQ1_M,
             20 => Self::IQ4_NL,
             21 => Self::IQ3_S,
             23 => Self::IQ4_XS,
@@ -382,6 +406,24 @@ impl TensorInfo {
             GgmlType::IQ3_S => n
                 .div_ceil(allpaca_cpu::IQ3_S_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::IQ3_S_BLOCK_BYTES),
+            GgmlType::IQ2_XXS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_XXS_BLOCK_BYTES),
+            GgmlType::IQ2_XS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_XS_BLOCK_BYTES),
+            GgmlType::IQ2_S => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_S_BLOCK_BYTES),
+            GgmlType::IQ3_XXS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ3_XXS_BLOCK_BYTES),
+            GgmlType::IQ1_S => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ1_S_BLOCK_BYTES),
+            GgmlType::IQ1_M => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ1_M_BLOCK_BYTES),
             GgmlType::IQ4_NL => n
                 .div_ceil(allpaca_cpu::IQ4_NL_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::IQ4_NL_BLOCK_BYTES),
@@ -747,6 +789,12 @@ impl GgufFile {
             GgmlType::IQ4_NL as u32,
             GgmlType::IQ4_XS as u32,
             GgmlType::IQ3_S as u32,
+            GgmlType::IQ2_XXS as u32,
+            GgmlType::IQ2_XS as u32,
+            GgmlType::IQ2_S as u32,
+            GgmlType::IQ3_XXS as u32,
+            GgmlType::IQ1_S as u32,
+            GgmlType::IQ1_M as u32,
             GgmlType::I32 as u32,
             GgmlType::BF16 as u32,
             GgmlType::MXFP4 as u32,
@@ -767,7 +815,7 @@ impl GgufFile {
         let mut reasons = Vec::new();
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/Q1_0/Q2_0/ROCmFP4)"
             ));
         }
         let llama_family = matches!(
@@ -1129,7 +1177,14 @@ impl GgufFile {
                 allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
-            ty @ (GgmlType::Q1_0 | GgmlType::Q2_0) => {
+            ty @ (GgmlType::Q1_0
+            | GgmlType::Q2_0
+            | GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ2_S
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ1_M) => {
                 let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
@@ -2005,6 +2060,66 @@ mod tests {
         assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
         assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// ggml IQ1/IQ2/IQ3_XXS types (16-19, 22, 29): accepted by the compat
+    /// probe, sized by their 256-weight blocks and dequantised to F32 by
+    /// `allpaca_cpu`'s llama.cpp-exact decoders, whole tensor and row slice.
+    #[test]
+    fn iq1_iq2_iq3_xxs_types_load_and_dequant_to_f32() {
+        type Dequant = fn(&[u8], usize, &mut [f32]) -> Result<(), AllpacaError>;
+        let types: [(u32, usize, Dequant); 6] = [
+            (16, allpaca_cpu::IQ2_XXS_BLOCK_BYTES, allpaca_cpu::dequant_iq2_xxs),
+            (17, allpaca_cpu::IQ2_XS_BLOCK_BYTES, allpaca_cpu::dequant_iq2_xs),
+            (18, allpaca_cpu::IQ3_XXS_BLOCK_BYTES, allpaca_cpu::dequant_iq3_xxs),
+            (19, allpaca_cpu::IQ1_S_BLOCK_BYTES, allpaca_cpu::dequant_iq1_s),
+            (22, allpaca_cpu::IQ2_S_BLOCK_BYTES, allpaca_cpu::dequant_iq2_s),
+            (29, allpaca_cpu::IQ1_M_BLOCK_BYTES, allpaca_cpu::dequant_iq1_m),
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for (id, block_bytes, dequant) in types {
+            let mut payload: Vec<u8> = (0..2 * block_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect();
+            for block in payload.chunks_exact_mut(block_bytes) {
+                if id == 29 {
+                    // IQ1_M keeps its half scale (here 1.0 = 0x3c00) in the
+                    // top nibbles of the four scale words at bytes 48..56.
+                    for (k, nibble) in [0u8, 0, 0xc, 3].into_iter().enumerate() {
+                        let hi = &mut block[49 + 2 * k];
+                        *hi = (*hi & 0x0f) | (nibble << 4);
+                    }
+                } else {
+                    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                }
+            }
+            let path = std::env::temp_dir().join(format!("allpaca_gguf_iq_{id}.gguf"));
+            write_typed_gguf(&path, id, &payload, 512);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.nbytes(), payload.len(), "type {id}");
+            assert!(
+                !file
+                    .compat_report()
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+                "type {id} must not be rejected"
+            );
+            let mut want = vec![0.0f32; 512];
+            dequant(&payload, 512, &mut want).unwrap();
+            assert!(want.iter().all(|v| v.is_finite()) && want.iter().any(|v| *v != 0.0));
+            assert_eq!(file.tensor_f32("quant.weight").unwrap(), want, "type {id}");
+            let mut row = vec![0.0f32; 256];
+            dequant_packed(info.ggml_type, &payload[block_bytes..], 256, &mut row).unwrap();
+            assert_eq!(row, want[256..], "type {id} row");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// ggml types 41 and 42 (Q1_0, Q2_0): 18-byte blocks of 128 and 64 weights.

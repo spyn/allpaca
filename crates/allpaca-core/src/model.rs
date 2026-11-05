@@ -3931,7 +3931,22 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
     use allpaca_gguf::GgmlType as T;
     matches!(
         ty,
-        T::IQ4_NL | T::IQ4_XS | T::Q4_0 | T::Q4_1 | T::Q5_0 | T::Q5_1 | T::Q2_K | T::Q3_K
+        T::IQ4_NL
+            | T::IQ4_XS
+            | T::Q4_0
+            | T::Q4_1
+            | T::Q5_0
+            | T::Q5_1
+            | T::Q2_K
+            | T::Q3_K
+            // No HIP kernels for the lattice i-quants either: a Q8_0 copy is
+            // 8.5 bits per weight where the F32 fallback would be 32.
+            | T::IQ2_XXS
+            | T::IQ2_XS
+            | T::IQ2_S
+            | T::IQ3_XXS
+            | T::IQ1_S
+            | T::IQ1_M
     )
 }
 
@@ -13548,6 +13563,25 @@ mod lightning_moe_tests {
         let ragged = info(5120 + 32);
         let q8 = ragged.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
         assert_eq!(staged_device_bytes(&ragged), q8);
+    }
+
+    /// IQ1/IQ2/IQ3_XXS GEMM weights go to the device as the Q8_0 re-pack
+    /// the IQ4 types use (no native kernel), not as 4-byte floats.
+    #[test]
+    fn low_bit_iq_gemm_weights_repack_to_q8_0_on_device() {
+        use allpaca_gguf::GgmlType as T;
+        for (ty, id) in [(T::IQ2_XXS, 16), (T::IQ2_XS, 17), (T::IQ3_XXS, 18), (T::IQ1_S, 19), (T::IQ2_S, 22), (T::IQ1_M, 29)] {
+            let info = allpaca_gguf::TensorInfo {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![4096, 1024],
+                ggml_type: ty,
+                ggml_type_id: id,
+                offset: 0,
+                shard: 0,
+            };
+            let q8 = info.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+            assert_eq!(staged_device_bytes(&info), q8, "{ty:?}");
+        }
     }
 
     #[test]
