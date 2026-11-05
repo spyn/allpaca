@@ -1744,6 +1744,7 @@ fn dsv4_absorb(
             eps,
             rope,
             fp8_nope: attn.nope,
+            index_qat: false,
         };
         let kv_rows = rows("attn_compressor_kv", curs, pool.width(), dim)?;
         let gate_rows = rows("attn_compressor_gate", curs, pool.width(), dim)?;
@@ -1756,6 +1757,7 @@ fn dsv4_absorb(
                 eps,
                 rope,
                 fp8_nope: 0,
+                index_qat: true,
             };
             let index_kv = rows("indexer_compressor_kv", curs, index_pool.width(), dim)?;
             let index_gate = rows("indexer_compressor_gate", curs, index_pool.width(), dim)?;
@@ -1782,6 +1784,7 @@ fn dsv4_absorb(
                 for (t, tok) in q.chunks_mut(heads * idim).enumerate() {
                     for head in tok.chunks_mut(idim) {
                         rope.rotate(head, start_pos + t, false);
+                        crate::dsv4_attn::index_qat(head);
                     }
                 }
                 index_query = Some(IndexQuery {
