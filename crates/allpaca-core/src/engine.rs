@@ -9139,6 +9139,69 @@ mod tests {
         assert_eq!(ids, expected, "hosted speculative == plain decode");
     }
 
+    /// The shared expert queued ahead of the worker's round trip (so the
+    /// card runs it while the routed experts run remotely) gives the same
+    /// logits, bit for bit, as the shared expert queued after the reply.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn shared_expert_queued_before_remote_experts_matches_queued_after() {
+        if allpaca_hip::device_count() == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("allpaca-p8-shexp-{}", std::process::id()));
+        // Layer 1 is full attention, so the run covers both mixers.
+        let three = three_layer_qwen35moe(&dir, true, false);
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(2),
+            ..GenerationParams::default()
+        };
+        // Long enough that prefill takes the multi-row MoE.
+        let prompt = "hello world again hello world again hello";
+        let _env = Q3N_HOST_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let run = |early: bool| {
+            unsafe { std::env::set_var("ALLPACA_SHEXP_EARLY", if early { "1" } else { "0" }) };
+            let (addr, worker) = spawn_q3n_worker(false);
+            let mut cfg = test_config();
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(three.clone());
+            cfg.engine.cpu_only = false;
+            cfg.engine.gpu_backend = "hip".into();
+            cfg.speculative.enabled = false;
+            cfg.rpc.endpoints = vec![addr.to_string()];
+            cfg.rpc.expert_homes = ["1".into(), "2".into()]
+                .into_iter()
+                .map(|layer| (layer, format!("rpc:{addr}/0")))
+                .collect();
+            let engine = Engine::new(cfg).unwrap();
+            unsafe { std::env::remove_var("ALLPACA_SHEXP_EARLY") };
+            assert_eq!(
+                engine.lock().unwrap().target.as_ref().unwrap().shexp_early,
+                early,
+                "the model took the switch at load"
+            );
+            engine.tap_logits(true).unwrap();
+            let ids = engine.generate(prompt, params.clone()).unwrap().token_ids;
+            let logits = engine.take_tapped_logits().unwrap();
+            let trips = engine.stats().rpc_roundtrips;
+            drop(engine);
+            worker.join().unwrap();
+            (ids, logits, trips)
+        };
+        let (late_ids, late_logits, late_trips) = run(false);
+        let (early_ids, early_logits, early_trips) = run(true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(late_trips > 0 && early_trips == late_trips, "experts on the worker: {late_trips} vs {early_trips}");
+        assert_eq!(early_ids, late_ids, "tokens");
+        assert_eq!(early_logits.len(), late_logits.len());
+        assert!(!early_logits.is_empty(), "decode logits were tapped");
+        for (step, (a, b)) in early_logits.iter().zip(&late_logits).enumerate() {
+            let (a, b): (Vec<u32>, Vec<u32>) = (a.iter().map(|v| v.to_bits()).collect(), b.iter().map(|v| v.to_bits()).collect());
+            assert_eq!(a, b, "decode step {step}: logits differ");
+        }
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn rpc_qwen3next_whole_span_matches_local_and_cuts_roundtrips() {

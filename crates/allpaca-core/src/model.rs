@@ -4721,6 +4721,23 @@ pub struct TinyModel {
     /// a separate `MoeFfn` reply (host top-k, F16 routed sum), so hosted
     /// output equals the separate expert-parallel path bit for bit.
     pub hosted_moe_compat: bool,
+    /// Queue a layer's device shared expert as soon as the host has read
+    /// back the routing inputs, ahead of routed experts that leave its
+    /// buffers alone (an RPC worker's, or the fused local kernels), so the
+    /// card runs it while the host routes and waits. The same kernels on
+    /// the same inputs, so output is unchanged. Read at load from
+    /// [`SHEXP_EARLY_ENV`]; `0` keeps the old order (board task P8).
+    pub shexp_early: bool,
+}
+
+/// `ALLPACA_SHEXP_EARLY=0` keeps a MoE layer's shared expert behind its
+/// routed experts (see [`TinyModel::shexp_early`]).
+pub const SHEXP_EARLY_ENV: &str = "ALLPACA_SHEXP_EARLY";
+
+/// Whether the shared expert goes ahead of the routed experts' wait, from
+/// [`SHEXP_EARLY_ENV`] (on unless it is `0`).
+pub(crate) fn shexp_early_from_env() -> bool {
+    std::env::var(SHEXP_EARLY_ENV).map_or(true, |v| v.trim() != "0")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4901,6 +4918,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            shexp_early: shexp_early_from_env(),
         }
     }
 
@@ -5953,6 +5971,12 @@ impl TinyModel {
             return Ok(());
         }
         let (x_norm, mut router_logits) = self.device_moe_readback(hip, resident, off, buf, 1)?;
+        // The card is idle from here until the routed experts are queued
+        // (host routing, a worker's round trip): give it the shared expert.
+        let mut shared_queued = self.shared_expert_first(layer_idx, resident, off);
+        if shared_queued {
+            self.shared_expert_gemm_rows(hip, resident, buf, off, 1)?;
+        }
         let ds_probe = side.as_ref().and_then(|s| s.ds_probe);
         let ds_queue = side.as_ref().and_then(|s| s.ds_queue);
         let nvme_side = side.as_ref().map(|s| DeviceDecodeSide {
@@ -6006,6 +6030,9 @@ impl TinyModel {
         if !self.remote_moe_rows(layer_idx, hip, resident, buf, &x_norm, routes)?
             && !self.fused_local_moe_rows(layer_idx, hip, resident, buf, routes)?
         {
+            // The per-expert loop below reuses `buf.proj`: the shared expert
+            // runs again after it.
+            shared_queued = false;
             let plan = if let Some(lru) = &self.expert_lru {
                 let route_ids = if !prefill {
                     if let Some(u) = micro_batch {
@@ -6149,22 +6176,9 @@ impl TinyModel {
         {
             // Shared expert, then its sigmoid-gated scale, the residual add
             // and the copy back into proj in one launch.
-            let sff = if cfg.shared_ff_dim > 0 {
-                cfg.shared_ff_dim
-            } else {
-                off.w_shared_up.n / dim.max(1)
-            };
-            self.device_expert_gemm(
-                hip,
-                resident,
-                buf,
-                buf.normed,
-                1,
-                off.w_shared_gate,
-                off.w_shared_up,
-                off.w_shared_down,
-                sff,
-            )?;
+            if !shared_queued {
+                self.shared_expert_gemm_rows(hip, resident, buf, off, 1)?;
+            }
             let logit: f32 = x_norm[..dim]
                 .iter()
                 .zip(&host_layer.shared_gate_inp)
@@ -6174,7 +6188,10 @@ impl TinyModel {
             record_elementwise(Some(metrics));
             return Ok(());
         } else if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
-            self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, 1, None)?;
+            if !shared_queued {
+                self.shared_expert_gemm_rows(hip, resident, buf, off, 1)?;
+            }
+            self.finish_shared_expert_rows(hip, buf, host_layer, &x_norm, 1, None)?;
         } else if !host_layer.shared_expert.w_up.is_empty() {
             let sff = if cfg.shared_ff_dim > 0 {
                 cfg.shared_ff_dim
@@ -6414,6 +6431,40 @@ impl TinyModel {
         Ok(true)
     }
 
+    /// Layer `layer_idx`'s stacked local experts when the fused MoE kernels
+    /// can run them ([`Self::fused_local_moe_rows`]).
+    fn fused_moe_experts(&self, layer_idx: usize, resident: &ResidentModel) -> Option<[allpaca_hip::MoeExperts; 3]> {
+        let cfg = &self.config;
+        if self.expert_lru.is_some()
+            || resident.expert_ring.is_some()
+            || cfg.moe_relu_sqr
+            || cfg.ffn_gelu
+            || cfg.dim % 256 != 0
+            || cfg.ff_dim % 256 != 0
+        {
+            return None;
+        }
+        resident
+            .expert_offs
+            .get(layer_idx)
+            .filter(|o| o.len() == cfg.n_experts)
+            .and_then(|o| stacked_moe_experts(&resident.weights, o))
+    }
+
+    /// Whether a host-routed layer's device shared expert can be queued
+    /// before its routed experts: they must run on an RPC worker or in the
+    /// fused kernels, which leave the shared expert's buffers (`buf.gate`,
+    /// `buf.up`, `buf.proj`) alone, unlike the per-expert loop. The card
+    /// then runs the shared expert while the host routes and waits for the
+    /// worker. The result is the same either way.
+    fn shared_expert_first(&self, layer_idx: usize, resident: &ResidentModel, off: &LayerOff) -> bool {
+        self.shexp_early
+            && off.w_shared_up.n > 0
+            && off.w_shared_down.n > 0
+            && (self.rpc.as_ref().is_some_and(|r| r.experts_remote(layer_idx))
+                || self.fused_moe_experts(layer_idx, resident).is_some())
+    }
+
     /// Local routed experts through the fused K-quant MoE kernels: three
     /// launches per layer instead of ~4 per selected expert, with the same
     /// arithmetic. Rows of `buf.normed`; weighted sums into `buf.attn`.
@@ -6429,21 +6480,7 @@ impl TinyModel {
     ) -> Result<bool, AllpacaError> {
         let cfg = &self.config;
         let (dim, ff) = (cfg.dim, cfg.ff_dim);
-        if self.expert_lru.is_some()
-            || resident.expert_ring.is_some()
-            || cfg.moe_relu_sqr
-            || cfg.ffn_gelu
-            || dim % 256 != 0
-            || ff % 256 != 0
-        {
-            return Ok(false);
-        }
-        let Some(experts) = resident
-            .expert_offs
-            .get(layer_idx)
-            .filter(|o| o.len() == cfg.n_experts)
-            .and_then(|o| stacked_moe_experts(&resident.weights, o))
-        else {
+        let Some(experts) = self.fused_moe_experts(layer_idx, resident) else {
             return Ok(false);
         };
         let pairs: Vec<(u32, u32, f32)> = routes
@@ -6497,12 +6534,25 @@ impl TinyModel {
         n_tok: usize,
         device_scale: Option<*const f32>,
     ) -> Result<(), AllpacaError> {
+        self.shared_expert_gemm_rows(hip, resident, buf, off, n_tok)?;
+        self.finish_shared_expert_rows(hip, buf, host_layer, x_norm, n_tok, device_scale)
+    }
+
+    /// The shared expert's matrices on `n_tok` rows of `buf.normed`, into
+    /// `buf.proj` (through `buf.gate` and `buf.up`).
+    fn shared_expert_gemm_rows(
+        &self,
+        hip: &HipWorkspace,
+        resident: &ResidentModel,
+        buf: DeviceDecode,
+        off: &LayerOff,
+        n_tok: usize,
+    ) -> Result<(), AllpacaError> {
         let cfg = &self.config;
-        let dim = cfg.dim;
         let sff = if cfg.shared_ff_dim > 0 {
             cfg.shared_ff_dim
         } else {
-            off.w_shared_up.n / dim.max(1)
+            off.w_shared_up.n / cfg.dim.max(1)
         };
         self.device_expert_gemm(
             hip,
@@ -6514,7 +6564,21 @@ impl TinyModel {
             off.w_shared_up,
             off.w_shared_down,
             sff,
-        )?;
+        )
+    }
+
+    /// Scale the shared expert's rows in `buf.proj` by their gate and add
+    /// them into `buf.attn`.
+    fn finish_shared_expert_rows(
+        &self,
+        hip: &HipWorkspace,
+        buf: DeviceDecode,
+        host_layer: &LayerWeights,
+        x_norm: &[f32],
+        n_tok: usize,
+        device_scale: Option<*const f32>,
+    ) -> Result<(), AllpacaError> {
+        let dim = self.config.dim;
         let gate = &host_layer.shared_gate_inp;
         if let Some(scale) = device_scale {
             allpaca_hip::scale_rows_device(buf.proj, scale, n_tok, dim)?;
@@ -6606,6 +6670,12 @@ impl TinyModel {
             return Ok(());
         }
         let (x_norm, mut logits) = self.device_moe_readback(hip, resident, off, buf, n_tok)?;
+        // As in [`Self::device_moe`]: the card runs the shared expert while
+        // the host routes and waits.
+        let mut shared_queued = self.shared_expert_first(layer_idx, resident, off);
+        if shared_queued {
+            self.shared_expert_gemm_rows(hip, resident, buf, off, n_tok)?;
+        }
         let n_exp = cfg.n_experts.max(1);
         let n_act = cfg.n_active.max(1).min(n_exp);
         let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n_tok);
@@ -6640,6 +6710,9 @@ impl TinyModel {
         if !self.remote_moe_rows(layer_idx, hip, resident, buf, &x_norm, &routes)?
             && !self.fused_local_moe_rows(layer_idx, hip, resident, buf, &routes)?
         {
+            // The per-expert loop below reuses `buf.proj` (and reads its
+            // rows from `buf.q`): the shared expert runs again after it.
+            shared_queued = false;
             let ids: Vec<ExpertId> = union
                 .iter()
                 .map(|&e| ExpertId {
@@ -6740,7 +6813,10 @@ impl TinyModel {
             hip.round_f16(buf.attn, n_tok * dim)?;
         }
         if off.w_shared_up.n > 0 && off.w_shared_down.n > 0 {
-            self.device_shared_expert_rows(hip, resident, buf, off, host_layer, &x_norm, n_tok, None)?;
+            if !shared_queued {
+                self.shared_expert_gemm_rows(hip, resident, buf, off, n_tok)?;
+            }
+            self.finish_shared_expert_rows(hip, buf, host_layer, &x_norm, n_tok, None)?;
         } else if !host_layer.shared_expert.w_up.is_empty() {
             let sff = if cfg.shared_ff_dim > 0 {
                 cfg.shared_ff_dim
@@ -7408,6 +7484,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            shexp_early: shexp_early_from_env(),
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7572,6 +7649,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            shexp_early: shexp_early_from_env(),
         }
     }
 
@@ -7711,6 +7789,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            shexp_early: shexp_early_from_env(),
         })
     }
 
@@ -7829,6 +7908,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            shexp_early: shexp_early_from_env(),
         })
     }
 
