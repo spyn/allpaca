@@ -198,6 +198,18 @@ pub enum GgmlType {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    /// ggml IQ2_XXS (16): 2.0625 bits per weight, 256-weight blocks.
+    IQ2_XXS = 16,
+    /// ggml IQ2_XS (17): 2.3125 bits per weight.
+    IQ2_XS = 17,
+    /// ggml IQ3_XXS (18): 3.0625 bits per weight.
+    IQ3_XXS = 18,
+    /// ggml IQ1_S (19): 1.5625 bits per weight.
+    IQ1_S = 19,
+    /// ggml IQ2_S (22): 2.5625 bits per weight.
+    IQ2_S = 22,
+    /// ggml IQ1_M (29): 1.75 bits per weight.
+    IQ1_M = 29,
     /// ggml IQ3_S (ggml_type_id=21): Unsloth's UD files keep experts in it.
     IQ3_S = 21,
     /// Unsloth / ggml IQ4_NL (ggml_type_id=20).
@@ -221,11 +233,27 @@ pub enum GgmlType {
     RocmFp4 = 100,
     /// AMD ROCmFP4 FAST single-scale, 17-byte blocks (ggml_type_id=101).
     RocmFp4Fast = 101,
+    /// ROCmFPX `Q6_0_ROCMFPX`: 6-bit codes, two UE4M3 scales, 26-byte blocks.
+    RocmFpxQ6 = 102,
+    /// ROCmFPX `Q8_0_ROCMFPX`: int8 codes, one UE4M3 scale, 33-byte blocks.
+    RocmFpxQ8 = 103,
+    /// ROCmFPX `Q3_0_ROCMFPX`: 3-bit codes, two UE4M3 scales, 14-byte blocks.
+    RocmFpxQ3 = 104,
+    /// ROCmFPX `Q5_0_ROCMFPX`: 5-bit codes, two UE4M3 scales, 22-byte blocks.
+    RocmFpxQ5 = 109,
+    /// ROCmFPX `Q7_0_ROCMFPX`: 7-bit codes, two UE4M3 scales, 30-byte blocks.
+    RocmFpxQ7 = 110,
+    /// ROCmFPX `Q2_0_ROCMFPX`: S40 2-bit codes, two UE4M3 scales, 10-byte blocks.
+    RocmFpxQ2 = 111,
     /// MoESQ paired-4:8 sparse FP4, 12-byte blocks of 32 weights. Allpaca's
     /// own id: no llama.cpp build reads it.
     P48Fp4 = 200,
     Other = 255,
 }
+
+/// Why ggml type 107 is refused: the ROCmFPX fork wrote two different
+/// layouts under it (now `Q2_0_ROCMFPX_LEGACY_AMBIGUOUS`) and refuses it too.
+pub const AMBIGUOUS_ROCMFPX_107: &str = "ggml type 107 (legacy ROCmFPX Q2_0) is ambiguous: two different block layouts were written under that id, so its weights cannot be read safely; re-quantise to ROCmFPX Q2_0 (type 111)";
 
 /// Dequantize a packed slice of `ty` (whole blocks, `n` elements) into `out`.
 ///
@@ -275,6 +303,12 @@ pub fn dequant_packed(
         GgmlType::Q5_K => allpaca_cpu::dequant_q5_k(bytes, n, out),
         GgmlType::Q6_K => allpaca_cpu::dequant_q6_k(bytes, n, out),
         GgmlType::IQ3_S => allpaca_cpu::dequant_iq3_s(bytes, n, out),
+        GgmlType::IQ2_XXS => allpaca_cpu::dequant_iq2_xxs(bytes, n, out),
+        GgmlType::IQ2_XS => allpaca_cpu::dequant_iq2_xs(bytes, n, out),
+        GgmlType::IQ2_S => allpaca_cpu::dequant_iq2_s(bytes, n, out),
+        GgmlType::IQ3_XXS => allpaca_cpu::dequant_iq3_xxs(bytes, n, out),
+        GgmlType::IQ1_S => allpaca_cpu::dequant_iq1_s(bytes, n, out),
+        GgmlType::IQ1_M => allpaca_cpu::dequant_iq1_m(bytes, n, out),
         GgmlType::IQ4_NL => allpaca_cpu::dequant_iq4_nl(bytes, n, out),
         GgmlType::IQ4_XS => allpaca_cpu::dequant_iq4_xs(bytes, n, out),
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
@@ -284,6 +318,12 @@ pub fn dequant_packed(
         GgmlType::Q2_0 => allpaca_cpu::dequant_q2_0(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
         GgmlType::RocmFp4Fast => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out),
+        GgmlType::RocmFpxQ6 => allpaca_cpu::dequant_rocmfpx_q6(bytes, n, out),
+        GgmlType::RocmFpxQ8 => allpaca_cpu::dequant_rocmfpx_q8(bytes, n, out),
+        GgmlType::RocmFpxQ3 => allpaca_cpu::dequant_rocmfpx_q3(bytes, n, out),
+        GgmlType::RocmFpxQ5 => allpaca_cpu::dequant_rocmfpx_q5(bytes, n, out),
+        GgmlType::RocmFpxQ7 => allpaca_cpu::dequant_rocmfpx_q7(bytes, n, out),
+        GgmlType::RocmFpxQ2 => allpaca_cpu::dequant_rocmfpx_q2(bytes, n, out),
         GgmlType::P48Fp4 => allpaca_cpu::dequant_p48fp4(bytes, n, out),
         GgmlType::I32 | GgmlType::Other => Err(AllpacaError::Fatal(FatalError::ModelLoad(
             format!("dequant {ty:?} unsupported"),
@@ -307,6 +347,12 @@ impl GgmlType {
             12 => Self::Q4_K,
             13 => Self::Q5_K,
             14 => Self::Q6_K,
+            16 => Self::IQ2_XXS,
+            17 => Self::IQ2_XS,
+            18 => Self::IQ3_XXS,
+            19 => Self::IQ1_S,
+            22 => Self::IQ2_S,
+            29 => Self::IQ1_M,
             20 => Self::IQ4_NL,
             21 => Self::IQ3_S,
             23 => Self::IQ4_XS,
@@ -319,6 +365,13 @@ impl GgmlType {
             42 => Self::Q2_0,
             100 => Self::RocmFp4,
             101 => Self::RocmFp4Fast,
+            102 => Self::RocmFpxQ6,
+            103 => Self::RocmFpxQ8,
+            104 => Self::RocmFpxQ3,
+            // 107 stays `Other`: see `AMBIGUOUS_ROCMFPX_107`.
+            109 => Self::RocmFpxQ5,
+            110 => Self::RocmFpxQ7,
+            111 => Self::RocmFpxQ2,
             200 => Self::P48Fp4,
             _ => Self::Other,
         }
@@ -382,6 +435,24 @@ impl TensorInfo {
             GgmlType::IQ3_S => n
                 .div_ceil(allpaca_cpu::IQ3_S_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::IQ3_S_BLOCK_BYTES),
+            GgmlType::IQ2_XXS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_XXS_BLOCK_BYTES),
+            GgmlType::IQ2_XS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_XS_BLOCK_BYTES),
+            GgmlType::IQ2_S => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ2_S_BLOCK_BYTES),
+            GgmlType::IQ3_XXS => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ3_XXS_BLOCK_BYTES),
+            GgmlType::IQ1_S => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ1_S_BLOCK_BYTES),
+            GgmlType::IQ1_M => n
+                .div_ceil(allpaca_cpu::IQ_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::IQ1_M_BLOCK_BYTES),
             GgmlType::IQ4_NL => n
                 .div_ceil(allpaca_cpu::IQ4_NL_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::IQ4_NL_BLOCK_BYTES),
@@ -411,6 +482,24 @@ impl TensorInfo {
             GgmlType::Q2_0 => n
                 .div_ceil(allpaca_cpu::Q2_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::Q2_0_BLOCK_BYTES),
+            GgmlType::RocmFpxQ6 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES),
+            GgmlType::RocmFpxQ8 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q8_BLOCK_BYTES),
+            GgmlType::RocmFpxQ3 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q3_BLOCK_BYTES),
+            GgmlType::RocmFpxQ5 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q5_BLOCK_BYTES),
+            GgmlType::RocmFpxQ7 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q7_BLOCK_BYTES),
+            GgmlType::RocmFpxQ2 => n
+                .div_ceil(allpaca_cpu::ROCMFPX_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::ROCMFPX_Q2_BLOCK_BYTES),
             GgmlType::P48Fp4 => n
                 .div_ceil(allpaca_cpu::P48FP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::P48FP4_BLOCK_BYTES),
@@ -747,6 +836,12 @@ impl GgufFile {
             GgmlType::IQ4_NL as u32,
             GgmlType::IQ4_XS as u32,
             GgmlType::IQ3_S as u32,
+            GgmlType::IQ2_XXS as u32,
+            GgmlType::IQ2_XS as u32,
+            GgmlType::IQ2_S as u32,
+            GgmlType::IQ3_XXS as u32,
+            GgmlType::IQ1_S as u32,
+            GgmlType::IQ1_M as u32,
             GgmlType::I32 as u32,
             GgmlType::BF16 as u32,
             GgmlType::MXFP4 as u32,
@@ -754,6 +849,12 @@ impl GgufFile {
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
             GgmlType::RocmFp4Fast as u32,
+            GgmlType::RocmFpxQ6 as u32,
+            GgmlType::RocmFpxQ8 as u32,
+            GgmlType::RocmFpxQ3 as u32,
+            GgmlType::RocmFpxQ5 as u32,
+            GgmlType::RocmFpxQ7 as u32,
+            GgmlType::RocmFpxQ2 as u32,
             GgmlType::P48Fp4 as u32,
             GgmlType::Q1_0 as u32,
             GgmlType::Q2_0 as u32,
@@ -765,9 +866,12 @@ impl GgufFile {
             .collect();
 
         let mut reasons = Vec::new();
+        if unsupported_types.contains(&107) {
+            reasons.push(AMBIGUOUS_ROCMFPX_107.to_string());
+        }
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/ROCmFP4)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/Q1_0/Q2_0/ROCmFP4/ROCmFPX 102-104,109-111)"
             ));
         }
         let llama_family = matches!(
@@ -1129,7 +1233,20 @@ impl GgufFile {
                 allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
-            ty @ (GgmlType::Q1_0 | GgmlType::Q2_0) => {
+            ty @ (GgmlType::Q1_0
+            | GgmlType::Q2_0
+            | GgmlType::RocmFpxQ6
+            | GgmlType::RocmFpxQ8
+            | GgmlType::RocmFpxQ3
+            | GgmlType::RocmFpxQ5
+            | GgmlType::RocmFpxQ7
+            | GgmlType::RocmFpxQ2
+            | GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ2_S
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ1_M) => {
                 let nbytes = info.nbytes();
                 if start.saturating_add(nbytes) > mmap.len() {
                     return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
@@ -1151,6 +1268,9 @@ impl GgufFile {
                 allpaca_cpu::dequant_p48fp4(&mmap[start..start + nbytes], n, &mut out)?;
                 Ok(out)
             }
+            _ if info.ggml_type_id == 107 => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "tensor {name}: {AMBIGUOUS_ROCMFPX_107}"
+            )))),
             other => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
                 "tensor {name} is {other:?} (unsupported GGUF quant)"
             )))),
@@ -2004,6 +2124,154 @@ mod tests {
         assert_eq!(loaded.len(), 256);
         assert!(loaded[..32].iter().all(|v| (v - 1.0).abs() < 1e-4));
         assert!(loaded[32..].iter().all(|v| v.abs() < 1e-5));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ggml IQ1/IQ2/IQ3_XXS types (16-19, 22, 29): accepted by the compat
+    /// probe, sized by their 256-weight blocks and dequantised to F32 by
+    /// `allpaca_cpu`'s llama.cpp-exact decoders, whole tensor and row slice.
+    #[test]
+    fn iq1_iq2_iq3_xxs_types_load_and_dequant_to_f32() {
+        type Dequant = fn(&[u8], usize, &mut [f32]) -> Result<(), AllpacaError>;
+        let types: [(u32, usize, Dequant); 6] = [
+            (16, allpaca_cpu::IQ2_XXS_BLOCK_BYTES, allpaca_cpu::dequant_iq2_xxs),
+            (17, allpaca_cpu::IQ2_XS_BLOCK_BYTES, allpaca_cpu::dequant_iq2_xs),
+            (18, allpaca_cpu::IQ3_XXS_BLOCK_BYTES, allpaca_cpu::dequant_iq3_xxs),
+            (19, allpaca_cpu::IQ1_S_BLOCK_BYTES, allpaca_cpu::dequant_iq1_s),
+            (22, allpaca_cpu::IQ2_S_BLOCK_BYTES, allpaca_cpu::dequant_iq2_s),
+            (29, allpaca_cpu::IQ1_M_BLOCK_BYTES, allpaca_cpu::dequant_iq1_m),
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for (id, block_bytes, dequant) in types {
+            let mut payload: Vec<u8> = (0..2 * block_bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect();
+            for block in payload.chunks_exact_mut(block_bytes) {
+                if id == 29 {
+                    // IQ1_M keeps its half scale (here 1.0 = 0x3c00) in the
+                    // top nibbles of the four scale words at bytes 48..56.
+                    for (k, nibble) in [0u8, 0, 0xc, 3].into_iter().enumerate() {
+                        let hi = &mut block[49 + 2 * k];
+                        *hi = (*hi & 0x0f) | (nibble << 4);
+                    }
+                } else {
+                    block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                }
+            }
+            let path = std::env::temp_dir().join(format!("allpaca_gguf_iq_{id}.gguf"));
+            write_typed_gguf(&path, id, &payload, 512);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.nbytes(), payload.len(), "type {id}");
+            assert!(
+                !file
+                    .compat_report()
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+                "type {id} must not be rejected"
+            );
+            let mut want = vec![0.0f32; 512];
+            dequant(&payload, 512, &mut want).unwrap();
+            assert!(want.iter().all(|v| v.is_finite()) && want.iter().any(|v| *v != 0.0));
+            assert_eq!(file.tensor_f32("quant.weight").unwrap(), want, "type {id}");
+            let mut row = vec![0.0f32; 256];
+            dequant_packed(info.ggml_type, &payload[block_bytes..], 256, &mut row).unwrap();
+            assert_eq!(row, want[256..], "type {id} row");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// ROCmFPX fork types 102-104 and 109-111: accepted, sized by their
+    /// 32-weight blocks and dequantised by `allpaca_cpu`'s fork-exact decoders.
+    #[test]
+    fn rocmfpx_types_load_and_dequant_to_f32() {
+        type Dequant = fn(&[u8], usize, &mut [f32]) -> Result<(), AllpacaError>;
+        let types: [(u32, usize, Dequant); 6] = [
+            (102, allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q6),
+            (103, allpaca_cpu::ROCMFPX_Q8_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q8),
+            (104, allpaca_cpu::ROCMFPX_Q3_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q3),
+            (109, allpaca_cpu::ROCMFPX_Q5_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q5),
+            (110, allpaca_cpu::ROCMFPX_Q7_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q7),
+            (111, allpaca_cpu::ROCMFPX_Q2_BLOCK_BYTES, allpaca_cpu::dequant_rocmfpx_q2),
+        ];
+        for (id, block_bytes, dequant) in types {
+            // Codes from a counter, scale bytes kept valid (<= 0x7e).
+            let mut payload: Vec<u8> = (0..4 * block_bytes).map(|i| (i * 37 + 11) as u8).collect();
+            for block in payload.chunks_exact_mut(block_bytes) {
+                let scales = if id == 103 { 1 } else { 2 };
+                for s in &mut block[block_bytes - scales..] {
+                    *s %= 0x7f;
+                }
+            }
+            let path = std::env::temp_dir().join(format!("allpaca_gguf_rocmfpx_{id}.gguf"));
+            write_typed_gguf(&path, id, &payload, 128);
+            let file = GgufFile::open(&path).unwrap();
+            let info = file.tensor("quant.weight").expect("header lists tensor");
+            assert_eq!(info.nbytes(), payload.len(), "type {id}");
+            assert!(
+                !file
+                    .compat_report()
+                    .reject_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("unsupported ggml_type_id")),
+                "type {id} must not be rejected"
+            );
+            let mut want = vec![0.0f32; 128];
+            dequant(&payload, 128, &mut want).unwrap();
+            assert!(want.iter().any(|v| *v != 0.0));
+            assert_eq!(file.tensor_f32("quant.weight").unwrap(), want, "type {id}");
+            let mut row = vec![0.0f32; 32];
+            dequant_packed(info.ggml_type, &payload[3 * block_bytes..], 32, &mut row).unwrap();
+            assert_eq!(row, want[96..], "type {id} row");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Real type-103 blocks: a ROCmFPX Q8_0 file and its lossless Q8_0
+    /// conversion (`target/q3n/rocmfp8_to_q8.py`) dequantise to the same f32
+    /// bits, tensor by tensor (first 8 type-103 tensors). Opt-in:
+    /// `ALLPACA_ROCMFPX_Q8=<103 file> ALLPACA_ROCMFPX_Q8_AS_Q8_0=<converted>`.
+    #[test]
+    #[ignore = "needs a real ROCmFPX Q8_0 file and its Q8_0 conversion"]
+    fn real_rocmfpx_q8_file_matches_its_q8_0_conversion() {
+        let (Ok(fpx), Ok(q8)) = (std::env::var("ALLPACA_ROCMFPX_Q8"), std::env::var("ALLPACA_ROCMFPX_Q8_AS_Q8_0"))
+        else {
+            eprintln!("skip: set ALLPACA_ROCMFPX_Q8 and ALLPACA_ROCMFPX_Q8_AS_Q8_0");
+            return;
+        };
+        let open = |p: &str| GgufFile::open(std::path::Path::new(p)).unwrap();
+        let (fpx, q8) = (open(&fpx), open(&q8));
+        let mut checked = 0;
+        for t in fpx.tensors.iter().filter(|t| t.ggml_type == GgmlType::RocmFpxQ8).take(8) {
+            let other = q8.tensor(&t.name).expect("same tensor in the conversion");
+            assert_eq!(other.ggml_type, GgmlType::Q8_0, "{}", t.name);
+            let (a, b) = (fpx.tensor_f32(&t.name).unwrap(), q8.tensor_f32(&t.name).unwrap());
+            assert_eq!(a.len(), b.len());
+            let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(same, "{} differs from its Q8_0 conversion", t.name);
+            eprintln!("{}: {} weights equal", t.name, a.len());
+            checked += 1;
+        }
+        assert!(checked > 0, "no type-103 tensors in the ROCmFPX file");
+    }
+
+    /// Type 107 names two different ROCmFPX layouts; the fork refuses it and
+    /// so does Allpaca, with a reason that says why.
+    #[test]
+    fn rocmfpx_type_107_is_refused_as_ambiguous() {
+        let path = std::env::temp_dir().join("allpaca_gguf_rocmfpx_107.gguf");
+        write_typed_gguf(&path, 107, &[0u8; 64], 32);
+        let file = GgufFile::open(&path).unwrap();
+        let reason = file.compat_report().reject_reason.expect("type 107 must be rejected");
+        assert!(reason.contains("107") && reason.contains("ambiguous"), "{reason}");
+        let err = file.tensor_f32("quant.weight").expect_err("no decoder for 107").to_string();
+        assert!(err.contains("ambiguous"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 

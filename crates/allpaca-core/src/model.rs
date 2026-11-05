@@ -3931,8 +3931,31 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
     use allpaca_gguf::GgmlType as T;
     matches!(
         ty,
-        T::IQ4_NL | T::IQ4_XS | T::Q4_0 | T::Q4_1 | T::Q5_0 | T::Q5_1 | T::Q2_K | T::Q3_K
+        T::IQ4_NL
+            | T::IQ4_XS
+            | T::Q4_0
+            | T::Q4_1
+            | T::Q5_0
+            | T::Q5_1
+            | T::Q2_K
+            | T::Q3_K
+            // No HIP kernels for the lattice i-quants either: a Q8_0 copy is
+            // 8.5 bits per weight where the F32 fallback would be 32.
+            | T::IQ2_XXS
+            | T::IQ2_XS
+            | T::IQ2_S
+            | T::IQ3_XXS
+            | T::IQ1_S
+            | T::IQ1_M
     )
+}
+
+/// ROCmFPX two-scale types (102, 104, 109-111) have no HIP kernel; every
+/// value they decode to is exact in f16, so they go to the device as F16
+/// and the GPU reads the CPU dequant's values bit for bit.
+fn rocmfpx_as_f16(ty: allpaca_gguf::GgmlType) -> bool {
+    use allpaca_gguf::GgmlType as T;
+    matches!(ty, T::RocmFpxQ6 | T::RocmFpxQ3 | T::RocmFpxQ5 | T::RocmFpxQ7 | T::RocmFpxQ2)
 }
 
 /// Q3_K GEMM weights with whole 256-value rows run on the native int8 GEMV
@@ -3995,7 +4018,8 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
             info.nbytes() as u64
         }
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
-        T::Q8_0 => q8_staged,
+        T::Q8_0 | T::RocmFpxQ8 => q8_staged,
+        ty if rocmfpx_as_f16(ty) => n * 2,
         ty if requant_q8_0_on_load(ty) => q8_staged,
         _ => n * 4,
     }
@@ -4272,6 +4296,31 @@ fn append_gguf_tensor_as<'a>(
         }
         allpaca_gguf::GgmlType::Q3_K if !gather && q3_k_native(info) => {
             (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Q3_K)
+        }
+        allpaca_gguf::GgmlType::RocmFpxQ8 if !gather && n > 65_536 => {
+            // Lossless: each block is a Q8_0 block with its UE4M3 scale as a half.
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if k == 0 || k % 32 != 0 || n % k != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "ROCmFPX Q8_0 GEMV {name} dims {:?} do not tile n={n}",
+                    info.dims
+                ))));
+            }
+            let q8 = allpaca_cpu::repack_rocmfpx_q8_as_q8_0(file.tensor_bytes(name)?)?;
+            let staged = allpaca_hip::stage_q8_0_gemv(&q8, n / k, k).map_err(|e| {
+                AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "Q8_0 GEMV stage {name}: {e}"
+                )))
+            })?;
+            (UploadPart::Owned(staged), WeightKind::Q8_0)
+        }
+        ty if !gather && n > 65_536 && rocmfpx_as_f16(ty) => {
+            let f32s = file.tensor_f32(name)?;
+            let mut bytes = Vec::with_capacity(n * 2);
+            for v in &f32s {
+                bytes.extend_from_slice(&allpaca_cpu::f32_to_f16(*v).to_le_bytes());
+            }
+            (UploadPart::Owned(bytes), WeightKind::F16)
         }
         ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
             let k = *info.dims.first().unwrap_or(&1) as usize;
@@ -13548,6 +13597,84 @@ mod lightning_moe_tests {
         let ragged = info(5120 + 32);
         let q8 = ragged.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
         assert_eq!(staged_device_bytes(&ragged), q8);
+    }
+
+    /// IQ1/IQ2/IQ3_XXS GEMM weights go to the device as the Q8_0 re-pack
+    /// the IQ4 types use (no native kernel), not as 4-byte floats.
+    #[test]
+    fn low_bit_iq_gemm_weights_repack_to_q8_0_on_device() {
+        use allpaca_gguf::GgmlType as T;
+        for (ty, id) in [(T::IQ2_XXS, 16), (T::IQ2_XS, 17), (T::IQ3_XXS, 18), (T::IQ1_S, 19), (T::IQ2_S, 22), (T::IQ1_M, 29)] {
+            let info = allpaca_gguf::TensorInfo {
+                name: "blk.0.ffn_down.weight".into(),
+                dims: vec![4096, 1024],
+                ggml_type: ty,
+                ggml_type_id: id,
+                offset: 0,
+                shard: 0,
+            };
+            let q8 = info.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+            assert_eq!(staged_device_bytes(&info), q8, "{ty:?}");
+        }
+    }
+
+    /// ROCmFPX GEMM weights reach the device without changing a value: type
+    /// 103 as the staged Q8_0 its blocks re-pack to, the two-scale types
+    /// (102, 104, 109-111) as F16, which holds every value they decode to.
+    #[test]
+    fn rocmfpx_gemm_weights_stage_losslessly() {
+        use allpaca_gguf::GgmlType as T;
+        let (rows, k) = (512usize, 256usize);
+        let n = rows * k;
+        let path = std::env::temp_dir().join(format!("allpaca-p13-rocmfpx-{}.gguf", std::process::id()));
+        let types = [
+            (T::RocmFpxQ8, allpaca_cpu::ROCMFPX_Q8_BLOCK_BYTES),
+            (T::RocmFpxQ6, allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES),
+            (T::RocmFpxQ3, allpaca_cpu::ROCMFPX_Q3_BLOCK_BYTES),
+            (T::RocmFpxQ5, allpaca_cpu::ROCMFPX_Q5_BLOCK_BYTES),
+            (T::RocmFpxQ7, allpaca_cpu::ROCMFPX_Q7_BLOCK_BYTES),
+            (T::RocmFpxQ2, allpaca_cpu::ROCMFPX_Q2_BLOCK_BYTES),
+        ];
+        let payloads: Vec<Vec<u8>> = types
+            .iter()
+            .map(|&(_, bb)| (0..n / 32 * bb).map(|i| (i * 131 + 7) as u8 % 0x7f).collect())
+            .collect();
+        let tensors: Vec<allpaca_gguf::GgufWriteQuantTensor> = types
+            .iter()
+            .zip(&payloads)
+            .map(|(&(ty, _), bytes)| allpaca_gguf::GgufWriteQuantTensor {
+                name: format!("w{}.weight", ty as u32),
+                dims: vec![k as u64, rows as u64],
+                ggml_type: ty,
+                bytes,
+            })
+            .collect();
+        allpaca_gguf::write_gguf_quant(&path, &Default::default(), &[], &tensors).unwrap();
+        let file = GgufFile::open(&path).unwrap();
+        for ((ty, _), packed) in types.iter().zip(&payloads) {
+            let name = format!("w{}.weight", *ty as u32);
+            let info = file.tensor(&name).unwrap();
+            let (mut parts, mut off) = (Vec::new(), 0usize);
+            let w = append_gguf_tensor_as(&file, &name, &mut parts, &mut off, false).unwrap();
+            let staged = parts.last().unwrap().as_slice().to_vec();
+            assert_eq!(staged.len() as u64, staged_device_bytes(info), "{ty:?}");
+            let mut want = vec![0.0f32; n];
+            allpaca_gguf::dequant_packed(*ty, packed, n, &mut want).unwrap();
+            if *ty == T::RocmFpxQ8 {
+                assert_eq!(w.kind, WeightKind::Q8_0);
+                let q8 = allpaca_cpu::repack_rocmfpx_q8_as_q8_0(packed).unwrap();
+                assert_eq!(staged, allpaca_hip::stage_q8_0_gemv(&q8, rows, k).unwrap());
+                let mut got = vec![0.0f32; n];
+                allpaca_cpu::dequant_q8_0(&q8, n, &mut got).unwrap();
+                assert!(got.iter().zip(&want).all(|(g, w)| g.to_bits() == w.to_bits()));
+            } else {
+                assert_eq!(w.kind, WeightKind::F16, "{ty:?}");
+                let got = staged.chunks_exact(2).map(|h| allpaca_cpu::f16_to_f32(u16::from_le_bytes([h[0], h[1]])));
+                assert!(got.zip(&want).all(|(g, w)| g.to_bits() == w.to_bits()), "{ty:?}");
+            }
+        }
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

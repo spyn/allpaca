@@ -8563,3 +8563,140 @@ fn hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model() {
     assert_eq!(stats.radix_skip_tokens % 256, 0, "resumes at a boundary; {stats:?}");
     assert_eq!(hit.token_ids, full.token_ids, "a mid-prompt hit must decode as a full prefill");
 }
+
+/// P13: a tiny llama whose matrices are random valid blocks of type `ty`
+/// (`block_bytes` per `block_elems` weights). The FFN matrices (131072
+/// weights) take the device staging path; scale fields are set so the
+/// layer, not the small embedding, decides the logits.
+#[cfg(feature = "hip")]
+fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlType, block_bytes: usize, block_elems: usize) {
+    use allpaca_gguf::{write_gguf_quant, GgmlType as T, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
+    use std::collections::HashMap;
+
+    let (dim, ff, vocab) = (256usize, 512usize, 16usize);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (ty as u64);
+    let mut blocks = |n: usize| -> Vec<u8> {
+        let mut out: Vec<u8> = (0..n / block_elems * block_bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        for (b, block) in out.chunks_exact_mut(block_bytes).enumerate() {
+            match ty {
+                // Half scale 2^-7 in the top nibbles of the four scale words.
+                T::IQ1_M => {
+                    for (k, nibble) in [0u8, 0, 0, 2].into_iter().enumerate() {
+                        block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (nibble << 4);
+                    }
+                }
+                T::IQ2_XXS | T::IQ2_XS | T::IQ2_S | T::IQ3_XXS | T::IQ1_S => {
+                    block[..2].copy_from_slice(&0x2000u16.to_le_bytes());
+                }
+                // UE4M3 scale bytes 0x20..0x27: (8 + m) * 2^-7.
+                T::RocmFpxQ8 => block[block_bytes - 1] = 0x20 | (b % 8) as u8,
+                _ => {
+                    block[block_bytes - 2] = 0x20 | (b % 8) as u8;
+                    block[block_bytes - 1] = 0x20 | ((b + 3) % 8) as u8;
+                }
+            }
+        }
+        out
+    };
+    let (q, k, v, o) = (blocks(dim * dim), blocks(dim / 4 * dim), blocks(dim / 4 * dim), blocks(dim * dim));
+    let (gate, up, down) = (blocks(ff * dim), blocks(ff * dim), blocks(dim * ff));
+
+    let mut meta = HashMap::new();
+    meta.insert("general.architecture".into(), GgufValue::String("llama".into()));
+    meta.insert("llama.vocab_size".into(), GgufValue::Uint32(vocab as u32));
+    meta.insert("llama.embedding_length".into(), GgufValue::Uint32(dim as u32));
+    meta.insert("llama.block_count".into(), GgufValue::Uint32(1));
+    meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(4));
+    meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(1));
+    meta.insert("llama.feed_forward_length".into(), GgufValue::Uint32(ff as u32));
+    meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
+    let mut tokens = vec!["<unk>".to_string(), "<s>".into(), "</s>".into(), "hello".into()];
+    tokens.extend((4..vocab).map(|i| format!("t{i}")));
+    meta.insert(
+        "tokenizer.ggml.tokens".into(),
+        GgufValue::Array(tokens.into_iter().map(GgufValue::String).collect()),
+    );
+    meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
+    meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
+    let embd: Vec<f32> = (0..vocab * dim).map(|i| ((i * 37 % 101) as f32 - 50.0) / 4096.0).collect();
+    let ones = vec![1.0f32; dim];
+    let quant = |name: &str, dims: [usize; 2]| (name.to_string(), vec![dims[0] as u64, dims[1] as u64]);
+    let named = [
+        (quant("blk.0.attn_q.weight", [dim, dim]), &q),
+        (quant("blk.0.attn_k.weight", [dim, dim / 4]), &k),
+        (quant("blk.0.attn_v.weight", [dim, dim / 4]), &v),
+        (quant("blk.0.attn_output.weight", [dim, dim]), &o),
+        (quant("blk.0.ffn_gate.weight", [dim, ff]), &gate),
+        (quant("blk.0.ffn_up.weight", [dim, ff]), &up),
+        (quant("blk.0.ffn_down.weight", [ff, dim]), &down),
+    ];
+    let quant_tensors: Vec<GgufWriteQuantTensor> = named
+        .iter()
+        .map(|((name, dims), bytes)| GgufWriteQuantTensor { name: name.clone(), dims: dims.clone(), ggml_type: ty, bytes })
+        .collect();
+    write_gguf_quant(
+        path,
+        &meta,
+        &[
+            GgufWriteTensor { name: "token_embd.weight".into(), dims: vec![dim as u64, vocab as u64], data: &embd },
+            GgufWriteTensor { name: "blk.0.attn_norm.weight".into(), dims: vec![dim as u64], data: &ones },
+            GgufWriteTensor { name: "blk.0.ffn_norm.weight".into(), dims: vec![dim as u64], data: &ones },
+            GgufWriteTensor { name: "output_norm.weight".into(), dims: vec![dim as u64], data: &ones },
+        ],
+        &quant_tensors,
+    )
+    .expect("write tiny typed GGUF");
+}
+
+/// P13: every new GGUF type loads on the HIP path, runs its FFN on the GPU
+/// (IQ types as the Q8_0 re-pack, ROCmFPX 103 as lossless Q8_0, the other
+/// ROCmFPX types as lossless F16) and gives the CPU path's greedy tokens.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_new_gguf_types_match_cpu_greedy() {
+    use allpaca_gguf::GgmlType as T;
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip hip_new_gguf_types_match_cpu_greedy: no HIP device");
+        return;
+    }
+    let types = [
+        (T::IQ2_XXS, allpaca_cpu::IQ2_XXS_BLOCK_BYTES, 256),
+        (T::IQ2_XS, allpaca_cpu::IQ2_XS_BLOCK_BYTES, 256),
+        (T::IQ2_S, allpaca_cpu::IQ2_S_BLOCK_BYTES, 256),
+        (T::IQ3_XXS, allpaca_cpu::IQ3_XXS_BLOCK_BYTES, 256),
+        (T::IQ1_S, allpaca_cpu::IQ1_S_BLOCK_BYTES, 256),
+        (T::IQ1_M, allpaca_cpu::IQ1_M_BLOCK_BYTES, 256),
+        (T::RocmFpxQ6, allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES, 32),
+        (T::RocmFpxQ8, allpaca_cpu::ROCMFPX_Q8_BLOCK_BYTES, 32),
+        (T::RocmFpxQ3, allpaca_cpu::ROCMFPX_Q3_BLOCK_BYTES, 32),
+        (T::RocmFpxQ5, allpaca_cpu::ROCMFPX_Q5_BLOCK_BYTES, 32),
+        (T::RocmFpxQ7, allpaca_cpu::ROCMFPX_Q7_BLOCK_BYTES, 32),
+        (T::RocmFpxQ2, allpaca_cpu::ROCMFPX_Q2_BLOCK_BYTES, 32),
+    ];
+    for (ty, block_bytes, block_elems) in types {
+        let path = std::env::temp_dir().join(format!("allpaca_p13_tiny_{}_{}.gguf", ty as u32, std::process::id()));
+        write_tiny_typed_llama_gguf(&path, ty, block_bytes, block_elems);
+        let run = |cpu_only: bool| {
+            let mut cfg = hip_7b_config(path.clone());
+            cfg.engine.cpu_only = cpu_only;
+            let engine = Engine::new(cfg).unwrap_or_else(|e| panic!("{ty:?} load (cpu_only={cpu_only}): {e}"));
+            let out = engine.generate("hello", greedy(6)).unwrap_or_else(|e| panic!("{ty:?} generate: {e}"));
+            (out.token_ids, engine.stats())
+        };
+        let (cpu_ids, _) = run(true);
+        let (hip_ids, stats) = run(false);
+        let _ = std::fs::remove_file(&path);
+        eprintln!("{ty:?}: cpu {cpu_ids:?} hip {hip_ids:?} gpu_forwards {}", stats.gpu_forwards);
+        assert!(!cpu_ids.is_empty(), "{ty:?}");
+        assert_eq!(stats.backend, "hip", "{ty:?}");
+        assert!(stats.gpu_forwards > 0, "{ty:?} must run on the GPU; stats={stats:?}");
+        assert_eq!(hip_ids, cpu_ids, "{ty:?}: HIP greedy tokens must equal CPU");
+    }
+}
