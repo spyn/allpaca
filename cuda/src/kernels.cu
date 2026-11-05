@@ -1585,10 +1585,17 @@ __device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int caus
 }
 
 /* A row with more than ATTN_CHUNK keys: the keys split into chunks, each an
- * online softmax from an empty state (sinks in chunk 0 only), folded in
- * ascending order by attn_fold. A row with one chunk is the single-pass result. */
+ * online softmax from an empty state (sinks in chunk 0 only), folded by
+ * attn_fold in one fixed tree, the same as HIP's (see ATTN_FOLD_STACK). A row
+ * with one chunk is the single-pass result. */
 constexpr int ATTN_CHUNK = 128;
 static_assert(ATTN_CHUNK % ATTN_KT == 0, "chunks are whole key tiles");
+/* The fold tree: at stride s = 1, 2, 4, ... the partial at left + s folds into
+ * the one at left, for every left that is a multiple of 2s with left + s <
+ * n_chunks. The Q-tiled kernel builds the same tree with a carry stack: push a
+ * chunk, fold while the top two spans are the same size, then fold what is
+ * left right to left. At most floor(log2(n_chunks)) + 2 partials. */
+constexpr int ATTN_FOLD_STACK = 26;
 
 /* Floats per (row, head, chunk) partial: every lane's accumulators, m, l. */
 template <int DPT>
@@ -1618,6 +1625,49 @@ __device__ __forceinline__ void attn_fold(float &m, float &l, float *acc, float 
         acc[i] = fmaf(acc[i], a, __fmul_rn(acc_b[i], b));
     }
     m = mm;
+}
+
+/* The carry stack of the fold tree (see ATTN_FOLD_STACK), one per warp lane. */
+template <int DPT>
+struct AttnFoldStack {
+    float acc[ATTN_FOLD_STACK][attn_row_dims<DPT>()];
+    float m[ATTN_FOLD_STACK];
+    float l[ATTN_FOLD_STACK];
+    int span[ATTN_FOLD_STACK];
+    int sp;
+};
+
+/* Pushes one finished chunk and folds while the top two spans match. */
+template <int DPT>
+__device__ __forceinline__ void attn_tree_push(AttnFoldStack<DPT> &st, const AttnRow<DPT> &r) {
+#pragma unroll
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+        st.acc[st.sp][i] = r.acc[i];
+    }
+    st.m[st.sp] = r.m;
+    st.l[st.sp] = r.l;
+    st.span[st.sp] = 1;
+    ++st.sp;
+    while (st.sp >= 2 && st.span[st.sp - 1] == st.span[st.sp - 2]) {
+        attn_fold<DPT>(st.m[st.sp - 2], st.l[st.sp - 2], st.acc[st.sp - 2], st.m[st.sp - 1], st.l[st.sp - 1],
+                       st.acc[st.sp - 1]);
+        st.span[st.sp - 2] += st.span[st.sp - 1];
+        --st.sp;
+    }
+}
+
+/* Folds what the carry left, right to left, into `r`. */
+template <int DPT>
+__device__ __forceinline__ void attn_tree_finish(AttnFoldStack<DPT> &st, AttnRow<DPT> &r) {
+    for (int i = st.sp - 1; i > 0; --i) {
+        attn_fold<DPT>(st.m[i - 1], st.l[i - 1], st.acc[i - 1], st.m[i], st.l[i], st.acc[i]);
+    }
+#pragma unroll
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+        r.acc[i] = st.acc[0][i];
+    }
+    r.m = st.m[0];
+    r.l = st.l[0];
 }
 
 /* Copies keys [t0, t0 + tile) of key/value head `kv_h` into shared memory,
@@ -1670,9 +1720,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE)
     const int step = tile > 0 ? tile : ATTN_KT;
     AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
-    float m_acc[attn_row_dims<DPT>()];
-    float m_m = -1.0e30f, m_l = 0.f;
-    bool folded = false;
+    /* Finished chunks before the current one, as the fold tree's carry stack. */
+    AttnFoldStack<DPT> st;
+    st.sp = 0;
     int next_fold = ATTN_CHUNK;
     for (int t0 = 0; t0 < block_end; t0 += step) {
         if (tile > 0) {
@@ -1684,17 +1734,7 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE)
         for (int s = t0; s < stop; s += ATTN_KT) {
             if (s == next_fold) {
                 next_fold += ATTN_CHUNK;
-                if (folded) {
-                    attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                        m_acc[i] = r.acc[i];
-                    }
-                    m_m = r.m;
-                    m_l = r.l;
-                    folded = true;
-                }
+                attn_tree_push<DPT>(st, r);
                 attn_row_reset(r);
             }
             const int t = s + lane / 2;
@@ -1708,14 +1748,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE)
         }
     }
     if (active) {
-        if (folded) {
-            attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-#pragma unroll
-            for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                r.acc[i] = m_acc[i];
-            }
-            r.m = m_m;
-            r.l = m_l;
+        if (st.sp > 0) {
+            attn_tree_push<DPT>(st, r);
+            attn_tree_finish<DPT>(st, r);
         }
         attn_row_store(r, oh, lane, head_dim, nvec, vec4);
     }
@@ -1794,7 +1829,53 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS)
     }
 }
 
-/* Folds a row's chunk partials in ascending order and writes the row. */
+/* The largest power of two below n_chunks: the stride of the fold tree's last
+ * level, which attention_merge_kernel folds. n_chunks >= 2. */
+__host__ __device__ __forceinline__ int attn_tree_top(int n_chunks) {
+    int top = 1;
+    while (2 * top < n_chunks) {
+        top *= 2;
+    }
+    return top;
+}
+
+/* One tree level of a decode row's partials (see ATTN_FOLD_STACK): block x is
+ * the pair (2 * stride * x, + stride), block y the head; folds in place. */
+template <int DPT>
+__global__ void __launch_bounds__(32) attention_merge_pair_kernel(float *part, int n_chunks, int stride) {
+    const int left = static_cast<int>(blockIdx.x) * 2 * stride;
+    const int right = left + stride;
+    const int h = static_cast<int>(blockIdx.y);
+    if (right >= n_chunks) {
+        return;
+    }
+    const int lane = static_cast<int>(threadIdx.x);
+    constexpr int dims = attn_row_dims<DPT>();
+    float *base = part + static_cast<size_t>(h) * n_chunks * attn_part<DPT>();
+    float *dst = base + static_cast<size_t>(left) * attn_part<DPT>();
+    const float *src = base + static_cast<size_t>(right) * attn_part<DPT>();
+    float acc[dims];
+    float acc_b[dims];
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        acc[i] = dst[lane * dims + i];
+        acc_b[i] = src[lane * dims + i];
+    }
+    float m = dst[32 * dims];
+    float l = dst[32 * dims + 1];
+    attn_fold<DPT>(m, l, acc, src[32 * dims], src[32 * dims + 1], acc_b);
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        dst[lane * dims + i] = acc[i];
+    }
+    if (lane == 0) {
+        dst[32 * dims] = m;
+        dst[32 * dims + 1] = l;
+    }
+}
+
+/* The fold tree's last level, (0, top), then writes the row. Every level
+ * below it has already run (attention_merge_pair_kernel). */
 template <int DPT>
 __global__ void __launch_bounds__(32)
     attention_merge_kernel(const float *q, const float *part, float *out, int n_heads, int head_dim,
@@ -1815,15 +1896,13 @@ __global__ void __launch_bounds__(32)
     }
     r.m = src[32 * attn_row_dims<DPT>()];
     r.l = src[32 * attn_row_dims<DPT>() + 1];
-    for (int c = 1; c < n_chunks; ++c) {
-        const float *pc = src + static_cast<size_t>(c) * attn_part<DPT>();
-        float acc_b[attn_row_dims<DPT>()];
+    const float *pc = src + static_cast<size_t>(attn_tree_top(n_chunks)) * attn_part<DPT>();
+    float acc_b[attn_row_dims<DPT>()];
 #pragma unroll
-        for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-            acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
-        }
-        attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
+    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
+        acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
     }
+    attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
     attn_row_store(r, oh, lane, head_dim, nvec, vec4);
 }
 
@@ -1892,6 +1971,14 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
                 attention_split_gqa_kernel<DPT, VEC4><<<split_grid, split_block, lds, stream>>>(
                     q, k, v, s.p, static_cast<float *>(nullptr), n_kv, n_heads, n_kv_heads, head_dim, causal,
                     mask, sinks, softcap, n_chunks, tile);
+                /* The fold tree's levels below the last (see ATTN_FOLD_STACK). */
+                const int top = attn_tree_top(n_chunks);
+                for (int stride = 1; stride < top; stride *= 2) {
+                    const int pairs = (n_chunks - stride + 2 * stride - 1) / (2 * stride);
+                    attention_merge_pair_kernel<DPT>
+                        <<<dim3(static_cast<unsigned>(pairs), static_cast<unsigned>(n_heads)), 32, 0, stream>>>(
+                            s.p, n_chunks, stride);
+                }
                 attention_merge_kernel<DPT><<<dim3(1, static_cast<unsigned>(n_heads)), 32, 0, stream>>>(
                     q, s.p, out, n_heads, head_dim, n_chunks);
                 return;
