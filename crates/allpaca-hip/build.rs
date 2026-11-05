@@ -117,7 +117,7 @@ fn main() {
     pin_sdk_hip_dlls(&hip_root);
 }
 
-/// Copy the SDK HIP runtime next to test executables so Windows does not load
+/// Copy the SDK HIP runtime next to test executables and binaries so Windows does not load
 /// `System32\amdhip64_7.dll`. Skips the copy when the destination is already
 /// the same size.
 fn pin_sdk_hip_dlls(hip_root: &Path) {
@@ -127,16 +127,27 @@ fn pin_sdk_hip_dlls(hip_root: &Path) {
     let Ok(out) = env::var("OUT_DIR") else {
         return;
     };
-    let deps = PathBuf::from(out).join("../../../deps");
+    // `deps` holds the test executables; the profile directory above it holds
+    // the binaries (`allpaca-server.exe`), which crash in System32's ROCm 10
+    // runtime when a fresh target directory has no pinned copy. Binaries get
+    // the runtime only: with SDK 7.1's `amd_comgr_3.dll` beside it as well,
+    // `allpaca-server.exe` crashes at startup on xeres (measured 2026-11-05).
+    let profile = PathBuf::from(out).join("../../..");
+    let deps = profile.join("deps");
     if std::fs::create_dir_all(&deps).is_err() {
         return;
     }
-    for name in ["amdhip64_7.dll", "amd_comgr_3.dll"] {
+    let pins = [
+        (&deps, "amdhip64_7.dll"),
+        (&deps, "amd_comgr_3.dll"),
+        (&profile, "amdhip64_7.dll"),
+    ];
+    for (dir, name) in pins {
         let src = hip_root.join("bin").join(name);
         if !src.is_file() {
             continue;
         }
-        let dst = deps.join(name);
+        let dst = dir.join(name);
         let same_len = match (src.metadata(), dst.metadata()) {
             (Ok(a), Ok(b)) => a.len() == b.len(),
             _ => false,
@@ -446,9 +457,10 @@ fn hip_looks_valid(root: &Path) -> bool {
 }
 
 /// Default fat binary when no live GPU is visible: Vega/GCN5 (MI50, Radeon VII,
-/// home Vega) plus the RDNA3/4 targets the kernels were first brought up on.
+/// home Vega), the RDNA3/4 targets the kernels were first brought up on, and
+/// gfx1151 (Strix Halo's Radeon 8060S, RDNA3.5).
 fn default_offload_arches() -> Vec<String> {
-    ["gfx906", "gfx900", "gfx1100", "gfx1200", "gfx1201"]
+    ["gfx906", "gfx900", "gfx1100", "gfx1151", "gfx1200", "gfx1201"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -475,6 +487,11 @@ fn gfx_arch_token(raw: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
         .collect();
+    // ROCm 7+ rocminfo also lists generic ISAs such as `gfx11-generic` and
+    // `gfx9-4-generic`; clang rejects the truncated `gfx11`, so skip them.
+    if rest[token.len()..].starts_with('-') {
+        return None;
+    }
     let base = token.split(':').next().unwrap_or("");
     if base.starts_with("gfx") && base.len() > 3 {
         Some(base.to_string())

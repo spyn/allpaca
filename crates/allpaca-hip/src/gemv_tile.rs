@@ -97,6 +97,17 @@ pub fn infinity_cache_from_l2(l2_bytes: usize) -> usize {
     l2_bytes.saturating_mul(8).clamp(16 << 20, 64 << 20)
 }
 
+/// Infinity Cache size for ISAs where the L2 rule above is known to be wrong.
+/// gfx1151 (Strix Halo's Radeon 8060S) has 2 MiB of L2, which the rule turns into
+/// 16 MiB, but its last-level cache is 32 MiB: `rocminfo` on shodan lists
+/// L3 = 32768 KB for the GPU agent.
+pub fn known_infinity_cache_bytes(arch: &str) -> Option<usize> {
+    match arch.split(':').next().unwrap_or(arch) {
+        "gfx1151" => Some(32 << 20),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +137,18 @@ mod tests {
         assert_eq!(infinity_cache_from_l2(0), 0);
         assert_eq!(infinity_cache_from_l2(4 << 20), 32 << 20);
         assert_eq!(infinity_cache_from_l2(16 << 20), 64 << 20);
+    }
+
+    #[test]
+    fn strix_halo_uses_its_real_cache_size() {
+        assert_eq!(known_infinity_cache_bytes("gfx1151"), Some(32 << 20));
+        assert_eq!(known_infinity_cache_bytes("gfx1151:xnack-"), Some(32 << 20));
+        assert_eq!(known_infinity_cache_bytes("gfx1201"), None);
+        assert_eq!(
+            select_gemv_tile_cols_heuristic(256, 4096, 32 << 20, 176),
+            128,
+            "32 MiB still allows COLS=128"
+        );
     }
 
     #[test]

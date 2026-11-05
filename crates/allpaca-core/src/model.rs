@@ -10433,14 +10433,18 @@ impl TinyModel {
         vision: Option<&VisionSeq>,
         hidden_rows: Option<&mut [f32]>,
     ) -> Result<(), AllpacaError> {
-        // Remote RPC prefill must use the same row arithmetic on every worker
-        // arch; a local tensor split keeps its existing single-machine path.
-        // Expert-parallel counts: without exact rows its local prefill takes
-        // the BLAS/WMMA paths, and those changed text from run to run. MoE
-        // models also take exact rows when nothing is remote: Ling-mini's
-        // local prefill changed text between fresh starts without it (S2).
+        // Every prefill takes exact rows: each row of a wide GEMM equals that
+        // row computed alone, so the bits don't depend on where layers run.
+        // RPC workers compute rows that way (`serve_connection_ext`); with the
+        // BLAS/WMMA paths here, attaching a worker changed the local layers'
+        // bits too, and Qwen3.8 text with them (Q23). MoE models needed it
+        // with nothing remote as well: Ling-mini's local prefill changed
+        // text between fresh starts without it (S2). The one exception is the
+        // opt-in `experimental.row_variant_kernels` prefill of a dense model
+        // with nothing remote, which exists to run the WMMA tiles instead.
         let moe = self.config.n_experts > 0;
-        let _exact_rows = (moe || self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote()))
+        let remote = self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote());
+        let _exact_rows = (moe || remote || !allpaca_hip::prefill_wmma_active())
             .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()
