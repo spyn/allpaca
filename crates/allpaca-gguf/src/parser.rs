@@ -253,7 +253,7 @@ pub enum GgmlType {
 
 /// Why ggml type 107 is refused: the ROCmFPX fork wrote two different
 /// layouts under it (now `Q2_0_ROCMFPX_LEGACY_AMBIGUOUS`) and refuses it too.
-pub const AMBIGUOUS_ROCMFPX_107: &str = "ggml type 107 (legacy ROCmFPX Q2_0) is ambiguous: two different      block layouts were written under that id, so its weights cannot be read safely;      re-quantise to ROCmFPX Q2_0 (type 111)";
+pub const AMBIGUOUS_ROCMFPX_107: &str = "ggml type 107 (legacy ROCmFPX Q2_0) is ambiguous: two different block layouts were written under that id, so its weights cannot be read safely; re-quantise to ROCmFPX Q2_0 (type 111)";
 
 /// Dequantize a packed slice of `ty` (whole blocks, `n` elements) into `out`.
 ///
