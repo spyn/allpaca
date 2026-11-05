@@ -9,6 +9,9 @@ pub fn peak_gbs(device_name: &str) -> Option<f64> {
         Some(640.0)
     } else if n.contains("9060") {
         Some(320.0)
+    } else if n.contains("8060s") || n.contains("gfx1151") {
+        // Strix Halo: LPDDR5X-8000 on 256 bits, shared with the CPU (calculated).
+        Some(256.0)
     } else if n.contains("mi50") || n.contains("gfx906") {
         Some(1024.0)
     } else if n.contains("3060") {
@@ -74,6 +77,7 @@ mod tests {
         assert_eq!(peak_gbs("AMD Radeon RX 9070"), Some(640.0));
         assert_eq!(peak_gbs("Radeon RX 9070 XT"), Some(640.0)); // still 640 table; XT is a different card we do not own
         assert_eq!(peak_gbs("AMD Radeon RX 9060 XT"), Some(320.0));
+        assert_eq!(peak_gbs("AMD Radeon 8060S Graphics"), Some(256.0));
         assert_eq!(peak_gbs("AMD Instinct MI50"), Some(1024.0));
         assert_eq!(peak_gbs("NVIDIA GeForce RTX 3060"), Some(360.0));
         assert_eq!(peak_gbs("Tesla K80"), Some(240.0));

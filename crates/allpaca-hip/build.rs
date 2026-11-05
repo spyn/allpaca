@@ -446,9 +446,10 @@ fn hip_looks_valid(root: &Path) -> bool {
 }
 
 /// Default fat binary when no live GPU is visible: Vega/GCN5 (MI50, Radeon VII,
-/// home Vega) plus the RDNA3/4 targets the kernels were first brought up on.
+/// home Vega), the RDNA3/4 targets the kernels were first brought up on, and
+/// gfx1151 (Strix Halo's Radeon 8060S, RDNA3.5).
 fn default_offload_arches() -> Vec<String> {
-    ["gfx906", "gfx900", "gfx1100", "gfx1200", "gfx1201"]
+    ["gfx906", "gfx900", "gfx1100", "gfx1151", "gfx1200", "gfx1201"]
         .into_iter()
         .map(str::to_string)
         .collect()
