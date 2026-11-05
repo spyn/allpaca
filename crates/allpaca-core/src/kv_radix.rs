@@ -63,6 +63,7 @@ impl RadixCheckpoint {
         let draft = self.draft.as_ref().map_or(0, Vec::len);
         rec.saturating_add(host_kv)
             .saturating_add(r.q4x.host_bytes())
+            .saturating_add(r.dsv4.host_bytes())
             .saturating_add(kv)
             .saturating_add(draft)
             .saturating_add(64)
@@ -1309,8 +1310,9 @@ fn kv_below(node: &RadixNode) -> Option<Vec<u32>> {
 }
 
 const MAGIC: &[u8; 4] = b"APKC";
-/// Checkpoint files. 3 has no drafter trailer; 4 may.
-const VERSION: u32 = 4;
+/// Checkpoint files. 3 has no drafter trailer; 4 may; 5 may hold Dsv4Memory.
+const VERSION: u32 = 5;
+const VERSION_V4: u32 = 4;
 const VERSION_V3: u32 = 3;
 const FLAG_SLICEABLE: u8 = 1;
 const FLAG_STATE_ONLY: u8 = 2;
@@ -1343,7 +1345,8 @@ fn write_file(file: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// `MAGIC`, version, tokens, flags, per-layer keys and values, then the
 /// recurrent state (layers, ssm_h, ssm_conv, gdn_state, gdn_conv), the host
-/// attention keys and values, and the qwen4exp memory.
+/// attention keys and values, the qwen4exp memory, the drafter trailer,
+/// and (v5) Dsv4Memory.
 fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     let mut out = Vec::with_capacity(cp.approx_bytes() + tokens.len() * 4 + 64);
     out.extend_from_slice(MAGIC);
@@ -1391,6 +1394,11 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
             out.extend_from_slice(draft);
         }
     }
+    let dsv4 = !r.dsv4.is_empty();
+    out.push(dsv4 as u8);
+    if dsv4 {
+        r.dsv4.write_to(&mut out);
+    }
     out
 }
 
@@ -1399,7 +1407,7 @@ fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8, u32)> {
         return None;
     }
     let version = r.u32()?;
-    if version != VERSION && version != VERSION_V3 {
+    if version < VERSION_V3 || version > VERSION {
         return None;
     }
     let n = r.u32()? as usize;
@@ -1464,13 +1472,22 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
         1 => Some(crate::qwen4exp::Qwen4Memory::read_from(&mut r)?),
         _ => return None,
     };
-    let draft = if version >= VERSION {
+    let draft = if version >= VERSION_V4 {
         match r.u8()? {
             0 => None,
             1 => {
                 let n = r.u32()? as usize;
                 Some(r.take(n)?.to_vec())
             }
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    let dsv4 = if version >= VERSION {
+        match r.u8()? {
+            0 => None,
+            1 => Some(crate::dsv4_attn::Dsv4Memory::read_from(&mut r)?),
             _ => return None,
         }
     } else {
@@ -1489,6 +1506,9 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     recurrent.host_kv = host_kv;
     if let Some(q4x) = q4x {
         recurrent.q4x = q4x;
+    }
+    if let Some(dsv4) = dsv4 {
+        recurrent.dsv4 = dsv4;
     }
     Some(RadixCheckpoint {
         recurrent,
@@ -1915,6 +1935,48 @@ mod tests {
         assert_eq!(cp.kv_rows(), one.kv_rows());
         assert_eq!(cp.recurrent.gdn_state, one.recurrent.gdn_state);
         assert_eq!(cp.recurrent.gdn_conv, one.recurrent.gdn_conv);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// APKC must persist DSV4 compressed memory: a v4 file drops it, so a
+    /// RAM-evicted checkpoint would resume with an empty compressor.
+    #[test]
+    fn a_checkpoint_file_keeps_dsv4_compressed_memory() {
+        let dir = disk_dir("dsv4");
+        let mut rec = RecurrentState::zeros(1, 4);
+        rec.dsv4 = crate::dsv4_attn::Dsv4Memory::from_test_keys(vec![1.5, -0.25, 3.0, 0.0], 12);
+        let saved = KvRadixForest::new().checkpoint(
+            rec,
+            vec![vec![KvRow {
+                k: vec![1.0; 2],
+                v: vec![2.0; 2],
+            }]],
+        );
+        let with_dsv4 = saved.approx_bytes();
+        let empty = RecurrentState::zeros(1, 4);
+        let without = KvRadixForest::new()
+            .checkpoint(
+                empty,
+                vec![vec![KvRow {
+                    k: vec![1.0; 2],
+                    v: vec![2.0; 2],
+                }]],
+            )
+            .approx_bytes();
+        assert!(
+            with_dsv4 > without,
+            "approx_bytes must count Dsv4Memory: {with_dsv4} vs {without}"
+        );
+        let mut forest = KvRadixForest::with_limits(0, 1).with_disk(&dir, 0).unwrap();
+        forest.insert_checkpoint(&[1, 2, 3], saved.clone());
+        let (n, back) = forest
+            .lookup_checkpoint(&[1, 2, 3, 9])
+            .expect("back from disk");
+        assert_eq!(n, 3);
+        assert_eq!(
+            back.recurrent.dsv4, saved.recurrent.dsv4,
+            "compressed memory must survive the checkpoint file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

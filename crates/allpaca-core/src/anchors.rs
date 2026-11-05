@@ -246,6 +246,20 @@ pub fn restore_kv(
     rows: &[Vec<KvRow>],
     cfg: &ModelConfig,
 ) -> Result<(), AllpacaError> {
+    restore_kv_from(kv, pages, rows, cfg, 0)
+}
+
+/// Write `rows` into KV pages starting at token `start_pos`.
+///
+/// A sliding-window checkpoint keeps only the last window of raw rows of a
+/// longer prefix, so those rows belong at `depth - window`, not at slot 0.
+pub fn restore_kv_from(
+    kv: &mut KvTierManager,
+    pages: &[Vec<u64>],
+    rows: &[Vec<KvRow>],
+    cfg: &ModelConfig,
+    start_pos: usize,
+) -> Result<(), AllpacaError> {
     // The first layer with pages: a recurrent layer keeps none.
     let page_tokens = kv
         .get(pages.iter().find_map(|l| l.first()).copied().unwrap_or(0))
@@ -259,21 +273,28 @@ pub fn restore_kv(
                 "anchor restore missing KV layer".into(),
             ))
         })?;
-        // One write per page: rows one at a time cost two synchronous
+        // One write per page span: rows one at a time cost two synchronous
         // device copies each.
-        for (page_index, page_rows) in layer_rows.chunks(page_tokens).enumerate() {
+        let mut pos = start_pos;
+        let mut i = 0;
+        while i < layer_rows.len() {
+            let page_index = pos / page_tokens;
+            let slot = pos % page_tokens;
             let page_id = *layer_pages.get(page_index).ok_or_else(|| {
                 AllpacaError::Fatal(FatalError::OutOfMemory(
                     "anchor restore missing KV page".into(),
                 ))
             })?;
+            let run = (layer_rows.len() - i).min(page_tokens - slot);
             k.clear();
             v.clear();
-            for row in page_rows {
+            for row in &layer_rows[i..i + run] {
                 k.extend_from_slice(&row.k);
                 v.extend_from_slice(&row.v);
             }
-            kv.write_slots(page_id, 0, cfg.n_kv_heads, cfg.head_dim(), &k, &v)?;
+            kv.write_slots(page_id, slot as u32, cfg.n_kv_heads, cfg.head_dim(), &k, &v)?;
+            i += run;
+            pos += run;
         }
     }
     Ok(())

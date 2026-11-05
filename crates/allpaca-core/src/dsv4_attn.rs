@@ -348,7 +348,7 @@ impl PoolCfg<'_> {
 }
 
 /// The tokens a compressor has seen but not finished pooling.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Pool {
     kv: Vec<f32>,
     score: Vec<f32>,
@@ -421,7 +421,7 @@ impl Pool {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct LayerMemory {
     /// Tokens this layer has taken in.
     tokens: usize,
@@ -434,7 +434,7 @@ struct LayerMemory {
 }
 
 /// One sequence's compressed attention memory, for every layer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Dsv4Memory {
     layers: Vec<LayerMemory>,
 }
@@ -452,6 +452,85 @@ impl Dsv4Memory {
         self.layers
             .get(layer)
             .map_or(0, |l| l.keys.len() / head_dim.max(1))
+    }
+
+    /// Bytes this memory occupies in a checkpoint (payload only).
+    pub(crate) fn host_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| {
+                (l.keys.len()
+                    + l.index_keys.len()
+                    + l.attn.kv.len()
+                    + l.attn.score.len()
+                    + l.index.kv.len()
+                    + l.index.score.len())
+                    * 4
+                    + std::mem::size_of::<usize>()
+            })
+            .sum()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    /// Append to a prompt-cache checkpoint file.
+    pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
+        use crate::kv_codec::write_f32s;
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for layer in &self.layers {
+            out.extend_from_slice(&(layer.tokens as u64).to_le_bytes());
+            write_f32s(out, &layer.attn.kv);
+            write_f32s(out, &layer.attn.score);
+            write_f32s(out, &layer.index.kv);
+            write_f32s(out, &layer.index.score);
+            write_f32s(out, &layer.keys);
+            write_f32s(out, &layer.index_keys);
+        }
+    }
+
+    /// What [`Self::write_to`] wrote.
+    pub(crate) fn read_from(r: &mut crate::kv_codec::Reader<'_>) -> Option<Self> {
+        let n_layers = r.u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers.min(1024));
+        for _ in 0..n_layers {
+            let tokens = usize::try_from(r.u64()?).ok()?;
+            layers.push(LayerMemory {
+                tokens,
+                attn: Pool {
+                    kv: r.f32s()?,
+                    score: r.f32s()?,
+                },
+                index: Pool {
+                    kv: r.f32s()?,
+                    score: r.f32s()?,
+                },
+                keys: r.f32s()?,
+                index_keys: r.f32s()?,
+            });
+        }
+        Some(Self { layers })
+    }
+
+    /// A one-layer memory for checkpoint round-trip tests.
+    #[cfg(test)]
+    pub(crate) fn from_test_keys(keys: Vec<f32>, tokens: usize) -> Self {
+        Self {
+            layers: vec![LayerMemory {
+                tokens,
+                keys,
+                attn: Pool {
+                    kv: vec![0.25, 0.5],
+                    score: vec![-1.0, 2.0],
+                },
+                index: Pool {
+                    kv: vec![0.125],
+                    score: vec![4.0],
+                },
+                index_keys: vec![9.0, 8.0],
+            }],
+        }
     }
 }
 
@@ -1098,5 +1177,53 @@ mod tests {
         run.memory = Dsv4Memory::default();
         let err = run.feed(&[3]).expect_err("memory was dropped");
         assert!(err.to_string().contains("attention memory"), "{err}");
+    }
+
+    /// A DSV4 SWA checkpoint keeps the compressed memory plus only the last
+    /// `window` raw KV rows, restored at the checkpoint's own positions.
+    /// Replay of the suffix must match a cold prefill of the whole prompt
+    /// (exact, not DeepInfer's truncated-window approximation).
+    #[test]
+    fn a_swa_checkpoint_past_the_window_replays_like_a_cold_prefill() {
+        use crate::anchors::{restore_kv_from, snapshot_kv};
+
+        let window = 8usize;
+        let model = tiny(window as u32, &[4], 0);
+        let tokens: Vec<u32> = (0..20u32).map(|i| 3 + (i * 5 + i / 3) % 5).collect();
+        // Two window strides in: last-window rows sit at positions 8..16,
+        // so a restore that writes them at slot 0 is wrong.
+        let depth = 16usize;
+        assert!(depth > window && depth < tokens.len());
+
+        let mut cold = Run::new(&model);
+        cold.feed(&tokens).expect("cold prefill");
+        let want = cold.logits.clone();
+
+        let mut saved = Run::new(&model);
+        saved.feed(&tokens[..depth]).expect("prefix to checkpoint");
+        let cfg = &model.config;
+        let window_rows: Vec<Vec<crate::anchors::KvRow>> =
+            snapshot_kv(&saved.kv, &saved.pages, cfg)
+                .expect("snapshot")
+                .into_iter()
+                .map(|layer| {
+                    let skip = layer.len().saturating_sub(window);
+                    layer[skip..].to_vec()
+                })
+                .collect();
+        assert!(
+            window_rows.iter().all(|l| l.len() == window),
+            "checkpoint keeps one window of raw rows"
+        );
+
+        let mut restored = Run::new(&model);
+        restored.memory = saved.memory.clone();
+        restored.pos = depth;
+        let start = depth - window;
+        restore_kv_from(&mut restored.kv, &restored.pages, &window_rows, cfg, start)
+            .expect("restore window rows at their positions");
+        restored.feed(&tokens[depth..]).expect("replay suffix");
+        let got = max_diff(&want, &restored.logits);
+        assert!(got < 1e-4, "restored logits drifted from cold: {got}");
     }
 }
