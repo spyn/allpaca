@@ -3947,6 +3947,9 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
             | T::IQ3_XXS
             | T::IQ1_S
             | T::IQ1_M
+            // NVFP4 weights (with their `.scale` folded in by `tensor_f32`)
+            // land within half a Q8_0 step of the FP4 grid.
+            | T::Nvfp4
     )
 }
 

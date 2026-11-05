@@ -224,6 +224,8 @@ pub enum GgmlType {
     TQ2_0 = 35,
     /// ggml MXFP4 (E8M0 + nibbles, ggml_type_id=39).
     MXFP4 = 39,
+    /// ggml NVFP4: 64-weight blocks, four UE4M3 scales, E2M1 nibbles (ggml_type_id=40).
+    Nvfp4 = 40,
     /// One sign bit per weight, half scale per 128 (ggml_type_id=41).
     Q1_0 = 41,
     /// Two bits per weight on -1, 0, +1, +2 scales, half scale per 64
@@ -314,6 +316,7 @@ pub fn dequant_packed(
         GgmlType::TQ1_0 => allpaca_cpu::dequant_tq1_0(bytes, n, out),
         GgmlType::TQ2_0 => allpaca_cpu::dequant_tq2_0(bytes, n, out),
         GgmlType::MXFP4 => allpaca_cpu::dequant_mxfp4(bytes, n, out),
+        GgmlType::Nvfp4 => allpaca_cpu::dequant_nvfp4(bytes, n, out),
         GgmlType::Q1_0 => allpaca_cpu::dequant_q1_0(bytes, n, out),
         GgmlType::Q2_0 => allpaca_cpu::dequant_q2_0(bytes, n, out),
         GgmlType::RocmFp4 => allpaca_cpu::dequant_rocmfp4(bytes, n, out),
@@ -361,6 +364,7 @@ impl GgmlType {
             34 => Self::TQ1_0,
             35 => Self::TQ2_0,
             39 => Self::MXFP4,
+            40 => Self::Nvfp4,
             41 => Self::Q1_0,
             42 => Self::Q2_0,
             100 => Self::RocmFp4,
@@ -464,6 +468,9 @@ impl TensorInfo {
             GgmlType::MXFP4 => n
                 .div_ceil(allpaca_cpu::MXFP4_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::MXFP4_BLOCK_BYTES),
+            GgmlType::Nvfp4 => n
+                .div_ceil(allpaca_cpu::NVFP4_BLOCK_ELEMS)
+                .saturating_mul(allpaca_cpu::NVFP4_BLOCK_BYTES),
             GgmlType::TQ1_0 => n
                 .div_ceil(allpaca_cpu::TQ1_0_BLOCK_ELEMS)
                 .saturating_mul(allpaca_cpu::TQ1_0_BLOCK_BYTES),
@@ -845,6 +852,7 @@ impl GgufFile {
             GgmlType::I32 as u32,
             GgmlType::BF16 as u32,
             GgmlType::MXFP4 as u32,
+            GgmlType::Nvfp4 as u32,
             GgmlType::TQ1_0 as u32,
             GgmlType::TQ2_0 as u32,
             GgmlType::RocmFp4 as u32,
@@ -871,7 +879,7 @@ impl GgufFile {
         }
         if !unsupported_types.is_empty() {
             reasons.push(format!(
-                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/Q1_0/Q2_0/ROCmFP4/ROCmFPX 102-104,109-111)"
+                "unsupported ggml_type_id={unsupported_types:?} (need F32/F16/BF16/I32/MXFP4/NVFP4/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS/TQ1_0/TQ2_0/Q1_0/Q2_0/ROCmFP4/ROCmFPX 102-104,109-111)"
             ));
         }
         let llama_family = matches!(
@@ -957,6 +965,27 @@ impl GgufFile {
     }
 
     /// Materialize a tensor as F32. Supported quants convert on CPU; unknown types are Fatal.
+    /// The per-tensor F32 scale stored beside an NVFP4 weight (`X.weight` ->
+    /// `X.scale`), if the file has one. `X.input_scale` is not used: llama.cpp
+    /// loads it but never applies it in the graph.
+    pub fn nvfp4_tensor_scale(&self, weight: &str) -> Result<Option<f32>, AllpacaError> {
+        let Some(stem) = weight.strip_suffix(".weight") else {
+            return Ok(None);
+        };
+        let name = format!("{stem}.scale");
+        if self.tensor(&name).is_none() {
+            return Ok(None);
+        }
+        let v = self.tensor_f32(&name)?;
+        match v.as_slice() {
+            [s] => Ok(Some(*s)),
+            _ => Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "{name} must hold one value, has {}",
+                v.len()
+            )))),
+        }
+    }
+
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>, AllpacaError> {
         let info = self.tensor(name).ok_or_else(|| {
             AllpacaError::Fatal(FatalError::ModelLoad(format!("missing tensor {name}")))
@@ -1231,6 +1260,24 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_rocmfp4_fast(&mmap[start..start + nbytes], n, &mut out)?;
+                Ok(out)
+            }
+            GgmlType::Nvfp4 => {
+                let nbytes = info.nbytes();
+                if start.saturating_add(nbytes) > mmap.len() {
+                    return Err(AllpacaError::Fatal(FatalError::CorruptGguf(format!(
+                        "tensor {name} NVFP4 out of range"
+                    ))));
+                }
+                let mut out = vec![0.0f32; n];
+                allpaca_cpu::dequant_nvfp4(&mmap[start..start + nbytes], n, &mut out)?;
+                // llama.cpp multiplies the matmul output by the F32 `.scale`
+                // tensor; scaling the weights first gives the same product.
+                if let Some(scale) = self.nvfp4_tensor_scale(name)? {
+                    for v in &mut out {
+                        *v *= scale;
+                    }
+                }
                 Ok(out)
             }
             ty @ (GgmlType::Q1_0
@@ -1711,6 +1758,70 @@ mod tests {
         }
         buf.extend_from_slice(payload);
         std::fs::write(path, buf).unwrap();
+    }
+
+    /// Two-tensor GGUF: an NVFP4 weight and its F32 `.scale`.
+    fn write_nvfp4_with_scale(path: &std::path::Path, payload: &[u8], n: u64, scale: Option<f32>) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(1 + u64::from(scale.is_some())).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let mut info = |name: &str, n: u64, ty: u32, off: u64| {
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&n.to_le_bytes());
+            buf.extend_from_slice(&ty.to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        };
+        info("blk.0.ffn_down.weight", n, 40, 0);
+        if scale.is_some() {
+            info("blk.0.ffn_down.scale", 1, 0, 64);
+        }
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        let mut data = payload.to_vec();
+        data.resize(64, 0);
+        buf.extend_from_slice(&data);
+        if let Some(s) = scale {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    fn nvfp4_block() -> Vec<u8> {
+        // Scale 1.0 on sub-block 0 only; weight 0 = code 7 (12), weight 8 = code 12 (-4).
+        let mut b = vec![0u8; 36];
+        b[0] = 0x40;
+        b[4] = 0x07 | (0x0c << 4);
+        b
+    }
+
+    #[test]
+    fn nvfp4_tensor_loads_and_dequants() {
+        let path = std::env::temp_dir().join("allpaca_gguf_nvfp4.gguf");
+        write_nvfp4_with_scale(&path, &nvfp4_block(), 64, None);
+        let file = GgufFile::open(&path).unwrap();
+        let info = file.tensor("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(info.ggml_type, GgmlType::Nvfp4);
+        assert_eq!(info.nbytes(), 36);
+        assert!(!file.compat_report().ggml_type_ids.is_empty());
+        assert!(file.compat_report().reject_reason.as_deref().is_none_or(|r| !r.contains("unsupported ggml_type_id")));
+        let v = file.tensor_f32("blk.0.ffn_down.weight").unwrap();
+        assert_eq!((v[0], v[8], v[1]), (12.0, -4.0, 0.0));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nvfp4_tensor_scale_multiplies_the_weight() {
+        let path = std::env::temp_dir().join("allpaca_gguf_nvfp4_scale.gguf");
+        write_nvfp4_with_scale(&path, &nvfp4_block(), 64, Some(0.25));
+        let file = GgufFile::open(&path).unwrap();
+        let v = file.tensor_f32("blk.0.ffn_down.weight").unwrap();
+        assert_eq!((v[0], v[8], v[1]), (3.0, -1.0, 0.0));
+        let _ = std::fs::remove_file(path);
     }
 
     fn f32_to_f16_bits(v: f32) -> u16 {
