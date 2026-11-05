@@ -1898,7 +1898,8 @@ __device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int caus
  * computed it, and a row with one chunk is exactly the single-pass result.
  * The chunking depends only on the keys a row sees, never on the device.
  * Decode runs the chunks of a long row in parallel (attention_split_gqa_kernel,
- * then attention_merge_pair_kernel per tree level and attention_merge_kernel).
+ * then attention_merge_pair_kernel for the tree's lowest levels and
+ * attention_merge_kernel for the rest).
  * Inside a chunk the keys go ATTN_KT at a time (attn_tile_step). 128 against
  * 256 took a 2051-key MI50 decode row from 217 to 141 us. */
 constexpr int ATTN_CHUNK = 128;
@@ -2195,14 +2196,22 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     }
 }
 
-/* The largest power of two below n_chunks: the stride of the fold tree's last
- * level, which attention_merge_kernel folds. n_chunks >= 2. */
-__host__ __device__ __forceinline__ int attn_tree_top(int n_chunks) {
-    int top = 1;
-    while (2 * top < n_chunks) {
-        top *= 2;
+/* Partials attention_merge_kernel folds itself, in one warp. Below that the
+ * fold tree's lowest levels run as attention_merge_pair_kernel launches, one
+ * per level: a launch costs more than a few folds, so short rows (up to 16
+ * chunks, 2048 keys) take none. */
+constexpr int ATTN_MERGE_WARP = 16;
+
+/* The pair levels' last stride, doubled: the smallest power of two S with
+ * ceil(n_chunks / S) <= ATTN_MERGE_WARP. After the levels with stride < S,
+ * the partials at 0, S, 2S, ... hold the tree's aligned blocks, and the
+ * tree's upper levels are the same tree over those. */
+__host__ __device__ __forceinline__ int attn_merge_spacing(int n_chunks) {
+    int spacing = 1;
+    while ((n_chunks + spacing - 1) / spacing > ATTN_MERGE_WARP) {
+        spacing *= 2;
     }
-    return top;
+    return spacing;
 }
 
 /* One tree level of a decode row's partials (see ATTN_FOLD_STACK): block x is
@@ -2240,10 +2249,12 @@ __global__ void __launch_bounds__(32) attention_merge_pair_kernel(float *part, i
     }
 }
 
-/* The fold tree's last level, (0, top), then writes the row. Every level
- * below it has already run (attention_merge_pair_kernel). */
+/* The fold tree's levels from attn_merge_spacing up, in place in `part`, then
+ * writes the row. The levels below have already run
+ * (attention_merge_pair_kernel). One warp owns the row's partials; each lane
+ * reads back only what it wrote, except m and l, which lane 0 writes. */
 template <int DPT>
-__global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
+__global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, float *part, float *out, int n_heads,
                                        int head_dim, int n_chunks) {
     const int qi = static_cast<int>(blockIdx.x);
     const int h = static_cast<int>(blockIdx.y);
@@ -2253,21 +2264,41 @@ __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, con
     const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
                       (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    const float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * attn_part<DPT>();
+    float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * attn_part<DPT>();
+    constexpr int dims = attn_row_dims<DPT>();
+    for (int stride = attn_merge_spacing(n_chunks); stride < n_chunks; stride *= 2) {
+        for (int left = 0; left + stride < n_chunks; left += 2 * stride) {
+            float *dst = src + static_cast<size_t>(left) * attn_part<DPT>();
+            const float *pc = dst + static_cast<size_t>(stride) * attn_part<DPT>();
+            float acc[dims];
+            float acc_b[dims];
+#pragma unroll
+            for (int i = 0; i < dims; ++i) {
+                acc[i] = dst[lane * dims + i];
+                acc_b[i] = pc[lane * dims + i];
+            }
+            float m = dst[32 * dims];
+            float l = dst[32 * dims + 1];
+            attn_fold<DPT>(m, l, acc, pc[32 * dims], pc[32 * dims + 1], acc_b);
+#pragma unroll
+            for (int i = 0; i < dims; ++i) {
+                dst[lane * dims + i] = acc[i];
+            }
+            __threadfence_block();
+            if (lane == 0) {
+                dst[32 * dims] = m;
+                dst[32 * dims + 1] = l;
+            }
+            __threadfence_block();
+        }
+    }
     AttnRow<DPT> r;
 #pragma unroll
-    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-        r.acc[i] = src[lane * attn_row_dims<DPT>() + i];
+    for (int i = 0; i < dims; ++i) {
+        r.acc[i] = src[lane * dims + i];
     }
-    r.m = src[32 * attn_row_dims<DPT>()];
-    r.l = src[32 * attn_row_dims<DPT>() + 1];
-    const float *pc = src + static_cast<size_t>(attn_tree_top(n_chunks)) * attn_part<DPT>();
-    float acc_b[attn_row_dims<DPT>()];
-#pragma unroll
-    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-        acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
-    }
-    attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
+    r.m = src[32 * dims];
+    r.l = src[32 * dims + 1];
     attn_row_store(r, oh, lane, head_dim, nvec, vec4);
 }
 
@@ -2613,9 +2644,9 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
                                    split_grid, dim3(32 * per_block), lds, stream, q, k,
                                    v, s.p, static_cast<float *>(nullptr), n_kv, n_heads, n_kv_heads, head_dim, causal,
                                    mask, sinks, n_chunks, tile);
-                /* The fold tree's levels below the last (see ATTN_FOLD_STACK). */
-                const int top = attn_tree_top(n_chunks);
-                for (int stride = 1; stride < top; stride *= 2) {
+                /* The fold tree's lowest levels (see attn_merge_spacing). */
+                const int spacing = attn_merge_spacing(n_chunks);
+                for (int stride = 1; stride < spacing; stride *= 2) {
                     const int pairs = (n_chunks - stride + 2 * stride - 1) / (2 * stride);
                     hipLaunchKernelGGL(attention_merge_pair_kernel<DPT>,
                                        dim3(static_cast<unsigned>(pairs), static_cast<unsigned>(n_heads)), dim3(32),
