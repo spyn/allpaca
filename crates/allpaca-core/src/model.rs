@@ -10439,8 +10439,13 @@ impl TinyModel {
         // BLAS/WMMA paths here, attaching a worker changed the local layers'
         // bits too, and Qwen3.8 text with them (Q23). MoE models needed it
         // with nothing remote as well: Ling-mini's local prefill changed
-        // text between fresh starts without it (S2).
-        let _exact_rows = allpaca_hip::ExactRows::enable();
+        // text between fresh starts without it (S2). The one exception is the
+        // opt-in `experimental.row_variant_kernels` prefill of a dense model
+        // with nothing remote, which exists to run the WMMA tiles instead.
+        let moe = self.config.n_experts > 0;
+        let remote = self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote());
+        let _exact_rows = (moe || remote || !allpaca_hip::prefill_wmma_active())
+            .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()
             || segs.iter().map(|s| s.n_rows).sum::<usize>() != tokens.len()
