@@ -808,7 +808,7 @@ mod tests {
         // Attention: decode (one row), prefill (many rows), both sides of a
         // chunk, GQA, and head dims off the float4 path and past shared memory.
         let shapes = [(24usize, 24usize, 128usize), (8, 2, 64), (12, 12, 32), (6, 6, 256), (4, 4, 30), (2, 2, 512)];
-        let lengths = [(1usize, 1usize), (1, 2), (1, 8), (1, 15), (1, 16), (1, 17), (1, 21), (1, 127), (1, 128), (1, 129), (1, 257), (1, 300), (2, 2), (9, 9), (21, 21), (21, 300), (130, 130)];
+        let lengths = [(1usize, 1usize), (1, 2), (1, 8), (1, 15), (1, 16), (1, 17), (1, 21), (1, 127), (1, 128), (1, 129), (1, 257), (1, 300), (2, 2), (9, 9), (21, 21), (21, 300), (130, 130), (1, 1700), (6, 1700)];
         for (a_heads, a_kv, hd_a) in shapes {
             let (q_row, k_row) = (a_heads * hd_a, a_kv * hd_a);
             for (rows, n_kv) in lengths {
@@ -1013,7 +1013,9 @@ mod tests {
     }
 
     /// Every dense-layer op gives these bits on every backend: RX 9070, RX
-    /// 9060 XT, MI50 and a K80 (sm_37). A last-bit difference is not harmless:
+    /// 9060 XT, MI50 and a K80 (sm_37); re-pinned in Q21 (tree fold of
+    /// attention chunks, 1700-key rows added) on the RX 9070, Radeon 8060S
+    /// (gfx1151) and RTX 3070 Ti, which agreed. A last-bit difference is not harmless:
     /// the int8 activations in the K-quant GEMV turn it into a 1% difference
     /// within a few layers (S1). A change that moves this number has to move
     /// it on HIP and CUDA alike; re-pin it after checking both agree.
@@ -1034,7 +1036,7 @@ mod tests {
         let all = digests.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         });
-        assert_eq!(all, 0x1bb6_909a_8b8e_f82b, "dense-layer bits changed: {all:#018x}");
+        assert_eq!(all, 0x0ecc_099c_86d1_8be3, "dense-layer bits changed: {all:#018x}");
     }
 
     /// Expert tensor types, sizes, and the allowed error relative to the
