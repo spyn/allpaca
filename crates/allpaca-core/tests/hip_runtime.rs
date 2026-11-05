@@ -8566,8 +8566,8 @@ fn hip_prompt_cache_resumes_a_hybrid_mid_prompt_on_a_real_model() {
 
 /// P13: a tiny llama whose matrices are random valid blocks of type `ty`
 /// (`block_bytes` per `block_elems` weights). The FFN matrices (131072
-/// weights) take the device staging path; scale fields are set to small
-/// finite values so every weight is finite.
+/// weights) take the device staging path; scale fields are set so the
+/// layer, not the small embedding, decides the logits.
 #[cfg(feature = "hip")]
 fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlType, block_bytes: usize, block_elems: usize) {
     use allpaca_gguf::{write_gguf_quant, GgmlType as T, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
@@ -8586,20 +8586,20 @@ fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlTyp
             .collect();
         for (b, block) in out.chunks_exact_mut(block_bytes).enumerate() {
             match ty {
-                // Half scale 2^-10 in the top nibbles of the four scale words.
+                // Half scale 2^-7 in the top nibbles of the four scale words.
                 T::IQ1_M => {
-                    for (k, nibble) in [0u8, 0, 4, 1].into_iter().enumerate() {
+                    for (k, nibble) in [0u8, 0, 0, 2].into_iter().enumerate() {
                         block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (nibble << 4);
                     }
                 }
                 T::IQ2_XXS | T::IQ2_XS | T::IQ2_S | T::IQ3_XXS | T::IQ1_S => {
-                    block[..2].copy_from_slice(&0x1400u16.to_le_bytes());
+                    block[..2].copy_from_slice(&0x2000u16.to_le_bytes());
                 }
-                // UE4M3 scale bytes 0x08..0x0f: (8 + m) * 2^-10.
-                T::RocmFpxQ8 => block[block_bytes - 1] = 0x08 | (b % 8) as u8,
+                // UE4M3 scale bytes 0x20..0x27: (8 + m) * 2^-7.
+                T::RocmFpxQ8 => block[block_bytes - 1] = 0x20 | (b % 8) as u8,
                 _ => {
-                    block[block_bytes - 2] = 0x08 | (b % 8) as u8;
-                    block[block_bytes - 1] = 0x08 | ((b + 3) % 8) as u8;
+                    block[block_bytes - 2] = 0x20 | (b % 8) as u8;
+                    block[block_bytes - 1] = 0x20 | ((b + 3) % 8) as u8;
                 }
             }
         }
@@ -8625,7 +8625,7 @@ fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlTyp
     );
     meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
     meta.insert("tokenizer.ggml.eos_token_id".into(), GgufValue::Uint32(2));
-    let embd: Vec<f32> = (0..vocab * dim).map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0).collect();
+    let embd: Vec<f32> = (0..vocab * dim).map(|i| ((i * 37 % 101) as f32 - 50.0) / 4096.0).collect();
     let ones = vec![1.0f32; dim];
     let quant = |name: &str, dims: [usize; 2]| (name.to_string(), vec![dims[0] as u64, dims[1] as u64]);
     let named = [
