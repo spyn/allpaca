@@ -2233,6 +2233,34 @@ mod tests {
         }
     }
 
+    /// Real type-103 blocks: a ROCmFPX Q8_0 file and its lossless Q8_0
+    /// conversion (`target/q3n/rocmfp8_to_q8.py`) dequantise to the same f32
+    /// bits, tensor by tensor (first 8 type-103 tensors). Opt-in:
+    /// `ALLPACA_ROCMFPX_Q8=<103 file> ALLPACA_ROCMFPX_Q8_AS_Q8_0=<converted>`.
+    #[test]
+    #[ignore = "needs a real ROCmFPX Q8_0 file and its Q8_0 conversion"]
+    fn real_rocmfpx_q8_file_matches_its_q8_0_conversion() {
+        let (Ok(fpx), Ok(q8)) = (std::env::var("ALLPACA_ROCMFPX_Q8"), std::env::var("ALLPACA_ROCMFPX_Q8_AS_Q8_0"))
+        else {
+            eprintln!("skip: set ALLPACA_ROCMFPX_Q8 and ALLPACA_ROCMFPX_Q8_AS_Q8_0");
+            return;
+        };
+        let open = |p: &str| GgufFile::open(std::path::Path::new(p)).unwrap();
+        let (fpx, q8) = (open(&fpx), open(&q8));
+        let mut checked = 0;
+        for t in fpx.tensors.iter().filter(|t| t.ggml_type == GgmlType::RocmFpxQ8).take(8) {
+            let other = q8.tensor(&t.name).expect("same tensor in the conversion");
+            assert_eq!(other.ggml_type, GgmlType::Q8_0, "{}", t.name);
+            let (a, b) = (fpx.tensor_f32(&t.name).unwrap(), q8.tensor_f32(&t.name).unwrap());
+            assert_eq!(a.len(), b.len());
+            let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+            assert!(same, "{} differs from its Q8_0 conversion", t.name);
+            eprintln!("{}: {} weights equal", t.name, a.len());
+            checked += 1;
+        }
+        assert!(checked > 0, "no type-103 tensors in the ROCmFPX file");
+    }
+
     /// Type 107 names two different ROCmFPX layouts; the fork refuses it and
     /// so does Allpaca, with a reason that says why.
     #[test]
