@@ -13,7 +13,7 @@ use allpaca_gguf::GgufFile;
 use allpaca_types::{AllpacaError, FatalError};
 
 use crate::model::{
-    expert_mlp, expert_mlp_rows, topk_from_logits, DenseKv, ModelConfig, TinyModel,
+    expert_mlp_rows, topk_from_logits, DenseKv, ModelConfig, TinyModel,
 };
 use crate::telemetry::Metrics;
 use crate::weight_set::LayerFfn;
@@ -34,6 +34,16 @@ pub struct Dsv4Spec {
     /// Per GGUF block: routed experts cap their gate at this before SiLU
     /// and their up projection to plus or minus it (empty or 0 = no cap).
     pub swiglu_clamp: Vec<f32>,
+    /// The same cap for the shared expert (`swiglu_clamp_shexp`).
+    pub swiglu_clamp_shexp: Vec<f32>,
+}
+
+/// The cap a per-block clamp list sets for `blk` (0 = none).
+fn limit_at(limits: &[f32], blk: usize) -> f32 {
+    match limits.get(blk) {
+        Some(limit) if *limit > 1.0e-6 => *limit,
+        _ => 0.0,
+    }
 }
 
 impl Dsv4Spec {
@@ -81,15 +91,24 @@ impl Dsv4Spec {
                 .get(&format!("{arch}.swiglu_clamp_exp"))
                 .and_then(|v| v.as_f32_array())
                 .unwrap_or_default(),
+            swiglu_clamp_shexp: file
+                .metadata
+                .get(&format!("{arch}.swiglu_clamp_shexp"))
+                .and_then(|v| v.as_f32_array())
+                .unwrap_or_default(),
         }
     }
 
     /// The cap for the routed experts of GGUF block `blk` (0 = none).
     pub fn swiglu_limit(&self, blk: usize) -> f32 {
-        match self.swiglu_clamp.get(blk) {
-            Some(limit) if *limit > 1.0e-6 => *limit,
-            _ => 0.0,
-        }
+        limit_at(&self.swiglu_clamp, blk)
+    }
+
+    /// The cap for the shared expert of GGUF block `blk` (0 = none).
+    /// DeepSeek-V4 builds its shared expert with the routed experts'
+    /// `swiglu_limit` (inference/model.py, `MoE.shared_experts`).
+    pub fn shexp_swiglu_limit(&self, blk: usize) -> f32 {
+        limit_at(&self.swiglu_clamp_shexp, blk)
     }
 }
 
@@ -1887,10 +1906,16 @@ fn dsv4_expert_rows(
     matmul_nt(x, &ffn.w_up, &mut up, m, ff_dim, dim)?;
     matmul_nt(x, &ffn.w_gate, &mut gate, m, ff_dim, dim)?;
     for (g, u) in gate.iter_mut().zip(&up) {
-        let capped = g.min(limit);
-        *g = capped / (1.0 + (-capped).exp()) * u.clamp(-limit, limit);
+        *g = capped_swiglu(*g, *u, limit);
     }
     matmul_nt(&gate, &ffn.w_down, out, m, dim, ff_dim)
+}
+
+/// SwiGLU with DeepSeek-V4's cap (`limit` > 0): the gate is capped at
+/// `limit` before SiLU and the up projection clamped to plus or minus it.
+fn capped_swiglu(gate: f32, up: f32, limit: f32) -> f32 {
+    let g = gate.min(limit);
+    g / (1.0 + (-g).exp()) * up.clamp(-limit, limit)
 }
 
 struct Dsv4FfnPrep {
@@ -2869,6 +2894,7 @@ fn dsv4_shexp(
     let dim = cfg.dim;
     let host = &model.layers[layer_idx];
     let blk = cfg.gguf_blk(layer_idx);
+    let limit = dsv4.spec.shexp_swiglu_limit(blk);
     let mut shexp_y = vec![0.0f32; dim];
     if !host.shared_expert.w_up.is_empty() {
         let sff = if cfg.shared_ff_dim > 0 {
@@ -2876,7 +2902,7 @@ fn dsv4_shexp(
         } else {
             host.shared_expert.w_up.len() / dim.max(1)
         };
-        expert_mlp(fcur, &host.shared_expert, sff, dim, &mut shexp_y, false)?;
+        dsv4_expert_rows(fcur, &host.shared_expert, sff, dim, 1, &mut shexp_y, limit)?;
         return Ok(shexp_y);
     }
     let sff_hint = if cfg.shared_ff_dim > 0 {
@@ -2886,7 +2912,7 @@ fn dsv4_shexp(
     };
     let mut fused = false;
     if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-        if let Ok(y) = g.shexp_swiglu(f, blk, fcur, dim, sff_hint, Some(metrics)) {
+        if let Ok(y) = g.shexp_swiglu(f, blk, fcur, dim, sff_hint, limit, Some(metrics)) {
             shexp_y = y;
             fused = true;
         }
@@ -2935,8 +2961,12 @@ fn dsv4_shexp(
                 Some(metrics),
             )?;
             let t_silu = Instant::now();
-            for i in 0..sff {
-                up[i] = allpaca_cpu::silu(gate[i]) * up[i];
+            for (u, g) in up.iter_mut().zip(&gate) {
+                *u = if limit > 0.0 {
+                    capped_swiglu(*g, *u, limit)
+                } else {
+                    allpaca_cpu::silu(*g) * *u
+                };
             }
             metrics
                 .dsv4_silu_ns
@@ -3426,6 +3456,7 @@ fn dsv4_apply_moe_rows(
     let blk = cfg.gguf_blk(layer_idx);
     let mut gpu = gpu;
     let limit = spec.swiglu_limit(blk);
+    let shexp_limit = spec.shexp_swiglu_limit(blk);
     if let Some(g) = gpu.as_deref() {
         g.set_swiglu_limit(limit);
     }
@@ -3448,14 +3479,14 @@ fn dsv4_apply_moe_rows(
         } else {
             host.shared_expert.w_up.len() / dim.max(1)
         };
-        expert_mlp_rows(
+        dsv4_expert_rows(
             &xs,
             &host.shared_expert,
             sff,
             dim,
             n_tok,
             &mut shexp_y,
-            false,
+            shexp_limit,
         )?;
         shexp_done = true;
     }
@@ -3658,6 +3689,7 @@ fn dsv4_apply_moe_rows(
                             gate,
                             up,
                             down,
+                            shexp_limit,
                             Some(metrics),
                         ) {
                             Ok(()) => {
@@ -3678,6 +3710,7 @@ fn dsv4_apply_moe_rows(
                             gate,
                             up,
                             down,
+                            shexp_limit,
                             Some(metrics),
                         ) {
                             shexp_y = y;
@@ -3762,7 +3795,9 @@ fn dsv4_apply_moe_rows(
     }
     if !shexp_done {
         if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
-            if let Ok(y) = g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, Some(metrics)) {
+            if let Ok(y) =
+                g.shexp_swiglu_rows(f, blk, &xs, n_tok, dim, sff_hint, shexp_limit, Some(metrics))
+            {
                 shexp_y = y;
                 shexp_done = true;
             }
@@ -4819,6 +4854,8 @@ pub struct TinyDsv4Ctx {
     pub top_k: u32,
     /// `swiglu_clamp_exp` of every layer (0 = the key is left out).
     pub swiglu_clamp: f32,
+    /// `swiglu_clamp_shexp` of every layer (0 = the key is left out).
+    pub swiglu_clamp_shexp: f32,
 }
 
 /// Tiny DeepSeek-V4 GGUF for attention-memory tests: every weight differs
@@ -4884,16 +4921,21 @@ pub fn write_tiny_deepseek4_ctx_gguf(path: &std::path::Path, opts: &TinyDsv4Ctx)
         GgufValue::String("deepseek4".into()),
     );
     meta.insert("general.name".into(), GgufValue::String("tiny-dsv4-ctx".into()));
-    if opts.swiglu_clamp > 0.0 {
-        meta.insert(
-            "deepseek4.swiglu_clamp_exp".into(),
-            GgufValue::Array(
-                opts.compress_ratios
-                    .iter()
-                    .map(|_| GgufValue::Float32(opts.swiglu_clamp))
-                    .collect(),
-            ),
-        );
+    for (key, limit) in [
+        ("swiglu_clamp_exp", opts.swiglu_clamp),
+        ("swiglu_clamp_shexp", opts.swiglu_clamp_shexp),
+    ] {
+        if limit > 0.0 {
+            meta.insert(
+                format!("deepseek4.{key}"),
+                GgufValue::Array(
+                    opts.compress_ratios
+                        .iter()
+                        .map(|_| GgufValue::Float32(limit))
+                        .collect(),
+                ),
+            );
+        }
     }
     meta.insert(
         "tokenizer.ggml.model".into(),
@@ -5409,6 +5451,7 @@ mod tests {
             rope_offset: 0,
             attn: Default::default(),
             swiglu_clamp: Vec::new(),
+            swiglu_clamp_shexp: Vec::new(),
         };
         let dim = 8;
         let hc = spec.hc_mult;
@@ -5490,6 +5533,7 @@ mod tests {
                 rope_offset: 0,
                 attn: Default::default(),
                 swiglu_clamp: Vec::new(),
+                swiglu_clamp_shexp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -5552,6 +5596,7 @@ mod tests {
                 rope_offset: 0,
                 attn: Default::default(),
                 swiglu_clamp: Vec::new(),
+                swiglu_clamp_shexp: Vec::new(),
             };
             let dim = 8;
             let n_tok = 3;
@@ -5699,6 +5744,7 @@ mod tests {
                     compress_ratios: vec![0],
                     top_k: 0,
                     swiglu_clamp,
+                    swiglu_clamp_shexp: 0.0,
                 },
             );
             let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
@@ -5721,6 +5767,70 @@ mod tests {
         // A limit no activation reaches changes nothing; a tight one does.
         assert!(diff(&free, &logits(1.0e6)) < 1e-6);
         assert!(diff(&free, &logits(1.0e-3)) > 1e-4);
+    }
+
+    #[test]
+    fn tiny_deepseek4_shared_expert_follows_swiglu_clamp_shexp() {
+        // DeepSeek-V4 inference/model.py: `shared_experts = Expert(...,
+        // swiglu_limit=args.swiglu_limit)`, and Expert.forward caps the gate at
+        // the limit before SiLU and clamps up to +-limit. Reference values come
+        // straight from that formula on the fixture's shared-expert weights.
+        let limit = 0.05f32;
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_shexp_clamp-{}.gguf",
+            std::process::id()
+        ));
+        write_tiny_deepseek4_ctx_gguf(
+            &path,
+            &TinyDsv4Ctx {
+                window: 0,
+                compress_ratios: vec![0],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: limit,
+            },
+        );
+        let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
+        let mut model = TinyModel::from_gguf(&file).expect("model");
+        model.bind_gguf(file.clone());
+        let _ = std::fs::remove_file(&path);
+        let w = |name: &str| {
+            file.tensor_f32(&format!("blk.0.{name}.weight"))
+                .expect("shared expert tensor")
+        };
+        let (gate_w, up_w, down_w) = (w("ffn_gate_shexp"), w("ffn_up_shexp"), w("ffn_down_shexp"));
+        let dim = model.config.dim;
+        let ff = gate_w.len() / dim;
+        let x: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 2.0).collect();
+        let dot = |w: &[f32], row: usize, v: &[f32]| -> f32 {
+            w[row * v.len()..(row + 1) * v.len()]
+                .iter()
+                .zip(v)
+                .map(|(a, b)| a * b)
+                .sum()
+        };
+        let gates: Vec<f32> = (0..ff).map(|r| dot(&gate_w, r, &x)).collect();
+        assert!(
+            gates.iter().any(|g| g.abs() > limit),
+            "fixture never reaches the cap"
+        );
+        let act: Vec<f32> = (0..ff)
+            .map(|r| {
+                let g = gates[r].min(limit);
+                let u = dot(&up_w, r, &x).clamp(-limit, limit);
+                g / (1.0 + (-g).exp()) * u
+            })
+            .collect();
+        let want: Vec<f32> = (0..dim).map(|r| dot(&down_w, r, &act)).collect();
+        let dsv4 = model.dsv4.as_ref().expect("dsv4 weights");
+        let metrics = crate::telemetry::Metrics::default();
+        let got = super::dsv4_shexp(&model, dsv4, &x, 0, &metrics, &mut None, Some(&file), false)
+            .expect("shared expert");
+        let diff = want
+            .iter()
+            .zip(&got)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(diff < 1e-6, "shared expert differs from the capped SwiGLU by {diff}");
     }
 
     #[test]

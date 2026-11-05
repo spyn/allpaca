@@ -1077,6 +1077,13 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_silu_mul(gate: *mut f32, up: *const f32, n: i32, stream: *mut c_void)
             -> i32;
+        pub fn allpaca_silu_mul_limit(
+            gate: *mut f32,
+            up: *const f32,
+            n: i32,
+            limit: f32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gelu_mul(gate: *mut f32, up: *const f32, n: i32, stream: *mut c_void)
             -> i32;
         pub fn allpaca_relu_sqr(x: *mut f32, n: i32, stream: *mut c_void) -> i32;
@@ -9039,6 +9046,8 @@ impl HipWorkspace {
     }
 
     /// Packed BF16 SwiGLU: H2D `x` once (`M` rows), gate/up GEMM, device SiLU, down GEMM, D2H `y`.
+    /// `limit` > 0 caps the gate at `limit` before SiLU and the up projection
+    /// to `+-limit` (DeepSeek-V4 `swiglu_clamp_shexp`); 0 = plain SwiGLU.
     #[allow(clippy::too_many_arguments)]
     pub fn bf16_swiglu_gemm(
         &self,
@@ -9050,6 +9059,7 @@ impl HipWorkspace {
         m: i32,
         dim: i32,
         ff: i32,
+        limit: f32,
     ) -> Result<(), AllpacaError> {
         if m <= 0 || dim <= 0 || ff <= 0 || gate_w.is_null() || up_w.is_null() || down_w.is_null() {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -9071,7 +9081,7 @@ impl HipWorkspace {
             self.add_h2d(bytes);
             self.gemm_nt_bf16_dev(dx.cast(), gate_w, dg.cast(), m, ff, dim)?;
             self.gemm_nt_bf16_dev(dx.cast(), up_w, du.cast(), m, ff, dim)?;
-            self.silu_mul_device(dg.cast(), du.cast(), silu_n)?;
+            self.swiglu_device(dg.cast(), du.cast(), silu_n, limit)?;
             self.gemm_nt_bf16_dev(dg.cast(), down_w, dy.cast(), m, dim, ff)?;
             memcpy(y.as_mut_ptr().cast(), dy, bytes, MEMCPY_D2H)?;
             self.add_d2h(bytes);
@@ -9080,6 +9090,7 @@ impl HipWorkspace {
     }
 
     /// Packed BF16 SwiGLU from device `moe_x` into `moe_acc` (no activation H2D/D2H).
+    /// `limit` as in [`Self::bf16_swiglu_gemm`].
     #[allow(clippy::too_many_arguments)]
     pub fn bf16_swiglu_accumulate(
         &self,
@@ -9089,6 +9100,7 @@ impl HipWorkspace {
         m: i32,
         dim: i32,
         ff: i32,
+        limit: f32,
     ) -> Result<(), AllpacaError> {
         if m <= 0 || dim <= 0 || ff <= 0 || gate_w.is_null() || up_w.is_null() || down_w.is_null() {
             return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
@@ -9110,7 +9122,7 @@ impl HipWorkspace {
         self.with_swiglu_workspace(rows, d, h, |_dx, dg, du, dy| {
             self.gemm_nt_bf16_dev(dx_in, gate_w, dg.cast(), m, ff, dim)?;
             self.gemm_nt_bf16_dev(dx_in, up_w, du.cast(), m, ff, dim)?;
-            self.silu_mul_device(dg.cast(), du.cast(), silu_n)?;
+            self.swiglu_device(dg.cast(), du.cast(), silu_n, limit)?;
             self.gemm_nt_bf16_dev(dg.cast(), down_w, dy.cast(), m, dim, ff)?;
             self.residual_add(acc, dy.cast(), n as i32)
         })?;
@@ -9128,7 +9140,7 @@ impl HipWorkspace {
         dim: i32,
         ff: i32,
     ) -> Result<(), AllpacaError> {
-        self.bf16_swiglu_gemm(x, gate_w, up_w, down_w, y, 1, dim, ff)
+        self.bf16_swiglu_gemm(x, gate_w, up_w, down_w, y, 1, dim, ff, 0.0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12987,6 +12999,44 @@ impl HipWorkspace {
         {
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP silu_mul unavailable".into(),
+            )))
+        }
+    }
+
+    /// `gate = silu(gate) * up` in place; with `limit` > 0 the gate is capped
+    /// at `limit` before SiLU and `up` clamped to `+-limit` first (DeepSeek-V4
+    /// SwiGLU cap, the element math of the fused MXFP4 SwiGLU kernels).
+    pub fn swiglu_device(
+        &self,
+        gate: *mut f32,
+        up: *const f32,
+        n: i32,
+        limit: f32,
+    ) -> Result<(), AllpacaError> {
+        if limit <= 0.0 {
+            return self.silu_mul_device(gate, up, n);
+        }
+        if gate.is_null() || up.is_null() || n <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid device capped swiglu".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                // SAFETY: `gate` and `up` are device buffers of at least `n`
+                // floats (checked non-null above; sizes are the caller's).
+                let rc = unsafe {
+                    ffi::allpaca_silu_mul_limit(gate, up, n, limit, std::ptr::null_mut())
+                };
+                status(rc, "silu_mul_limit")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP silu_mul_limit unavailable".into(),
             )))
         }
     }
@@ -17474,6 +17524,7 @@ mod tests {
             m as i32,
             dim as i32,
             ff as i32,
+            0.0,
         )
         .expect("host gemm");
         hip.moe_begin(&x, m, dim).expect("moe_begin");
@@ -17484,6 +17535,7 @@ mod tests {
             m as i32,
             dim as i32,
             ff as i32,
+            0.0,
         )
         .expect("accumulate");
         let mut got = vec![0.0f32; m * dim];
@@ -17498,6 +17550,72 @@ mod tests {
                 got[i],
                 host[i]
             );
+        }
+    }
+
+    /// DeepSeek-V4's shared expert caps its SwiGLU (inference/model.py
+    /// `Expert.forward`: gate capped at `limit` before SiLU, up clamped to
+    /// `+-limit`); both BF16 SwiGLU paths must apply it like the reference.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn bf16_swiglu_caps_gate_and_up_at_the_limit() {
+        if device_count() == 0 {
+            return;
+        }
+        let (m, dim, ff, limit) = (3usize, 32usize, 64usize, 0.25f32);
+        let fill = |n: usize, mul: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i * mul) % 50) as f32 * 0.04 - 1.0).collect()
+        };
+        let x = fill(m * dim, 17);
+        // Weights are BF16 on the device; the reference uses the same values.
+        let bf = |v: Vec<f32>| -> Vec<u16> { v.into_iter().map(allpaca_cpu::f32_to_bf16).collect() };
+        let (gate, up, down) = (bf(fill(ff * dim, 13)), bf(fill(ff * dim, 11)), bf(fill(dim * ff, 7)));
+        let wf = |w: &[u16]| -> Vec<f32> { w.iter().map(|b| f32::from_bits(u32::from(*b) << 16)).collect() };
+        let (gf, uf, df) = (wf(&gate), wf(&up), wf(&down));
+        let dot = |w: &[f32], row: usize, v: &[f32]| -> f32 {
+            w[row * v.len()..(row + 1) * v.len()].iter().zip(v).map(|(a, b)| a * b).sum()
+        };
+        let mut want = vec![0.0f32; m * dim];
+        let mut capped = 0usize;
+        for t in 0..m {
+            let xt = &x[t * dim..(t + 1) * dim];
+            let act: Vec<f32> = (0..ff)
+                .map(|r| {
+                    let (g0, u0) = (dot(&gf, r, xt), dot(&uf, r, xt));
+                    capped += usize::from(g0 > limit || u0.abs() > limit);
+                    let g = g0.min(limit);
+                    g / (1.0 + (-g).exp()) * u0.clamp(-limit, limit)
+                })
+                .collect();
+            for r in 0..dim {
+                want[t * dim + r] = dot(&df, r, &act);
+            }
+        }
+        assert!(capped > 0, "fixture never reaches the cap");
+        let hip = HipWorkspace::new(0, 8 * 1024 * 1024, 8).expect("hip");
+        let gb = device_malloc(gate.len() * 2, 0).expect("gate");
+        let ub = device_malloc(up.len() * 2, 0).expect("up");
+        let db = device_malloc(down.len() * 2, 0).expect("down");
+        set_device(0).expect("bind");
+        memcpy(gb, gate.as_ptr().cast(), gate.len() * 2, MEMCPY_H2D).expect("h2d gate");
+        memcpy(ub, up.as_ptr().cast(), up.len() * 2, MEMCPY_H2D).expect("h2d up");
+        memcpy(db, down.as_ptr().cast(), down.len() * 2, MEMCPY_H2D).expect("h2d down");
+        let mut host = vec![0.0f32; m * dim];
+        hip.bf16_swiglu_gemm(
+            &x, gb.cast(), ub.cast(), db.cast(), &mut host, m as i32, dim as i32, ff as i32, limit,
+        )
+        .expect("gemm");
+        hip.moe_begin(&x, m, dim).expect("moe_begin");
+        hip.bf16_swiglu_accumulate(gb.cast(), ub.cast(), db.cast(), m as i32, dim as i32, ff as i32, limit)
+            .expect("accumulate");
+        let mut acc = vec![0.0f32; m * dim];
+        hip.moe_finish(&mut acc).expect("moe_finish");
+        device_free(gb, gate.len() * 2);
+        device_free(ub, up.len() * 2);
+        device_free(db, down.len() * 2);
+        for i in 0..m * dim {
+            assert!(gemm_close(host[i], want[i]), "gemm idx={i} hip={} ref={}", host[i], want[i]);
+            assert!(gemm_close(acc[i], want[i]), "accumulate idx={i} hip={} ref={}", acc[i], want[i]);
         }
     }
 
@@ -17558,6 +17676,7 @@ mod tests {
             m as i32,
             dim as i32,
             ff as i32,
+            0.0,
         )
         .expect("host gemm");
         hip.moe_begin(&x, m, dim).expect("moe_begin");
@@ -17568,6 +17687,7 @@ mod tests {
             m as i32,
             dim as i32,
             ff as i32,
+            0.0,
         )
         .expect("overflow accumulate");
         let mut got = vec![0.0f32; m * dim];
@@ -19752,6 +19872,7 @@ mod tests {
             m as i32,
             dim as i32,
             ff as i32,
+            0.0,
         )
         .expect("swiglu gemm");
         let mut looped = vec![0.0f32; m * dim];

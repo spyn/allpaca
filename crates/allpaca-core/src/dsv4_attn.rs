@@ -722,21 +722,23 @@ mod tests {
     use crate::KvTierManager;
 
     fn tiny(window: u32, compress_ratios: &[u32], top_k: u32) -> TinyModel {
+        tiny_with(&TinyDsv4Ctx {
+            window,
+            compress_ratios: compress_ratios.to_vec(),
+            top_k,
+            swiglu_clamp: 0.0,
+            swiglu_clamp_shexp: 0.0,
+        })
+    }
+
+    fn tiny_with(opts: &TinyDsv4Ctx) -> TinyModel {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "allpaca_tiny_dsv4_ctx-{}-{}.gguf",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        write_tiny_deepseek4_ctx_gguf(
-            &path,
-            &TinyDsv4Ctx {
-                window,
-                compress_ratios: compress_ratios.to_vec(),
-                top_k,
-                swiglu_clamp: 0.0,
-            },
-        );
+        write_tiny_deepseek4_ctx_gguf(&path, opts);
         let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
         let mut model = TinyModel::from_gguf(&file).expect("model");
         model.bind_gguf(file);
@@ -894,6 +896,34 @@ mod tests {
         let tokens = [3u32, 4, 5, 6, 7, 3, 5, 4, 6, 7, 4, 3, 5];
         let (a, b) = (one_by_one(&all, &tokens), one_by_one(&top1, &tokens));
         assert!(max_diff(&a, &b) > 1e-4, "{}", max_diff(&a, &b));
+    }
+
+    #[test]
+    fn shared_expert_clamp_applies_to_decode_and_prefill_alike() {
+        // DeepSeek-V4 caps the shared expert's SwiGLU too (inference/model.py
+        // builds `shared_experts` with `swiglu_limit`); the file carries it as
+        // `swiglu_clamp_shexp`. A tight cap must change the logits the same way
+        // whether the prompt is decoded token by token or forwarded at once.
+        let with_cap = |limit: f32| {
+            tiny_with(&TinyDsv4Ctx {
+                window: 3,
+                compress_ratios: vec![0, 4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: limit,
+            })
+        };
+        let tokens = [3u32, 4, 5, 6, 7, 3, 4];
+        let (free, capped) = (with_cap(0.0), with_cap(1.0e-3));
+        let free_one = one_by_one(&free, &tokens);
+        let capped_one = one_by_one(&capped, &tokens);
+        let capped_chunk = last_logits(&capped, &tokens, &[tokens.len()]);
+        assert!(max_diff(&free_one, &capped_one) > 1e-4, "decode ignores the cap");
+        assert!(
+            max_diff(&capped_one, &capped_chunk) < 1e-3,
+            "prefill and decode disagree: {}",
+            max_diff(&capped_one, &capped_chunk)
+        );
     }
 
     #[test]

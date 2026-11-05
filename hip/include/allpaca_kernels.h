@@ -396,6 +396,8 @@ int allpaca_rope(float *x, int32_t n_heads, int32_t head_dim, int32_t pos, float
                  allpaca_stream_t stream);
 
 int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
+int allpaca_silu_mul_limit(float *gate, const float *up, int32_t n, float limit,
+                           allpaca_stream_t stream);
 
 /* Spark2_5 FFN: gate[i] = gelu(gate[i]) * up[i] (erf GELU). */
 int allpaca_gelu_mul(float *gate, const float *up, int32_t n, allpaca_stream_t stream);
