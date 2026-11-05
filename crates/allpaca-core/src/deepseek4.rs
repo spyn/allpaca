@@ -3029,9 +3029,13 @@ fn dsv4_apply_moe(
             }
         }
     }
-    let shexp_y = dsv4_shexp(
-        model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp,
-    )?;
+    // With `shexp_early` the shared expert waits until the CPU-miss experts
+    // have started, so the card runs it beside them; its sum is added last
+    // either way.
+    let mut shexp_y = Vec::new();
+    if !model.shexp_early {
+        shexp_y = dsv4_shexp(model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp)?;
+    }
     let fill = gpu
         .as_ref()
         .map(|g| if g.has_expert_slots() { picks.len() } else { 0 })
@@ -3046,6 +3050,9 @@ fn dsv4_apply_moe(
         }
         _ => None,
     };
+    if model.shexp_early {
+        shexp_y = dsv4_shexp(model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp)?;
+    }
     let mut deferred: Vec<(usize, usize, f32)> = Vec::new();
     for (i, (e, w)) in picks.into_iter().enumerate() {
         if gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e)) {

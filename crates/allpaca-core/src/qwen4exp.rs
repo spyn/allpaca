@@ -2134,6 +2134,7 @@ fn forward_device(
         }
         if let Some(scale) = card_scale.filter(|_| gpu.routes_on_card(blk, cfg.n_active)) {
             gpu.ffn_route(blk, rows, None, &mut x)?;
+            gpu.ffn_shared(blk, rows)?;
             if wait {
                 lap(card, &mut times.route)?;
             }
@@ -2142,7 +2143,16 @@ fn forward_device(
             gpu.combine(card, rows)?;
             continue;
         }
+        // The host waits for the scores, then picks and runs the routed
+        // experts (or a worker does): queued after the download, the shared
+        // expert runs on the card meanwhile instead of delaying the scores.
+        if !gpu.shexp_early {
+            gpu.ffn_shared(blk, rows)?;
+        }
         gpu.ffn_route(blk, rows, Some(&mut scores), &mut x)?;
+        if gpu.shexp_early {
+            gpu.ffn_shared(blk, rows)?;
+        }
         lap(card, if wait { &mut times.route } else if recurrent { &mut times.gdn } else { &mut times.attention })?;
         let picks: Vec<Vec<(usize, f32)>> = scores
             .chunks_mut(n_experts.max(1))
@@ -2615,6 +2625,36 @@ mod tests {
         model.bind_gguf(file);
         let _ = std::fs::remove_file(&path);
         model
+    }
+
+    /// The shared expert queued after the router's scores come back (so the
+    /// card runs it while the host picks and runs the routed experts) gives
+    /// the same logits, bit for bit, as queued ahead of the download.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_shared_expert_after_the_scores_matches_before_them() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens = [1u32, 3, 4, 5, 3, 6, 7, 4, 4, 5];
+        type Build = fn() -> TinyModel;
+        for (what, build) in [("f32", tiny_model as Build), ("packed", tiny_packed_model as Build)] {
+            let model = build();
+            crate::qwen4_gpu::attach(&model, &hip, None, None, None).expect("attach");
+            let set_early = |early: bool| {
+                let mut gpu = model.q4x.as_ref().unwrap().gpu.lock().unwrap();
+                gpu.as_mut().expect("gpu attached").shexp_early = early;
+            };
+            set_early(false);
+            let before = run(&model, &tokens);
+            set_early(true);
+            let after = run(&model, &tokens);
+            for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(a), bits(b), "{what}: token {i}");
+            }
+        }
     }
 
     /// With its matrices and routed experts on the GPU, the forward gives
