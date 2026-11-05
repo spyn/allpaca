@@ -1967,6 +1967,99 @@ pub(crate) fn forward_qwen4_host_rows(
     Ok(())
 }
 
+/// FNV-1a over the little-endian bits of a pass's residual streams.
+fn layer_trace_hash(streams: &[f32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for value in streams {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// Append one line when `ALLPACA_Q4X_LAYER_TRACE` names a file. Off unless that
+/// variable is set, so a normal forward does not sync or write.
+fn layer_trace_append(path: &str, line: &str) -> Result<(), AllpacaError> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| load_err(format!("qwen4exp layer trace: {err}")))?;
+    writeln!(file, "{line}").map_err(|err| load_err(format!("qwen4exp layer trace: {err}")))
+}
+
+static LOGIT_DUMP_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write one last-row logit vector as little-endian f32 plus a JSON sidecar
+/// when `ALLPACA_Q4X_LOGIT_DUMP` names a directory. Off unless that variable
+/// is set, so a normal forward does not write. `req` is the sequence counter
+/// so three chats on one server do not overwrite each other.
+fn dump_logits_row(
+    dir: &str,
+    logits: &[f32],
+    pos: usize,
+    rows: usize,
+    req: u64,
+) -> Result<(), AllpacaError> {
+    std::fs::create_dir_all(dir).map_err(|err| load_err(format!("qwen4exp logit dump: {err}")))?;
+    let stem = format!("req{req}_pos{pos}_rows{rows}");
+    let mut bytes = Vec::with_capacity(logits.len() * 4);
+    for value in logits {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}.f32")), &bytes)
+        .map_err(|err| load_err(format!("qwen4exp logit dump: {err}")))?;
+    let (mut top1, mut best) = (0usize, f32::NEG_INFINITY);
+    for (index, value) in logits.iter().enumerate() {
+        if *value > best {
+            best = *value;
+            top1 = index;
+        }
+    }
+    let meta = format!(
+        "{{\"req\":{req},\"pos\":{pos},\"rows\":{rows},\"vocab\":{},\"top1\":{top1},\"top1_logit\":{best}}}\n",
+        logits.len()
+    );
+    std::fs::write(std::path::Path::new(dir).join(format!("{stem}.json")), meta)
+        .map_err(|err| load_err(format!("qwen4exp logit dump: {err}")))
+}
+
+#[cfg(test)]
+#[test]
+fn layer_trace_hash_matches_fnv_of_the_float_bits() {
+    // 1.0 is 0x3f800000 and -0.5 is 0xbf000000, little-endian.
+    assert_eq!(layer_trace_hash(&[1.0, -0.5]), 0x0979_d8ee_2da2_0b75);
+}
+
+#[cfg(test)]
+#[test]
+fn logit_dump_round_trips_little_endian_floats_and_records_the_top_token() {
+    let dir = std::env::temp_dir().join(format!(
+        "q20-logit-dump-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let logits = [0.1f32, 3.5, -2.0, 1.25];
+    dump_logits_row(dir.to_str().unwrap(), &logits, 16, 3, 7).unwrap();
+    let bytes = std::fs::read(dir.join("req7_pos16_rows3.f32")).unwrap();
+    let mut got = [0.0f32; 4];
+    for (slot, chunk) in got.iter_mut().zip(bytes.chunks_exact(4)) {
+        *slot = f32::from_le_bytes(chunk.try_into().unwrap());
+    }
+    assert_eq!(got, logits);
+    let meta = std::fs::read_to_string(dir.join("req7_pos16_rows3.json")).unwrap();
+    assert!(meta.contains("\"top1\":1"), "{meta}");
+    assert!(meta.contains("\"vocab\":4"), "{meta}");
+    assert!(meta.contains("\"req\":7"), "{meta}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One GPU pass over `tokens` (at most [`crate::qwen4_gpu::MAX_ROWS`])
 /// from `pos`: the streams of all of them stay on the card of the block
 /// they are in. They come to the host where the cards change and for the
@@ -2039,6 +2132,24 @@ fn forward_device(
     // The n-gram block runs on its card unless `ALLPACA_Q4X_HOST_PLE`; its
     // table rows go there with the streams.
     let host_ple = std::env::var_os("ALLPACA_Q4X_HOST_PLE").is_some();
+    let trace_path = std::env::var("ALLPACA_Q4X_LAYER_TRACE").ok().filter(|path| !path.is_empty());
+    let trace_file = trace_path.clone();
+    let logit_dump = std::env::var("ALLPACA_Q4X_LOGIT_DUMP")
+        .ok()
+        .filter(|path| !path.is_empty());
+    if pos == 0 && logit_dump.is_some() {
+        LOGIT_DUMP_REQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let trace = |blk: usize, layer: usize, span: usize, streams: &mut [f32]| -> Result<(), AllpacaError> {
+        let Some(path) = trace_path.as_deref() else {
+            return Ok(());
+        };
+        let hash = layer_trace_hash(streams);
+        layer_trace_append(
+            path,
+            &format!("pos={pos} rows={rows} layer={layer} blk={blk} span={span} hash={hash:016x}"),
+        )
+    };
     if let Some(ple) = q4.spec.ple.as_ref().filter(|_| !host_ple) {
         let blk = ple.layers[0];
         if (resume..cfg.n_layers).any(|layer| cfg.gguf_blk(layer) == blk) {
@@ -2083,7 +2194,9 @@ fn forward_device(
                 mem.tokens.extend(tokens.iter().map(|t| i64::from(*t)));
                 return Ok(Some(DevicePass { streams, resume, card }));
             }
+            let span = host.blocks().len();
             host.run(seq, pos, rows, &mut streams)?;
+            trace(blk, layer, span, &mut streams)?;
             gpu.set_streams(card, &streams)?;
             lap(card, &mut times.ffn_rpc)?;
             continue;
@@ -2140,6 +2253,10 @@ fn forward_device(
             gpu.ffn_finish_routed(blk, rows, cfg.n_active, scale)?;
             lap(card, &mut times.ffn_gpu)?;
             gpu.combine(card, rows)?;
+            if trace_file.is_some() {
+                gpu.get_streams(card, &mut streams)?;
+                trace(blk, layer, 1, &mut streams)?;
+            }
             continue;
         }
         gpu.ffn_route(blk, rows, Some(&mut scores), &mut x)?;
@@ -2166,6 +2283,10 @@ fn forward_device(
             lap(card, &mut times.ffn_host)?;
         }
         gpu.combine(card, rows)?;
+        if trace_file.is_some() {
+            gpu.get_streams(card, &mut streams)?;
+            trace(blk, layer, 1, &mut streams)?;
+        }
     }
     if card != 0 {
         gpu.get_streams(card, &mut streams)?;
@@ -2197,6 +2318,25 @@ fn forward_device(
         None => gpu.head(head, rows, &mut logits[..vocab])?,
     }
     lap(0, &mut times.head)?;
+    if let Some(path) = trace_file.as_deref() {
+        let (mut best_i, mut best) = (0usize, f32::NEG_INFINITY);
+        for (index, value) in logits[..vocab].iter().enumerate() {
+            if *value > best {
+                best = *value;
+                best_i = index;
+            }
+        }
+        layer_trace_append(path, &format!("pos={pos} rows={rows} top1={best_i}"))?;
+    }
+    if let Some(dir) = logit_dump.as_deref() {
+        dump_logits_row(
+            dir,
+            &logits[..vocab],
+            pos,
+            rows,
+            LOGIT_DUMP_REQ.load(std::sync::atomic::Ordering::Relaxed),
+        )?;
+    }
     if mem.times.is_some() {
         mem.times = Some(times);
     }
@@ -2693,6 +2833,53 @@ mod tests {
             assert_eq!(row, mixed_single[i], "mixed row {i}");
             let scale = single[i].iter().fold(1.0f32, |m, v| m.max(v.abs()));
             assert!(max_diff(row, &single[i]) <= 0.05 * scale, "mixed row {i} is {} from the card's", max_diff(row, &single[i]));
+        }
+    }
+
+    /// Off-card host experts (`gemm_q2_0_i8`) must match the same experts
+    /// on the card when both paths pick with the host router. The 5% bound
+    /// in `qwen4exp_gpu_passes_of_several_tokens_match_single_tokens` still
+    /// includes GPU `expf` routing on the all-card side; a `routes`
+    /// recorder keeps picking on the host, so only the Q2_0 products differ.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn qwen4exp_host_routed_experts_off_the_card_match_the_same_picks_on_the_card() {
+        let Ok(hip) = allpaca_hip::HipWorkspace::new(0, 1 << 20, 16) else {
+            return;
+        };
+        let hip = Arc::new(hip);
+        let tokens: Vec<u32> = (0..23u32).map(|i| 3 + (i * 7 + i / 3) % 5).collect();
+
+        let on_card = tiny_packed_model();
+        crate::qwen4_gpu::attach(&on_card, &hip, None, None, None).expect("attach");
+        let mixed = tiny_packed_model();
+        crate::qwen4_gpu::attach(&mixed, &hip, None, Some(&[2]), None).expect("attach");
+        assert_eq!(mixed.q4x.as_ref().unwrap().gpu.lock().unwrap().as_ref().unwrap().expert_layers()[0], [0, 1]);
+
+        let run_host_picks = |model: &TinyModel| {
+            let mut mem = Qwen4Memory { routes: Some(Vec::new()), ..Default::default() };
+            let mut logits = vec![0.0f32; model.config.vocab_size];
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(pos, &t)| {
+                    forward_qwen4_token(model, t, pos, &mut logits, &mut mem).expect("forward");
+                    logits.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let want = run_host_picks(&on_card);
+        let got = run_host_picks(&mixed);
+        let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
+        for (pos, (want, got)) in want.iter().zip(&got).enumerate() {
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(scale > 1e-3, "logits at {pos} are all zero");
+            let diff = max_diff(want, got);
+            assert!(
+                diff <= 2e-3 * scale.max(1.0),
+                "host-routed off-card experts at {pos} differ by {diff} (scale {scale})"
+            );
+            assert_eq!(top(want), top(got), "top-1 at {pos}");
         }
     }
 
