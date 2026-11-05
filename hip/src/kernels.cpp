@@ -5216,14 +5216,14 @@ struct Q2MoePicks {
  * takes it. */
 #if !defined(__gfx906__) && !defined(__gfx908__) && !defined(__gfx90a__) && !defined(__gfx942__) && \
     !defined(__gfx1100__) && !defined(__gfx1101__) && !defined(__gfx1102__) &&                       \
-    !defined(__gfx1200__) && !defined(__gfx1201__)
+    !defined(__gfx1151__) && !defined(__gfx1200__) && !defined(__gfx1201__)
 __device__ int g_allpaca_dot4_scalar_warned = 0;
 #endif
 __device__ inline int allpaca_dot4_i8(int a, int b, int c) {
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__)
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1200__) || defined(__gfx1201__)
+    defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     if (atomicCAS(&g_allpaca_dot4_scalar_warned, 0, 1) == 0) {

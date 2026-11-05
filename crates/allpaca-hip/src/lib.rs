@@ -8,7 +8,7 @@ mod fallback;
 mod gemv_tile;
 
 pub use gemv_tile::{
-    gemv_tile_working_bytes, infinity_cache_from_l2, profile_gemv_tile_cols,
+    gemv_tile_working_bytes, infinity_cache_from_l2, known_infinity_cache_bytes, profile_gemv_tile_cols,
     profiled_gemv_tile_cols, select_gemv_tile_cols, select_gemv_tile_cols_heuristic,
 };
 
@@ -4265,6 +4265,9 @@ fn infinity_cache_budget() -> usize {
     }
     // RDNA Infinity Cache is much larger than L2. GCN/CDNA (gfx9) has L2 only.
     let bytes = match device_gcn_arch(0) {
+        Some((arch, _)) if known_infinity_cache_bytes(&arch).is_some() => {
+            known_infinity_cache_bytes(&arch).unwrap_or(0)
+        }
         Some((arch, l2)) if arch_has_infinity_cache(&arch) => {
             infinity_cache_from_l2(l2).max(16 << 20)
         }
@@ -14512,6 +14515,7 @@ mod tests {
         match arch.split(':').next().unwrap_or(arch) {
             "gfx1201" => Some(640.0), // RX 9070 / 9070 XT / R9700
             "gfx1200" => Some(320.0), // RX 9060 XT
+            "gfx1151" => Some(256.0), // Radeon 8060S (Strix Halo), shared with the CPU
             "gfx906" => Some(1024.0), // MI50
             _ => None,
         }
