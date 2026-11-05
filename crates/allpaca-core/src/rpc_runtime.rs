@@ -2315,7 +2315,10 @@ fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
         // 200 = MoESQ paired-4:8 experts; only the HIP worker has kernels for it.
         RpcBackendKind::Hip => hip || ty == 200,
         RpcBackendKind::Cpu => {
-            hip || matches!(ty, 2 | 3 | 6 | 7 | 9 | 10 | 11 | 16 | 17 | 18 | 19 | 20 | 22 | 23 | 29)
+            hip || matches!(
+                ty,
+                2 | 3 | 6 | 7 | 9 | 10 | 11 | 16 | 17 | 18 | 19 | 20 | 22 | 23 | 29 | 102 | 103 | 104 | 109 | 110 | 111
+            )
         }
         // F32, Q8_0 and the int8 K-quant GEMV; ROCmFP4 and the rest stay off
         // CUDA workers.

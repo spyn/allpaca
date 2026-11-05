@@ -626,6 +626,12 @@ fn dequant_weight(ty: u32, bytes: &[u8], n: usize, out: &mut [f32]) -> Result<()
         39 => allpaca_cpu::dequant_mxfp4(bytes, n, out).map_err(bad),
         100 => allpaca_cpu::dequant_rocmfp4(bytes, n, out).map_err(bad),
         101 => allpaca_cpu::dequant_rocmfp4_fast(bytes, n, out).map_err(bad),
+        102 => allpaca_cpu::dequant_rocmfpx_q6(bytes, n, out).map_err(bad),
+        103 => allpaca_cpu::dequant_rocmfpx_q8(bytes, n, out).map_err(bad),
+        104 => allpaca_cpu::dequant_rocmfpx_q3(bytes, n, out).map_err(bad),
+        109 => allpaca_cpu::dequant_rocmfpx_q5(bytes, n, out).map_err(bad),
+        110 => allpaca_cpu::dequant_rocmfpx_q7(bytes, n, out).map_err(bad),
+        111 => allpaca_cpu::dequant_rocmfpx_q2(bytes, n, out).map_err(bad),
         other => Err(RpcError::Worker(format!(
             "ggml type {other} has no cpu dequant"
         ))),

@@ -8,6 +8,7 @@ mod kquant;
 mod lowbit;
 mod mxfp4_expert;
 mod p48fp4;
+mod rocmfpx;
 
 pub use iq3s::{dequant_iq3_s, IQ3_S_BLOCK_BYTES, IQ3_S_BLOCK_ELEMS};
 pub use iquant::{
@@ -19,6 +20,7 @@ pub use lowbit::{
     dequant_q1_0, dequant_q2_0, gemm_q2_0_i8, gemv_q2_0, gemv_q2_0_i8, quantize_q1_0, quantize_q2_0, Q1_0_BLOCK_BYTES, Q1_0_BLOCK_ELEMS,
     Q2_0Input, Q2_0_BLOCK_BYTES, Q2_0_BLOCK_ELEMS,
 };
+pub use rocmfpx::{repack_rocmfpx_q8_as_q8_0, dequant_rocmfpx_q2, ROCMFPX_Q2_BLOCK_BYTES, dequant_rocmfpx_q7, ROCMFPX_Q7_BLOCK_BYTES, dequant_rocmfpx_q5, ROCMFPX_Q5_BLOCK_BYTES, dequant_rocmfpx_q3, ROCMFPX_Q3_BLOCK_BYTES, dequant_rocmfpx_q6, dequant_rocmfpx_q8, ROCMFPX_Q6_BLOCK_BYTES, rocmfpx_scale, ROCMFPX_BLOCK_ELEMS, ROCMFPX_Q8_BLOCK_BYTES};
 pub use mxfp4_expert::{mxfp4_swiglu_experts, Mxfp4Expert};
 pub use p48fp4::{
     dequant_p48fp4, e4m3_to_f32, p48fp4_interleave, quantize_p48fp4, P48FP4_BLOCK_BYTES,
