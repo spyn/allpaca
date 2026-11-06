@@ -3493,6 +3493,30 @@ mod tests {
         assert_eq!((model.config.n_layers, model.config.n_experts, model.config.n_active), (4, 4, 2));
     }
 
+    /// The route-tail skip runs inside the model forward: off leaves the
+    /// logits untouched, on with a rank below the pick count drops tail
+    /// experts and changes them (every expert counts as a miss on the host).
+    #[test]
+    fn route_tail_skip_changes_the_forward_only_when_on() {
+        let tokens = [3u32, 4, 5, 6, 7, 3];
+        let model = tiny_model();
+        let base = run(&model, &tokens);
+        let q4 = model.q4x.as_ref().expect("qwen4exp state");
+        // Off with a rank set: identity.
+        q4.set_route_tail(crate::route_tail::Policy { enabled: false, rank_threshold: 1 });
+        assert_eq!(run(&model, &tokens), base);
+        // On, rank 1: everything after the top pick goes.
+        q4.set_route_tail(crate::route_tail::Policy::from_experimental(true, 1));
+        let on = run(&model, &tokens);
+        let moved = base.iter().zip(&on).map(|(a, b)| max_diff(a, b)).fold(0.0f32, f32::max);
+        assert!(moved > 1e-5, "the skip must change the logits, moved {moved}");
+        assert!(on.iter().flatten().all(|v| v.is_finite()));
+        assert_eq!(run(&model, &tokens), on, "deterministic");
+        // Rank 0 is clamped to 1, so it behaves as rank 1.
+        q4.set_route_tail(crate::route_tail::Policy::from_experimental(true, 0));
+        assert_eq!(run(&model, &tokens), on);
+    }
+
     #[test]
     fn tiny_qwen4exp_forward_depends_on_the_whole_sequence() {
         let model = tiny_model();

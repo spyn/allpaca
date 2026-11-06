@@ -20,17 +20,30 @@ impl Default for Policy {
 }
 
 impl Policy {
+    /// `rank_threshold` is clamped to at least 1: rank 0 is the top pick, and
+    /// dropping it could leave a token with no routed expert at all.
     pub fn from_experimental(enabled: bool, rank_threshold: u32) -> Self {
         Self {
             enabled,
-            rank_threshold,
+            rank_threshold: rank_threshold.max(1),
         }
     }
 }
 
-/// Drop missed experts whose rank is at or below `policy.rank_threshold` on
-/// every token. Remaining weights are left as-is (no renormalise). Resident
-/// experts are never dropped. Off (`policy.enabled == false`) is identity.
+/// Drop missed experts whose rank is at or below the threshold on every token
+/// of the window. Remaining weights are left as-is (no renormalise). Resident
+/// experts are never dropped, and the top pick of a token never is.
+///
+/// The threshold is capped at `k - 1`, where `k` is the longest pick list in
+/// the window, so a model that picks fewer experts than the threshold (DSV4
+/// picks 6, the default threshold is 7) still has a tail to skip: its
+/// last-ranked experts. `is_missed` may be stateful, so it is asked only about
+/// tail candidates (every token ranks the expert at or below the threshold),
+/// at most once per expert, in first-seen order.
+///
+/// Off (`policy.enabled == false`) is identity. The window can span rows of
+/// different requests, so with the policy on a row's picks depend on the rest
+/// of the batch; that is part of this technique being lossy.
 pub fn filter_picks(
     picks_per_token: &[Vec<(usize, f32)>],
     mut is_missed: impl FnMut(usize) -> bool,
@@ -39,33 +52,35 @@ pub fn filter_picks(
     if !policy.enabled {
         return picks_per_token.to_vec();
     }
-    let mut skip: Vec<usize> = Vec::new();
-    for picks in picks_per_token {
-        for &(e, _) in picks {
-            if skip.contains(&e) || !is_missed(e) {
-                continue;
-            }
-            let ranks: Vec<Option<u32>> = picks_per_token
-                .iter()
-                .map(|p| p.iter().position(|(id, _)| *id == e).map(|i| i as u32))
-                .collect();
-            if skip_missed_expert(&ranks, policy.rank_threshold) {
-                skip.push(e);
-            }
+    let k = picks_per_token.iter().map(Vec::len).max().unwrap_or(0);
+    if k < 2 {
+        return picks_per_token.to_vec();
+    }
+    let threshold = policy.rank_threshold.max(1).min(k as u32 - 1);
+    let n = picks_per_token.len();
+    let mut ranks: std::collections::HashMap<usize, Vec<Option<u32>>> =
+        std::collections::HashMap::new();
+    let mut first_seen: Vec<usize> = Vec::new();
+    for (t, picks) in picks_per_token.iter().enumerate() {
+        for (i, &(e, _)) in picks.iter().enumerate() {
+            ranks
+                .entry(e)
+                .or_insert_with(|| {
+                    first_seen.push(e);
+                    vec![None; n]
+                })[t] = Some(i as u32);
         }
     }
+    let skip: std::collections::HashSet<usize> = first_seen
+        .into_iter()
+        .filter(|e| skip_missed_expert(&ranks[e], threshold) && is_missed(*e))
+        .collect();
     if skip.is_empty() {
         return picks_per_token.to_vec();
     }
     picks_per_token
         .iter()
-        .map(|picks| {
-            picks
-                .iter()
-                .copied()
-                .filter(|(e, _)| !skip.contains(e))
-                .collect()
-        })
+        .map(|picks| picks.iter().copied().filter(|(e, _)| !skip.contains(e)).collect())
         .collect()
 }
 
@@ -187,5 +202,65 @@ mod tests {
         assert!(out[0].iter().any(|(e, _)| *e == 17));
         assert!(out[1].iter().any(|(e, _)| *e == 17));
         assert!(out[1].iter().any(|(e, _)| *e == 18));
+    }
+    #[test]
+    fn rank_zero_is_clamped_so_the_top_pick_is_never_dropped() {
+        assert_eq!(Policy::from_experimental(true, 0).rank_threshold, 1);
+        // Every pick missed, every window row the same: rank 0 survives.
+        let picks = window();
+        let out = filter_picks(&picks, |_| true, Policy::from_experimental(true, 0));
+        for (o, p) in out.iter().zip(&picks) {
+            assert_eq!(o[0], p[0], "top pick kept");
+            assert!(o.len() >= 1);
+        }
+        // Even an all-miss window keeps something to sum.
+        assert!(out.iter().all(|o| !o.is_empty()));
+    }
+
+    #[test]
+    fn the_miss_test_only_runs_for_tail_candidates() {
+        // Experts ranked better than the threshold on some token never reach
+        // the (stateful) miss test.
+        let mut asked = Vec::new();
+        let _ = filter_picks(
+            &window(),
+            |e| {
+                asked.push(e);
+                true
+            },
+            on(7),
+        );
+        // 10..=16 sit above rank 7 on both tokens, or are ranked well on one;
+        // only 17 and 18 are tail candidates, 18 only on token 1.
+        assert!(asked.iter().all(|e| *e == 17 || *e == 18), "asked {asked:?}");
+        let mut seen = asked.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), asked.len(), "each expert asked at most once");
+    }
+
+    #[test]
+    fn the_rank_is_capped_below_the_pick_count() {
+        // DSV4-Flash picks 6 experts, so ranks run 0..=5 and the default
+        // threshold 7 would never skip. The window's pick count caps it.
+        let w: Vec<Vec<(usize, f32)>> = vec![
+            vec![(1, 0.3), (2, 0.2), (3, 0.2), (4, 0.1), (5, 0.1), (6, 0.1)],
+            vec![(1, 0.3), (2, 0.2), (3, 0.2), (4, 0.1), (5, 0.1), (7, 0.1)],
+        ];
+        let out = filter_picks(&w, |e| e == 6 || e == 7, on(7));
+        assert_eq!(out[0].len(), 5);
+        assert_eq!(out[1].len(), 5);
+        // Resident last-ranked experts stay.
+        let out = filter_picks(&w, |_| false, on(7));
+        assert_eq!(out, w);
+        // A threshold already below the cap is used as given.
+        let out = filter_picks(&w, |e| e == 5 || e == 6 || e == 7, on(4));
+        assert_eq!(out[0].iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_single_pick_per_token_is_never_dropped() {
+        let w = vec![vec![(3usize, 1.0f32)], vec![(4, 1.0)]];
+        assert_eq!(filter_picks(&w, |_| true, on(1)), w);
     }
 }

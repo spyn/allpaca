@@ -3029,7 +3029,8 @@ fn dsv4_apply_moe(
         fcomb,
         picks,
     } = prep;
-    let picks = if model.route_tail.enabled {
+    // Hash-routed layers list experts in table order, not by score: no tail.
+    let picks = if model.route_tail.enabled && layer_idx >= spec.hash_layer_count {
         crate::route_tail::filter_picks(
             std::slice::from_ref(&picks),
             |e| {
@@ -3509,7 +3510,7 @@ fn dsv4_apply_moe_rows(
         )?;
         shexp_done = true;
     }
-    if model.route_tail.enabled {
+    if model.route_tail.enabled && layer_idx >= dsv4.spec.hash_layer_count {
         let ranked: Vec<Vec<(usize, f32)>> = preps.iter().map(|p| p.picks.clone()).collect();
         let filtered = crate::route_tail::filter_picks(
             &ranked,
