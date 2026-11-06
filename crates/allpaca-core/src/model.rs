@@ -4795,20 +4795,43 @@ pub struct TinyModel {
     /// buffers alone (an RPC worker's, or the fused local kernels), so the
     /// card runs it while the host routes and waits. The same kernels on
     /// the same inputs, so output is unchanged. Read at load from
-    /// [`SHEXP_EARLY_ENV`]; `0` keeps the old order (board task P8).
+    /// [`SHEXP_EARLY_ENV`]; off unless it is `1` (board task P8).
     pub shexp_early: bool,
     /// Strata route-tail skip. Off by default; set from Engine config at load.
     pub(crate) route_tail: crate::route_tail::Policy,
 }
 
-/// `ALLPACA_SHEXP_EARLY=0` keeps a MoE layer's shared expert behind its
-/// routed experts (see [`TinyModel::shexp_early`]).
+/// `ALLPACA_SHEXP_EARLY=1` queues a MoE layer's shared expert ahead of its
+/// routed experts (see [`TinyModel::shexp_early`]). Off by default: on
+/// Flash-Next it measured about 4% slower (18.04 vs 18.85 tok/s, 6 fresh
+/// starts, identical output; board task P8) and flat on Ornith.
 pub const SHEXP_EARLY_ENV: &str = "ALLPACA_SHEXP_EARLY";
 
+/// [`shexp_early_from_env`] for a given value of the variable.
+pub(crate) fn shexp_early_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
 /// Whether the shared expert goes ahead of the routed experts' wait, from
-/// [`SHEXP_EARLY_ENV`] (on unless it is `0`).
+/// [`SHEXP_EARLY_ENV`] (off unless it is `1`).
 pub(crate) fn shexp_early_from_env() -> bool {
-    std::env::var(SHEXP_EARLY_ENV).map_or(true, |v| v.trim() != "0")
+    shexp_early_from(std::env::var(SHEXP_EARLY_ENV).ok().as_deref())
+}
+
+#[cfg(test)]
+mod shexp_early_default_tests {
+    use super::shexp_early_from;
+
+    /// The early shared-expert order is opt-in (it measured slower).
+    #[test]
+    fn the_early_shared_expert_is_off_unless_set_to_one() {
+        assert!(!shexp_early_from(None));
+        assert!(!shexp_early_from(Some("")));
+        assert!(!shexp_early_from(Some("0")));
+        assert!(!shexp_early_from(Some("true")));
+        assert!(shexp_early_from(Some("1")));
+        assert!(shexp_early_from(Some(" 1 ")));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
