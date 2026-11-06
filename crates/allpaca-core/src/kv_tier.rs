@@ -530,6 +530,156 @@ impl KvTierManager {
         self.read_kv_counted(id, n_kv_heads, head_dim, &self.cache_d2h_bytes)
     }
 
+    /// `n_slots` rows from `first_slot`, not the rest of the page.
+    ///
+    /// Counted on [`Self::cache_d2h_bytes`] for every residency, including
+    /// host pages, so a window checkpoint's cost stays the window.
+    pub fn read_kv_slots_for_cache(
+        &self,
+        id: PageId,
+        first_slot: u32,
+        n_slots: u32,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
+        self.read_kv_slot_range(
+            id,
+            first_slot,
+            n_slots,
+            n_kv_heads,
+            head_dim,
+            &self.cache_d2h_bytes,
+        )
+    }
+
+    fn read_kv_slot_range(
+        &self,
+        id: PageId,
+        first_slot: u32,
+        n_slots: u32,
+        n_kv_heads: usize,
+        head_dim: usize,
+        counter: &AtomicU64,
+    ) -> Result<(Vec<f32>, Vec<f32>), AllpacaError> {
+        let page = self.pages.get(&id).ok_or_else(|| {
+            AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
+        })?;
+        let kv_width = n_kv_heads.saturating_mul(head_dim);
+        let n_slots = n_slots as usize;
+        let first = first_slot as usize;
+        if kv_width == 0 || n_slots == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let filled = page.filled as usize;
+        let cap = page.capacity_tokens as usize;
+        let end = first.saturating_add(n_slots);
+        if end > filled || end > cap {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "kv page {id}: slots {first}+{n_slots} past filled {filled}"
+            ))));
+        }
+        let n = n_slots.saturating_mul(kv_width);
+        let k_at = first.saturating_mul(kv_width);
+        let k_off = page.location.offset.saturating_add(k_at);
+        let v_off = page
+            .location
+            .offset
+            .saturating_add(cap.saturating_mul(kv_width))
+            .saturating_add(k_at);
+        let kind = page.location.kind;
+        let page_off = page.location.offset;
+        let page_len = page.location.len;
+        let (k, v) = match kind {
+            DeviceBufferKind::Hip => {
+                let alloc = self.hip_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "HIP KV page {id} missing device buffer"
+                    )))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                let bytes = n.saturating_mul(4);
+                // SAFETY: `alloc.ptr` is this page's device buffer of `alloc.bytes`.
+                // `k_off` and `v_off` are float indexes of `n` f32s inside it:
+                // the caller rejected a span past `filled` and `capacity_tokens`.
+                let k_ptr = unsafe { alloc.ptr.add(k_off.saturating_mul(4)) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off.saturating_mul(4)) };
+                allpaca_hip::memcpy(k.as_mut_ptr().cast(), k_ptr, bytes, allpaca_hip::MEMCPY_D2H)?;
+                allpaca_hip::memcpy(v.as_mut_ptr().cast(), v_ptr, bytes, allpaca_hip::MEMCPY_D2H)?;
+                (k, v)
+            }
+            DeviceBufferKind::Cuda => {
+                let alloc = self.cuda_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "CUDA KV page {id} missing device buffer"
+                    )))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                let bytes = n.saturating_mul(4);
+                // SAFETY: same span invariant as the HIP arm, for this page's cudaMalloc.
+                let k_ptr = unsafe { alloc.ptr.add(k_off.saturating_mul(4)) };
+                let v_ptr = unsafe { alloc.ptr.add(v_off.saturating_mul(4)) };
+                allpaca_cuda::memcpy(
+                    k.as_mut_ptr().cast(),
+                    k_ptr.cast(),
+                    bytes,
+                    allpaca_cuda::MEMCPY_D2H,
+                )?;
+                allpaca_cuda::memcpy(
+                    v.as_mut_ptr().cast(),
+                    v_ptr.cast(),
+                    bytes,
+                    allpaca_cuda::MEMCPY_D2H,
+                )?;
+                (k, v)
+            }
+            DeviceBufferKind::Vulkan => {
+                let page_buf = self.vulkan_pages.get(&id).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(format!(
+                        "Vulkan KV page {id} missing device buffer"
+                    )))
+                })?;
+                let ws = self.vulkan.as_ref().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "Vulkan KV page with no workspace".into(),
+                    ))
+                })?;
+                let mut k = vec![0.0f32; n];
+                let mut v = vec![0.0f32; n];
+                ws.kv_read_f32(page_buf, k_off, &mut k)?;
+                ws.kv_read_f32(page_buf, v_off, &mut v)?;
+                (k, v)
+            }
+            DeviceBufferKind::CpuVram => (
+                self.vram.slice(k_off, n).to_vec(),
+                self.vram.slice(v_off, n).to_vec(),
+            ),
+            DeviceBufferKind::CpuPinnedDram => (
+                self.dram.slice(k_off, n).to_vec(),
+                self.dram.slice(v_off, n).to_vec(),
+            ),
+            DeviceBufferKind::Nvme => {
+                let store = self.nvme.as_ref().ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory(
+                        "NVMe KV page with no cold-tier store".into(),
+                    ))
+                })?;
+                let data = store.read_page(page_off, page_len)?;
+                let v_at = cap.saturating_mul(kv_width).saturating_add(k_at);
+                let k = data.get(k_at..k_at + n).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV K slice".into()))
+                })?;
+                let v = data.get(v_at..v_at + n).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::OutOfMemory("NVMe KV V slice".into()))
+                })?;
+                (k.to_vec(), v.to_vec())
+            }
+        };
+        counter.fetch_add(n.saturating_mul(8) as u64, Ordering::Relaxed);
+        Ok((k, v))
+    }
+
     /// Device-to-host bytes read for prompt-cache checkpoints.
     pub fn cache_d2h_bytes(&self) -> u64 {
         self.cache_d2h_bytes.load(Ordering::Relaxed)

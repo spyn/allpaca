@@ -16,7 +16,7 @@ use allpaca_types::{
 use futures::Stream;
 use rand::rngs::StdRng;
 
-use crate::anchors::{restore_kv, AnchorCache, RecurrentState};
+use crate::anchors::{restore_kv, restore_kv_from, snapshot_kv_span, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
     apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
     decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, residual_add_rows,
@@ -3345,7 +3345,16 @@ impl Engine {
                     let rows = cp.kv_rows();
                     let decode_ms = decode_started.elapsed().as_secs_f64() * 1e3;
                     let upload_started = Instant::now();
-                    restore_kv(&mut inner.kv, &pages, &rows, &target.config)?;
+                    // A SWA checkpoint keeps only the last window of raw rows,
+                    // which belong at `n - window`, not at slot 0.
+                    let n_rows = rows.iter().map(Vec::len).max().unwrap_or(0);
+                    restore_kv_from(
+                        &mut inner.kv,
+                        &pages,
+                        &rows,
+                        &target.config,
+                        n.saturating_sub(n_rows),
+                    )?;
                     tracing::info!(
                         tokens = n,
                         lookup_ms,
@@ -4632,6 +4641,12 @@ impl Engine {
         // still has to forward its last prompt token: the checkpoint goes one
         // token before the end, so the same prompt again finds it.
         let q4x = inner.target.as_ref().is_some_and(|t| t.q4x.is_some());
+        let dsv4_window = inner
+            .target
+            .as_ref()
+            .and_then(|t| t.dsv4.as_ref())
+            .map(|w| w.spec.attn.window)
+            .unwrap_or(0);
         let (start, total, toks, pages) = {
             let active = request_mut(inner, id)?;
             let start = active.prefill_pos;
@@ -4646,7 +4661,18 @@ impl Engine {
                 .copied()
                 .find(|&n| n > start)
                 .unwrap_or(stop);
-            let end = (start + chunk).min(stop).min(next_checkpoint);
+            // DSV4 compressed memory is only exact at a window stride, so a
+            // chunk must land there: the snapshot cannot reconstruct an
+            // earlier stride from a later Dsv4Memory.
+            let next_stride = if dsv4_window > 0 {
+                start
+                    .saturating_add(dsv4_window)
+                    .saturating_div(dsv4_window)
+                    .saturating_mul(dsv4_window)
+            } else {
+                stop
+            };
+            let end = (start + chunk).min(stop).min(next_checkpoint).min(next_stride);
             (
                 start,
                 total,
@@ -4997,6 +5023,13 @@ impl Engine {
             if message_boundary || end + 1 == total {
                 self.capture_qwen4_prompt(inner, id, &target, end)?;
             }
+        } else if dsv4_window > 0 {
+            // Compressed memory is exact only on a window stride, and the
+            // checkpoint stores that stride's tail. An off-stride state node
+            // must not borrow those rows.
+            if end > 0 && end % dsv4_window == 0 {
+                self.capture_dsv4_prompt(inner, id, &target, end, dsv4_window)?;
+            }
         } else if end >= total {
             self.capture_prompt(inner, id, &target)?;
         } else {
@@ -5040,8 +5073,9 @@ impl Engine {
         inner.kv_radix.reset();
         inner.prefill_rate = Default::default();
         let pc = &self.config.prompt_cache;
-        // Its state is not part of a checkpoint file.
-        if target.dsv4.is_some() || target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted()) {
+        // Hosted worker state is not part of a checkpoint file. DSV4
+        // compressed memory is, as of APKC v5.
+        if target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted()) {
             return;
         }
         if settings.is_none() && (pc.worker || pc.disk_dir.is_some()) {
@@ -5141,6 +5175,42 @@ impl Engine {
         };
         let draft = drafter_snapshot(inner, id, end);
         inner.kv_radix.insert_state(&tokens, state, draft);
+        Ok(())
+    }
+
+    /// DSV4 SWA checkpoint: compressed `Dsv4Memory` plus only the last
+    /// `window` raw KV rows, taken when prefill lands on a window stride.
+    /// APKC v5 writes `Dsv4Memory` to the disk tier; RAM radix is enough
+    /// to replay a later prompt that shares this prefix.
+    fn capture_dsv4_prompt(
+        &self,
+        inner: &mut EngineInner,
+        id: u64,
+        target: &TinyModel,
+        end: usize,
+        window: usize,
+    ) -> Result<(), AllpacaError> {
+        if window == 0 || end == 0 {
+            return Ok(());
+        }
+        let (tokens, pages, state) = {
+            let active = request(inner, id)?;
+            if !active.vision.is_empty() || active.probe.is_some() {
+                return Ok(());
+            }
+            let Some(state) = active.recurrent.clone() else {
+                return Ok(());
+            };
+            if end > active.tokens.len() {
+                return Ok(());
+            }
+            (active.tokens[..end].to_vec(), active.pages.clone(), state)
+        };
+        let start = end.saturating_sub(window);
+        let n_rows = end.saturating_sub(start);
+        let rows = snapshot_kv_span(&inner.kv, &pages, &target.config, start, n_rows)?;
+        let cp = inner.kv_radix.checkpoint(state, rows);
+        inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
     }
 
@@ -13898,6 +13968,69 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// DSV4 stores SWA state at window-stride prefixes. A later prompt that
+    /// shares one must restore it and match a cold prefill of the same text.
+    #[test]
+    fn tiny_dsv4_swa_checkpoint_replays_like_a_cold_prefill() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_swa_ckpt-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_ctx_gguf(
+            &path,
+            &crate::deepseek4::TinyDsv4Ctx {
+                window: 8,
+                compress_ratios: vec![4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: 0.0,
+            },
+        );
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let words = ["hi", "a", "b", "c", "d"];
+        let prompt: String = (0..24).map(|i| words[i % 5]).collect::<Vec<_>>().join(" ");
+        let config = || {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only: true,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg
+        };
+        let cold = Engine::new(config())
+            .expect("tiny DSV4 must load")
+            .generate(&prompt, params.clone())
+            .expect("cold generate");
+        let engine = Engine::new(config()).expect("tiny DSV4 must load");
+        let _warm = engine
+            .generate(&prompt, params.clone())
+            .expect("warm generate");
+        let hit = engine.generate(&prompt, params).expect("restored generate");
+        let stats = engine.stats();
+        assert!(
+            stats.radix_hits >= 1,
+            "a repeated DSV4 prompt must restore a window-stride checkpoint; {stats:?}"
+        );
+        assert_eq!(
+            hit.token_ids, cold.token_ids,
+            "restored tokens must equal a cold prefill"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn route_tail_skip_on_matches_off_when_there_are_no_misses() {
         let path = std::env::temp_dir().join(format!(
@@ -14049,6 +14182,73 @@ mod tests {
             )
             .expect("tiny DeepSeek-V4 must generate");
         (out.token_ids, engine.stats())
+    }
+
+    /// A HIP workspace still has to keep the window checkpoint. F32 stays on
+    /// CPU gemv, but the raw rows live in device pages, and a later prompt
+    /// must restore them.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn tiny_dsv4_swa_checkpoint_replays_with_a_hip_workspace() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip tiny_dsv4_swa_checkpoint_replays_with_a_hip_workspace: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_swa_hip-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_ctx_gguf(
+            &path,
+            &crate::deepseek4::TinyDsv4Ctx {
+                window: 8,
+                compress_ratios: vec![4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: 0.0,
+            },
+        );
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let words = ["hi", "a", "b", "c", "d"];
+        let prompt: String = (0..24).map(|i| words[i % 5]).collect::<Vec<_>>().join(" ");
+        let config = |cpu_only: bool| {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg
+        };
+        let cold = Engine::new(config(true))
+            .expect("tiny DSV4 must load")
+            .generate(&prompt, params.clone())
+            .expect("cold generate");
+        let engine = Engine::new(config(false)).expect("tiny DSV4 must load on HIP");
+        let _warm = engine.generate(&prompt, params.clone()).expect("warm generate");
+        let hit = engine.generate(&prompt, params).expect("restored generate");
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            stats.radix_hits >= 1,
+            "a HIP workspace must store the window checkpoint; {stats:?}"
+        );
+        assert_eq!(
+            hit.token_ids, cold.token_ids,
+            "restored tokens must equal a cold prefill"
+        );
     }
 
     #[cfg(feature = "hip")]

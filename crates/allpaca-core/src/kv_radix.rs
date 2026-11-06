@@ -63,6 +63,7 @@ impl RadixCheckpoint {
         let draft = self.draft.as_ref().map_or(0, Vec::len);
         rec.saturating_add(host_kv)
             .saturating_add(r.q4x.host_bytes())
+            .saturating_add(r.dsv4.host_bytes())
             .saturating_add(kv)
             .saturating_add(draft)
             .saturating_add(64)
@@ -1033,13 +1034,22 @@ impl KvRadixForest {
 
     /// The checkpoint at `path`, with the keys and values of a state
     /// checkpoint taken from a longer prompt's checkpoint below it.
+    ///
+    /// A sliding-window checkpoint stores only its tail, so its row count is
+    /// shorter than the tokens it covers. Those rows are not a prefix, and
+    /// taking them would restore the wrong keys.
     fn resume_at(&mut self, path: &[u32]) -> Option<(usize, RadixCheckpoint)> {
         let mut cp = self.load(path)?;
         if cp.state_only {
             let rest = kv_below(node_at(&self.root, path)?)?;
             let mut below = path.to_vec();
             below.extend(rest);
-            cp.kv = self.load(&below)?.prefix(path.len()).kv;
+            let donor = self.load(&below)?;
+            let rows = donor.kv.iter().map(EncodedRows::rows).min().unwrap_or(0);
+            if rows > 0 && rows < below.len() {
+                return None;
+            }
+            cp.kv = donor.prefix(path.len()).kv;
             cp.state_only = false;
         }
         Some((path.len(), cp))
@@ -1309,8 +1319,9 @@ fn kv_below(node: &RadixNode) -> Option<Vec<u32>> {
 }
 
 const MAGIC: &[u8; 4] = b"APKC";
-/// Checkpoint files. 3 has no drafter trailer; 4 may.
-const VERSION: u32 = 4;
+/// Checkpoint files. 3 has no drafter trailer; 4 may; 5 may hold Dsv4Memory.
+const VERSION: u32 = 5;
+const VERSION_V4: u32 = 4;
 const VERSION_V3: u32 = 3;
 const FLAG_SLICEABLE: u8 = 1;
 const FLAG_STATE_ONLY: u8 = 2;
@@ -1343,7 +1354,8 @@ fn write_file(file: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// `MAGIC`, version, tokens, flags, per-layer keys and values, then the
 /// recurrent state (layers, ssm_h, ssm_conv, gdn_state, gdn_conv), the host
-/// attention keys and values, and the qwen4exp memory.
+/// attention keys and values, the qwen4exp memory, the drafter trailer,
+/// and (v5) Dsv4Memory.
 fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
     let mut out = Vec::with_capacity(cp.approx_bytes() + tokens.len() * 4 + 64);
     out.extend_from_slice(MAGIC);
@@ -1391,6 +1403,11 @@ fn encode_file(tokens: &[u32], cp: &RadixCheckpoint) -> Vec<u8> {
             out.extend_from_slice(draft);
         }
     }
+    let dsv4 = !r.dsv4.is_empty();
+    out.push(dsv4 as u8);
+    if dsv4 {
+        r.dsv4.write_to(&mut out);
+    }
     out
 }
 
@@ -1399,7 +1416,7 @@ fn read_header(r: &mut Reader<'_>) -> Option<(Vec<u32>, u8, u32)> {
         return None;
     }
     let version = r.u32()?;
-    if version != VERSION && version != VERSION_V3 {
+    if version < VERSION_V3 || version > VERSION {
         return None;
     }
     let n = r.u32()? as usize;
@@ -1464,13 +1481,22 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
         1 => Some(crate::qwen4exp::Qwen4Memory::read_from(&mut r)?),
         _ => return None,
     };
-    let draft = if version >= VERSION {
+    let draft = if version >= VERSION_V4 {
         match r.u8()? {
             0 => None,
             1 => {
                 let n = r.u32()? as usize;
                 Some(r.take(n)?.to_vec())
             }
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    let dsv4 = if version >= VERSION {
+        match r.u8()? {
+            0 => None,
+            1 => Some(crate::dsv4_attn::Dsv4Memory::read_from(&mut r)?),
             _ => return None,
         }
     } else {
@@ -1489,6 +1515,9 @@ fn decode_file(bytes: &[u8], tokens: &[u32]) -> Option<RadixCheckpoint> {
     recurrent.host_kv = host_kv;
     if let Some(q4x) = q4x {
         recurrent.q4x = q4x;
+    }
+    if let Some(dsv4) = dsv4 {
+        recurrent.dsv4 = dsv4;
     }
     Some(RadixCheckpoint {
         recurrent,
@@ -1918,6 +1947,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// APKC must persist DSV4 compressed memory: a v4 file drops it, so a
+    /// RAM-evicted checkpoint would resume with an empty compressor.
+    #[test]
+    fn a_checkpoint_file_keeps_dsv4_compressed_memory() {
+        let dir = disk_dir("dsv4");
+        let mut rec = RecurrentState::zeros(1, 4);
+        rec.dsv4 = crate::dsv4_attn::Dsv4Memory::from_test_keys(vec![1.5, -0.25, 3.0, 0.0], 12);
+        let saved = KvRadixForest::new().checkpoint(
+            rec,
+            vec![vec![KvRow {
+                k: vec![1.0; 2],
+                v: vec![2.0; 2],
+            }]],
+        );
+        let with_dsv4 = saved.approx_bytes();
+        let empty = RecurrentState::zeros(1, 4);
+        let without = KvRadixForest::new()
+            .checkpoint(
+                empty,
+                vec![vec![KvRow {
+                    k: vec![1.0; 2],
+                    v: vec![2.0; 2],
+                }]],
+            )
+            .approx_bytes();
+        assert!(
+            with_dsv4 > without,
+            "approx_bytes must count Dsv4Memory: {with_dsv4} vs {without}"
+        );
+        let mut forest = KvRadixForest::with_limits(0, 1).with_disk(&dir, 0).unwrap();
+        forest.insert_checkpoint(&[1, 2, 3], saved.clone());
+        let (n, back) = forest
+            .lookup_checkpoint(&[1, 2, 3, 9])
+            .expect("back from disk");
+        assert_eq!(n, 3);
+        assert_eq!(
+            back.recurrent.dsv4, saved.recurrent.dsv4,
+            "compressed memory must survive the checkpoint file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A later turn resumes the drafter that was warmed with this prefix.
     /// The bytes ride in the checkpoint file, so a RAM miss still brings them back.
     #[test]
@@ -2025,6 +2096,36 @@ mod tests {
         let (n, cp) = forest.lookup_checkpoint(&[1, 2, 3, 9]).expect("the shorter one");
         assert_eq!(n, 1);
         assert_eq!(cp.recurrent.gdn_state, state(1.0).gdn_state);
+    }
+
+    /// A sliding-window checkpoint stores only its tail. A state node above
+    /// that tail must not pretend those rows are the earlier prefix.
+    #[test]
+    fn a_state_checkpoint_does_not_resume_a_sliding_window_tail() {
+        let mut forest = KvRadixForest::new();
+        let tokens: Vec<u32> = (0..16).collect();
+        let early = forest.checkpoint(state(8.0), window_tail(1000.0, 8));
+        forest.insert_checkpoint(&tokens[..8], early);
+        let late = forest.checkpoint(state(16.0), window_tail(2000.0, 8));
+        forest.insert_checkpoint(&tokens, late);
+        forest.insert_state(&tokens[..14], state(14.0), None);
+
+        let mut query = tokens[..14].to_vec();
+        query.push(99);
+        let (n, cp) = forest.lookup_checkpoint(&query).expect("the earlier window");
+        assert_eq!(n, 8, "the tail at 16 is not the prefix through 14");
+        let rows = cp.kv_rows();
+        assert_eq!(rows[0][0].k[0], 1000.0);
+        assert_eq!(rows[0].len(), 8);
+    }
+
+    fn window_tail(marker: f32, n: usize) -> Vec<Vec<KvRow>> {
+        vec![(0..n)
+            .map(|t| KvRow {
+                k: vec![marker + t as f32; 4],
+                v: vec![-(marker + t as f32); 4],
+            })
+            .collect()]
     }
 
     #[test]
