@@ -718,10 +718,14 @@ pub fn divergence_between(
 }
 
 /// What the route-tail skip (`experimental.route_tail_skip`, rank `rank`) does
-/// to a `qwen4exp` model's predictions on `texts`, both runs on the CPU host
-/// forward (where every expert counts as a miss, so this bounds the loss):
-/// the mean `KL(exact || skipped)` in nats per token, and the share of
-/// positions where both pick the same top token.
+/// to a `qwen4exp` model's predictions on `texts`: the mean `KL(exact ||
+/// skipped)` in nats per token, and the share of positions where both pick the
+/// same top token. Both runs are on the CPU host forward, where every expert
+/// counts as a miss. The skipped run feeds one token at a time, so each
+/// routing window is a single token, as in decode (the exact run is batched;
+/// the two agree bit for bit with the flag off). This is NOT an upper bound
+/// for production: it skips whatever the rank allows, but a real run skips
+/// only experts that miss the cache.
 pub fn route_tail_divergence(
     model: &Path,
     texts: &[&str],
@@ -735,7 +739,11 @@ pub fn route_tail_divergence(
         .ok_or_else(|| bad("route-tail divergence: not a qwen4exp model"))?;
     q4.set_route_tail(crate::route_tail::Policy::from_experimental(true, rank));
     let vocab = model.config.vocab_size;
-    let (now, _) = log_probs(&model, &texts, |_| None)?;
+    // One token per routing window, as in decode.
+    let mut now = Vec::with_capacity(reference.len());
+    for text in &texts {
+        now.extend(text_log_probs(&model, text, None)?.0);
+    }
     let top = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, v)| if *v > b.1 { (i, *v) } else { b }).0;
     let positions = (reference.len() / vocab).max(1);
     let agree = reference.chunks(vocab).zip(now.chunks(vocab)).filter(|(p, q)| top(p) == top(q)).count();
