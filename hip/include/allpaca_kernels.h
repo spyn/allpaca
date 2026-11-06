@@ -207,6 +207,11 @@ int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b, float *c, 
 int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                  int32_t k, allpaca_stream_t stream);
 
+/* NVFP4 (ggml type 40) after the host re-pack: 20-byte blocks of 32 weights, qs[16] then two
+ * f16 scales (tensor scale folded in), E2M1 levels 0..12. K must be a multiple of 32. */
+int allpaca_gemm_nt_nvfp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                          int32_t k, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * W^T for MoESQ paired-4:8 FP4 weights (Allpaca tensor type 200): n rows
  * of k/32 12-byte blocks (8 kept value bytes, 2 mask bytes, half scale). k % 32 == 0. */
 int allpaca_gemm_nt_p48fp4(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,

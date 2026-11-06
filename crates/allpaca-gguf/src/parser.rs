@@ -1249,6 +1249,12 @@ impl GgufFile {
                 }
                 let mut out = vec![0.0f32; n];
                 allpaca_cpu::dequant_rocmfp4(&mmap[start..start + nbytes], n, &mut out)?;
+                // An NVFP4 file converted to ROCmFP4 keeps its `.scale` tensors.
+                if let Some(scale) = self.nvfp4_tensor_scale(name)? {
+                    for v in &mut out {
+                        *v *= scale;
+                    }
+                }
                 Ok(out)
             }
             GgmlType::RocmFp4Fast => {

@@ -6584,6 +6584,26 @@ __device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
     return (mag ^ neg) + (neg & 0x01010101u);
 }
 
+/* As rocmfp4_levels_i8x4 for the NVFP4 E2M1 codebook (0,1,2,3,4,6,8,12). */
+__device__ inline uint32_t nvfp4_levels_i8x4(uint32_t code) {
+    const uint32_t mag3 = code & 0x07070707u;
+    const uint32_t big = (((mag3 + 0x03030303u) >> 3) & 0x01010101u) * 0xFFu;
+    uint32_t mag = mag3 + ((((mag3 | 0x80808080u) - 0x04040404u) & 0x07070707u) & big);
+    // Index 7 is 12, not 10: add 2 where all three magnitude bits are set.
+    const uint32_t seven = mag3 & (mag3 >> 1) & (mag3 >> 2) & 0x01010101u;
+    mag += seven << 1;
+    const uint32_t nonzero = (((mag + 0x7F7F7F7Fu) >> 7) & 0x01010101u) * 0xFFu;
+    const uint32_t neg = (((code >> 3) & 0x01010101u) * 0xFFu) & nonzero;
+    return (mag ^ neg) + (neg & 0x01010101u);
+}
+
+/* f16 bits to f32 for the NVFP4 device block scales. */
+__device__ inline float nvfp4_f16_scale(const uint8_t *p) {
+    uint16_t h;
+    __builtin_memcpy(&h, p, 2);
+    return static_cast<float>(__builtin_bit_cast(_Float16, h));
+}
+
 /* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
  * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
  * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
@@ -6623,13 +6643,19 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
             // Blocks are 17 or 18 bytes: unaligned loads.
             uint32_t x[4];
             __builtin_memcpy(x, blk, 16);
-            const float d0 = rocmfp4_scale(blk[16]);
-            const float d1 = rocmfp4_scale(blk[BB - 1]);
+            // BB = 20: NVFP4 device block, f16 scales and the 12-top codebook.
+            const float d0 = BB == 20 ? nvfp4_f16_scale(blk + 16) : rocmfp4_scale(blk[16]);
+            const float d1 = BB == 20 ? nvfp4_f16_scale(blk + 18) : rocmfp4_scale(blk[BB - 1]);
             uint32_t wl[4], wh[4];
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
-                wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
-                wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                if (BB == 20) {
+                    wl[t] = nvfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                    wh[t] = nvfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                } else {
+                    wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                    wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                }
             }
 #if ALLPACA_I8_LOADS_FIRST
             uint32_t al[MR][4], ah[MR][4];
@@ -6786,6 +6812,18 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b,
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m,
                                             int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1, true);
+}
+
+/* NVFP4 (ggml type 40) after the host re-pack: 20-byte blocks of 32 weights
+ * (qs[16], two f16 scales with the tensor scale folded in). Int8 path only,
+ * so K must be a multiple of 32. */
+extern "C" int allpaca_gemm_nt_nvfp4(const float *a, const uint8_t *b, float *c, int32_t m,
+                                     int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    return launch_rocmfp4_i8<20>(a, b, c, m, n, k, as_stream(stream));
 }
 
 /* Float-activation ROCmFP4 GEMV (32 lanes split K): the kernel the int8
@@ -12420,6 +12458,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
 
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_nvfp4(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                     int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

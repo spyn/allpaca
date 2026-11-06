@@ -1080,6 +1080,11 @@ impl RpcRuntime {
                     info.ggml_type_id
                 ))));
             }
+            if tensor_scale_blocks_worker(file.nvfp4_tensor_scale(&name)) {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{name} has a per-tensor .scale, which rpc workers do not apply"
+                ))));
+            }
             let dims: Vec<u32> = info.dims.iter().map(|&d| d as u32).collect();
             let bytes = file.tensor_bytes(&name)?;
             self.h2d_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -1512,6 +1517,14 @@ impl RpcRuntime {
                     tensor = suffix,
                     ggml_type = info.ggml_type_id,
                     "rpc packed layer skipped; worker has no gemm for this ggml type"
+                );
+                return Ok(None);
+            }
+            if tensor_scale_blocks_worker(file.nvfp4_tensor_scale(&info.name)) {
+                tracing::warn!(
+                    layer_idx,
+                    tensor = suffix,
+                    "rpc packed layer skipped; the tensor has a per-tensor .scale a worker would not apply"
                 );
                 return Ok(None);
             }
@@ -2309,6 +2322,18 @@ fn gemm_nk(info: &allpaca_gguf::TensorInfo) -> Option<(usize, usize)> {
     Some((n_el / k, k))
 }
 
+/// A GGUF `<name>.scale` tensor (NVFP4 files, also after conversion to
+/// ROCmFP4) is a per-tensor output multiplier that the coordinator applies
+/// itself. A worker gets raw weight bytes and would silently skip it, so a
+/// scaled tensor is not placed on a worker.
+fn tensor_scale_blocks_worker(scale: Result<Option<f32>, AllpacaError>) -> bool {
+    match scale {
+        Ok(None) => false,
+        Ok(Some(s)) => s != 1.0,
+        Err(_) => true,
+    }
+}
+
 fn worker_accepts_type(backend: RpcBackendKind, ty: u32) -> bool {
     let hip = matches!(ty, 0 | 1 | 8 | 12 | 13 | 14 | 30 | 34 | 35 | 39 | 100 | 101);
     match backend {
@@ -2468,5 +2493,19 @@ mod tests {
         assert_eq!(pinned_budget(&[8332, 0], 0), Some(8332 << 20));
         assert_eq!(pinned_budget(&[8332, 0], 1), None);
         assert_eq!(pinned_budget(&[8332], 1), None);
+    }
+}
+
+#[cfg(test)]
+mod tensor_scale_tests {
+    use super::*;
+
+    /// A `.scale` that is not 1 (or cannot be read) keeps a tensor off a worker.
+    #[test]
+    fn a_per_tensor_scale_keeps_a_tensor_off_rpc_workers() {
+        assert!(!tensor_scale_blocks_worker(Ok(None)));
+        assert!(!tensor_scale_blocks_worker(Ok(Some(1.0))));
+        assert!(tensor_scale_blocks_worker(Ok(Some(3.1e-4))));
+        assert!(tensor_scale_blocks_worker(Err(AllpacaError::Fatal(FatalError::ModelLoad("x".into())))));
     }
 }
