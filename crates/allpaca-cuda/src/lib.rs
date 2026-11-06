@@ -5854,6 +5854,12 @@ mod tests {
             (3, 2049, 4, 4, 64, true),
             (2, 700, 4, 1, 128, false),
             (9, 513, 2, 2, 96, true),
+            // Chunk counts with three or more set bits (7, 11, 13), where a
+            // fold tree built another way gives other bits, and a deep one (129).
+            (4, 850, 4, 2, 128, true),
+            (3, 1400, 8, 2, 64, false),
+            (5, 1650, 4, 4, 128, true),
+            (2, 16500, 4, 2, 64, true),
         ];
         for (si, (n_q, n_kv, n_heads, n_kv_heads, head_dim, causal)) in
             shapes.iter().copied().enumerate()

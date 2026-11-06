@@ -199,11 +199,11 @@ fn arch_base(arch: &str) -> &str {
     arch.split(':').next().unwrap_or(arch)
 }
 
-/// `sdot4` on CDNA, `sudot4` on RDNA3/RDNA4, otherwise the scalar product.
+/// `sdot4` on CDNA, `sudot4` on RDNA3/RDNA3.5/RDNA4, otherwise the scalar product.
 pub fn dot4_family(arch: &str) -> &'static str {
     match arch_base(arch) {
         "gfx906" | "gfx908" | "gfx90a" | "gfx942" => "sdot4",
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1200" | "gfx1201" => "sudot4",
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" | "gfx1200" | "gfx1201" => "sudot4",
         _ => "scalar",
     }
 }
@@ -349,6 +349,7 @@ mod tests {
         assert_eq!(dot4_family("gfx1201"), "sudot4");
         assert_eq!(dot4_family("gfx1200:sramecc-:xnack-"), "sudot4");
         assert_eq!(dot4_family("gfx906:sramecc+:xnack-"), "sdot4");
+        assert_eq!(dot4_family("gfx1151"), "sudot4");
         warn_dot4_if_scalar("gfx1201");
         assert!(!warned(Fallback::Dot4Scalar));
         warn_dot4_if_scalar("gfx900");

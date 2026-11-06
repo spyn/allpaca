@@ -372,6 +372,7 @@ fn load_edge0_weights(
         layer_capture: Default::default(),
         hosted_moe_compat: false,
         shexp_early: crate::model::shexp_early_from_env(),
+        route_tail: Default::default(),
         dsv4: None,
         q4x: None,
         g4: None,

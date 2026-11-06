@@ -675,6 +675,9 @@ enum WeightKind {
     RocmFp4Fast,
     /// MoESQ paired-4:8 sparse FP4 (tensor type 200): 12-byte blocks.
     P48Fp4,
+    /// NVFP4 (ggml type 40) re-packed at load: 20-byte blocks of 32 weights,
+    /// f16 scales with the tensor `.scale` folded in (`repack_nvfp4_dev`).
+    Nvfp4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -682,6 +685,9 @@ struct WeightRef {
     off: usize,
     n: usize,
     kind: WeightKind,
+    /// Per-tensor output multiplier from a GGUF `<name>.scale` tensor (NVFP4
+    /// files, also after conversion to ROCmFP4); 1.0 when there is none.
+    scale: f32,
 }
 
 impl WeightRef {
@@ -690,6 +696,7 @@ impl WeightRef {
             off,
             n,
             kind: WeightKind::F32,
+            scale: 1.0,
         }
     }
 
@@ -2425,6 +2432,7 @@ impl ResidentModel {
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4
             | WeightKind::RocmFp4Fast
+            | WeightKind::Nvfp4
             | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
@@ -2477,7 +2485,14 @@ impl ResidentModel {
             WeightKind::P48Fp4 => {
                 hip.gemm_nt_p48fp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::Nvfp4 => {
+                hip.gemm_nt_nvfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
+        }?;
+        if w.scale != 1.0 {
+            hip.scale_f32(c, m as usize * n as usize, w.scale)?;
         }
+        Ok(())
     }
 
     fn embed_gather(
@@ -2513,6 +2528,7 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Nvfp4
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -2564,6 +2580,7 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Nvfp4
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -3917,11 +3934,23 @@ fn append_gguf_lm_head<'a>(
         off: *off,
         n,
         kind: WeightKind::Q4_0,
+        scale: 1.0,
     };
     *off += part.len();
     tracing::info!(tensor = name, bytes = part.len(), "MTP draft LM head staged as Q4_0");
     parts.push(part);
     Ok(w)
+}
+
+/// An NVFP4 weight runs through the native device GEMV (re-packed at load)
+/// when it is big, whole 64-weight blocks per row, and `ALLPACA_NVFP4_Q8=1` is
+/// not set (that keeps the Q8_0 re-pack, for A/B).
+fn nvfp4_native(info: &allpaca_gguf::TensorInfo) -> bool {
+    let k = info.dims.first().copied().unwrap_or(0) as usize;
+    info.n_elements() > 65_536
+        && k != 0
+        && k % allpaca_cpu::NVFP4_BLOCK_ELEMS == 0
+        && std::env::var("ALLPACA_NVFP4_Q8").map_or(true, |v| v != "1")
 }
 
 /// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
@@ -3947,6 +3976,9 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
             | T::IQ3_XXS
             | T::IQ1_S
             | T::IQ1_M
+            // NVFP4 weights (with their `.scale` folded in by `tensor_f32`)
+            // land within half a Q8_0 step of the FP4 grid.
+            | T::Nvfp4
     )
 }
 
@@ -4017,6 +4049,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast | T::P48Fp4 => {
             info.nbytes() as u64
         }
+        T::Nvfp4 if nvfp4_native(info) => n / 32 * allpaca_cpu::NVFP4_DEV_BLOCK_BYTES as u64,
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
         T::Q8_0 | T::RocmFpxQ8 => q8_staged,
         ty if rocmfpx_as_f16(ty) => n * 2,
@@ -4199,6 +4232,11 @@ fn append_gguf_tensor_as<'a>(
                 } else {
                     allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
                 }
+                if let Some(scale) = file.nvfp4_tensor_scale(name)? {
+                    for v in &mut f32s {
+                        *v *= scale;
+                    }
+                }
                 let mut bytes = Vec::with_capacity(n * 4);
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -4322,6 +4360,18 @@ fn append_gguf_tensor_as<'a>(
             }
             (UploadPart::Owned(bytes), WeightKind::F16)
         }
+        allpaca_gguf::GgmlType::Nvfp4 if !gather && nvfp4_native(info) => {
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if n % k != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "NVFP4 GEMV {name} dims {:?} do not tile n={n}",
+                    info.dims
+                ))));
+            }
+            let scale = file.nvfp4_tensor_scale(name)?.unwrap_or(1.0);
+            let dev = allpaca_cpu::repack_nvfp4_dev(file.tensor_bytes(name)?, n, scale)?;
+            (UploadPart::Owned(dev), WeightKind::Nvfp4)
+        }
         ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
             let k = *info.dims.first().unwrap_or(&1) as usize;
             if k == 0 || k % 32 != 0 || n % k != 0 {
@@ -4357,7 +4407,17 @@ fn append_gguf_tensor_as<'a>(
         parts.push(UploadPart::Owned(vec![0u8; pad]));
         *off += pad;
     }
-    let w = WeightRef { off: *off, n, kind };
+    let scale = if matches!(kind, WeightKind::RocmFp4 | WeightKind::RocmFp4Fast) {
+        file.nvfp4_tensor_scale(name)?.unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    let w = WeightRef {
+        off: *off,
+        n,
+        kind,
+        scale,
+    };
     *off += part.len();
     parts.push(part);
     Ok(w)
@@ -4383,16 +4443,19 @@ fn split_fused_qkv_ref(
         off: fused.off,
         n: q_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     let k = WeightRef {
         off: q.off + q_out * row_bytes,
         n: kv_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     let v = WeightRef {
         off: k.off + kv_out * row_bytes,
         n: kv_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     Ok([q, k, v])
 }
@@ -4445,6 +4508,11 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS).saturating_mul(block_bytes)
+        }
+        WeightKind::Nvfp4 => {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "{what}: NVFP4 experts have no device kernel yet; set ALLPACA_NVFP4_Q8=1"
+            ))));
         }
         WeightKind::P48Fp4 => {
             if n_per % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {
@@ -4534,6 +4602,7 @@ fn split_packed_experts(
             off: w.off + e * stride,
             n: n_per,
             kind: w.kind,
+            scale: w.scale,
         })
         .collect())
 }
@@ -4728,6 +4797,8 @@ pub struct TinyModel {
     /// the same inputs, so output is unchanged. Read at load from
     /// [`SHEXP_EARLY_ENV`]; `0` keeps the old order (board task P8).
     pub shexp_early: bool,
+    /// Strata route-tail skip. Off by default; set from Engine config at load.
+    pub(crate) route_tail: crate::route_tail::Policy,
 }
 
 /// `ALLPACA_SHEXP_EARLY=0` keeps a MoE layer's shared expert behind its
@@ -4919,6 +4990,7 @@ impl TinyModel {
             layer_capture: Default::default(),
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
+            route_tail: Default::default(),
         }
     }
 
@@ -7485,6 +7557,7 @@ impl TinyModel {
             layer_capture: Default::default(),
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
+            route_tail: Default::default(),
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7650,6 +7723,7 @@ impl TinyModel {
             layer_capture: Default::default(),
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
+            route_tail: Default::default(),
         }
     }
 
@@ -7790,6 +7864,7 @@ impl TinyModel {
             layer_capture: Default::default(),
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
+            route_tail: Default::default(),
         })
     }
 
@@ -7909,6 +7984,7 @@ impl TinyModel {
             layer_capture: Default::default(),
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
+            route_tail: Default::default(),
         })
     }
 
@@ -10513,14 +10589,18 @@ impl TinyModel {
         vision: Option<&VisionSeq>,
         hidden_rows: Option<&mut [f32]>,
     ) -> Result<(), AllpacaError> {
-        // Remote RPC prefill must use the same row arithmetic on every worker
-        // arch; a local tensor split keeps its existing single-machine path.
-        // Expert-parallel counts: without exact rows its local prefill takes
-        // the BLAS/WMMA paths, and those changed text from run to run. MoE
-        // models also take exact rows when nothing is remote: Ling-mini's
-        // local prefill changed text between fresh starts without it (S2).
+        // Every prefill takes exact rows: each row of a wide GEMM equals that
+        // row computed alone, so the bits don't depend on where layers run.
+        // RPC workers compute rows that way (`serve_connection_ext`); with the
+        // BLAS/WMMA paths here, attaching a worker changed the local layers'
+        // bits too, and Qwen3.8 text with them (Q23). MoE models needed it
+        // with nothing remote as well: Ling-mini's local prefill changed
+        // text between fresh starts without it (S2). The one exception is the
+        // opt-in `experimental.row_variant_kernels` prefill of a dense model
+        // with nothing remote, which exists to run the WMMA tiles instead.
         let moe = self.config.n_experts > 0;
-        let _exact_rows = (moe || self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote()))
+        let remote = self.rpc.as_ref().is_some_and(|rpc| rpc.sends_work_remote());
+        let _exact_rows = (moe || remote || !allpaca_hip::prefill_wmma_active())
             .then(allpaca_hip::ExactRows::enable);
         let cfg = &self.config;
         if segs.is_empty()

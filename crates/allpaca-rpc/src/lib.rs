@@ -808,7 +808,7 @@ mod tests {
         // Attention: decode (one row), prefill (many rows), both sides of a
         // chunk, GQA, and head dims off the float4 path and past shared memory.
         let shapes = [(24usize, 24usize, 128usize), (8, 2, 64), (12, 12, 32), (6, 6, 256), (4, 4, 30), (2, 2, 512)];
-        let lengths = [(1usize, 1usize), (1, 2), (1, 8), (1, 15), (1, 16), (1, 17), (1, 21), (1, 127), (1, 128), (1, 129), (1, 257), (1, 300), (2, 2), (9, 9), (21, 21), (21, 300), (130, 130)];
+        let lengths = [(1usize, 1usize), (1, 2), (1, 8), (1, 15), (1, 16), (1, 17), (1, 21), (1, 127), (1, 128), (1, 129), (1, 257), (1, 300), (2, 2), (9, 9), (21, 21), (21, 300), (130, 130), (1, 1700), (6, 1700)];
         for (a_heads, a_kv, hd_a) in shapes {
             let (q_row, k_row) = (a_heads * hd_a, a_kv * hd_a);
             for (rows, n_kv) in lengths {
@@ -1013,7 +1013,9 @@ mod tests {
     }
 
     /// Every dense-layer op gives these bits on every backend: RX 9070, RX
-    /// 9060 XT, MI50 and a K80 (sm_37). A last-bit difference is not harmless:
+    /// 9060 XT, MI50 and a K80 (sm_37); re-pinned in Q21 (tree fold of
+    /// attention chunks, 1700-key rows added) on the RX 9070, Radeon 8060S
+    /// (gfx1151) and RTX 3070 Ti, which agreed. A last-bit difference is not harmless:
     /// the int8 activations in the K-quant GEMV turn it into a 1% difference
     /// within a few layers (S1). A change that moves this number has to move
     /// it on HIP and CUDA alike; re-pin it after checking both agree.
@@ -1034,7 +1036,7 @@ mod tests {
         let all = digests.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
         });
-        assert_eq!(all, 0x1bb6_909a_8b8e_f82b, "dense-layer bits changed: {all:#018x}");
+        assert_eq!(all, 0x0ecc_099c_86d1_8be3, "dense-layer bits changed: {all:#018x}");
     }
 
     /// Expert tensor types, sizes, and the allowed error relative to the
@@ -1191,6 +1193,72 @@ mod tests {
             results.iter().all(|r| r.ends_with("Ok(())")),
             "{results:#?}"
         );
+    }
+
+    /// A wide GEMM on a worker gives each row the bits of that row computed
+    /// alone, as the coordinator's own prefill does (Q23). Without it the
+    /// worker's 128-row prefill spans took the tiled / BLAS GEMMs, so moving a
+    /// layer to a worker changed Qwen3.8's text.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn worker_wide_gemm_rows_equal_rows_alone() {
+        if allpaca_hip::device_count() <= 0 {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_connection(stream, WorkerBackend::Hip(HipWorker::new(0).unwrap())).unwrap();
+        });
+        let mut c = RpcSession::connect_addr(&addr.to_string()).unwrap();
+        let mat = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((((i * 2654435761usize) ^ (seed * 40503)) % 1000) as f32 - 500.0) * 0.002).collect()
+        };
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let gemm = |c: &mut RpcSession, a_rows: &[f32], w: BufId, m: usize, n: usize, k: usize| -> Vec<f32> {
+            let (a, y) = (c.alloc((m * k * 4) as u64).unwrap(), c.alloc((m * n * 4) as u64).unwrap());
+            c.h2d(a, 0, &bytes(a_rows)).unwrap();
+            c.launch(&LaunchList {
+                items: vec![LaunchItem {
+                    op: KernelOp::GemmNtQuant,
+                    bufs: vec![a, w, y],
+                    i32s: vec![m as i32, n as i32, k as i32],
+                    f32s: vec![],
+                }],
+            })
+            .unwrap();
+            c.sync().unwrap();
+            let v = c
+                .d2h(y, 0, (m * n * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            c.free(a).unwrap();
+            c.free(y).unwrap();
+            v
+        };
+        // Qwen3.8's prefill types: F32, Q8_0, Q5_K, Q6_K.
+        let (m, n, k) = (24usize, 512usize, 1024usize);
+        let x = mat(6, m * k);
+        for ty in [0u32, 8, 13, 14] {
+            let wm = mat(10 + ty as usize, n * k);
+            let packed = if ty == 0 { bytes(&wm) } else { quantize(ty, &wm) };
+            let w = c.put_tensor(ty, &[k as u32, n as u32], &packed, None).unwrap();
+            let wide = gemm(&mut c, &x, w, m, n, k);
+            for r in 0..m {
+                let alone = gemm(&mut c, &x[r * k..(r + 1) * k], w, 1, n, k);
+                let same = wide[r * n..(r + 1) * n]
+                    .iter()
+                    .zip(&alone)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "ggml type {ty}: row {r} of a {m}-row GEMM differs from the row alone");
+            }
+            c.free(w).unwrap();
+        }
+        drop(c);
+        worker.join().unwrap();
     }
 
     fn quantize(ty: u32, m: &[f32]) -> Vec<u8> {

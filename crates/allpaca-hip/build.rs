@@ -111,6 +111,54 @@ fn main() {
         println!("cargo:rustc-cfg=allpaca_direct_storage");
     }
     println!("cargo:rustc-cfg=allpaca_hip_runtime");
+    // The driver copy in System32 is found before PATH. On this machine that
+    // copy cannot link its blit kernels. The exe directory wins, and the HIP
+    // test binaries live in target/<profile>/deps.
+    pin_sdk_hip_dlls(&hip_root);
+}
+
+/// Copy the SDK HIP runtime next to test executables and binaries so Windows does not load
+/// `System32\amdhip64_7.dll`. Skips the copy when the destination is already
+/// the same size.
+fn pin_sdk_hip_dlls(hip_root: &Path) {
+    if !cfg!(windows) {
+        return;
+    }
+    let Ok(out) = env::var("OUT_DIR") else {
+        return;
+    };
+    // `deps` holds the test executables; the profile directory above it holds
+    // the binaries (`allpaca-server.exe`), which crash in System32's ROCm 10
+    // runtime when a fresh target directory has no pinned copy. Binaries get
+    // the runtime only: with SDK 7.1's `amd_comgr_3.dll` beside it as well,
+    // `allpaca-server.exe` crashes at startup on xeres (measured 2026-11-05).
+    let profile = PathBuf::from(out).join("../../..");
+    let deps = profile.join("deps");
+    if std::fs::create_dir_all(&deps).is_err() {
+        return;
+    }
+    let pins = [
+        (&deps, "amdhip64_7.dll"),
+        (&deps, "amd_comgr_3.dll"),
+        (&profile, "amdhip64_7.dll"),
+    ];
+    for (dir, name) in pins {
+        let src = hip_root.join("bin").join(name);
+        if !src.is_file() {
+            continue;
+        }
+        let dst = dir.join(name);
+        let same_len = match (src.metadata(), dst.metadata()) {
+            (Ok(a), Ok(b)) => a.len() == b.len(),
+            _ => false,
+        };
+        if same_len {
+            continue;
+        }
+        if let Err(e) = std::fs::copy(&src, &dst) {
+            println!("cargo:warning=could not pin {name} next to HIP test exes: {e}");
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -409,9 +457,10 @@ fn hip_looks_valid(root: &Path) -> bool {
 }
 
 /// Default fat binary when no live GPU is visible: Vega/GCN5 (MI50, Radeon VII,
-/// home Vega) plus the RDNA3/4 targets the kernels were first brought up on.
+/// home Vega), the RDNA3/4 targets the kernels were first brought up on, and
+/// gfx1151 (Strix Halo's Radeon 8060S, RDNA3.5).
 fn default_offload_arches() -> Vec<String> {
-    ["gfx906", "gfx900", "gfx1100", "gfx1200", "gfx1201"]
+    ["gfx906", "gfx900", "gfx1100", "gfx1151", "gfx1200", "gfx1201"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -438,6 +487,11 @@ fn gfx_arch_token(raw: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == ':')
         .collect();
+    // ROCm 7+ rocminfo also lists generic ISAs such as `gfx11-generic` and
+    // `gfx9-4-generic`; clang rejects the truncated `gfx11`, so skip them.
+    if rest[token.len()..].starts_with('-') {
+        return None;
+    }
     let base = token.split(':').next().unwrap_or("");
     if base.starts_with("gfx") && base.len() > 3 {
         Some(base.to_string())
@@ -526,9 +580,24 @@ fn apply_hip_env(cmd: &mut Command, hip_root: &Path) {
     if clang.join("clang++").is_file() || clang.join("clang++.exe").is_file() {
         cmd.env("HIP_CLANG_PATH", clang);
     }
-    if let Some(dir) = nested_device_lib_dir(hip_root) {
+    if let Some(dir) = device_bitcode_dir(hip_root) {
         cmd.env("DEVICE_LIB_PATH", dir);
     }
+}
+
+/// Bitcode directory hipcc should load.
+///
+/// Windows ROCm 7 keeps it at `<root>/amdgcn/bitcode` and does not search that
+/// path unless `DEVICE_LIB_PATH` is set. A `--rocm-device-lib-path` argument
+/// that contains spaces is split when hipcc reinvokes clang, so the root
+/// directory is passed only through the environment. The nested TheRock
+/// directory still goes on the hipcc command line as well.
+fn device_bitcode_dir(hip_root: &Path) -> Option<PathBuf> {
+    let root = hip_root.join("amdgcn").join("bitcode");
+    if root.is_dir() {
+        return Some(root);
+    }
+    nested_device_lib_dir(hip_root)
 }
 
 /// TheRock layouts (ROCm 10 tarball and wheels) keep the device bitcode under
@@ -580,9 +649,18 @@ fn try_hipcc(
         let vcvars = find_vcvars64()
             .ok_or_else(|| "vcvars64.bat not found (need MSVC for hipcc)".to_string())?;
         let bat = out.join("build_kernels.bat");
+        let device_lib_set = match device_bitcode_dir(hip_root) {
+            Some(dir) => {
+                // hipcc does not accept a forward slash in DEVICE_LIB_PATH.
+                let path = dir.display().to_string().replace('/', "\\");
+                format!("set \"DEVICE_LIB_PATH={path}\"\r\n")
+            }
+            None => String::new(),
+        };
         let script = format!(
-            "@echo off\r\ncall \"{vc}\"\r\n\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} {arches}\r\n",
+            "@echo off\r\ncall \"{vc}\"\r\n{device_lib_set}\"{hipcc}\" -c \"{src}\" -o \"{obj}\" -O2 -std=c++17 -I\"{inc}\"{extra} {arches}\r\n",
             vc = vcvars.display(),
+            device_lib_set = device_lib_set,
             hipcc = hipcc.display(),
             src = src.display(),
             obj = obj.display(),

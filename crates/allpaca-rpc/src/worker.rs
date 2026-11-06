@@ -2436,6 +2436,10 @@ pub fn serve_connection_ext<S: Read + Write>(
     expected_token: Option<&str>,
     extensions: Vec<Box<dyn Extension>>,
 ) -> Result<(), RpcError> {
+    // Row-exact GEMMs for the whole connection: a row span must give the
+    // bits the coordinator's own prefill gives (it runs exact rows too), so
+    // where a layer runs never changes the text (Q23). A no-op without HIP.
+    let _exact_rows = allpaca_hip::ExactRows::enable();
     let mut extensions = extensions;
     let mut saw_hello = false;
     loop {

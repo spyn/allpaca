@@ -7,7 +7,12 @@ mod kernels;
 mod kquant;
 mod lowbit;
 mod mxfp4_expert;
+mod nvfp4;
 mod p48fp4;
+pub use nvfp4::{
+    dequant_nvfp4, dequant_nvfp4_dev, repack_nvfp4_dev, NVFP4_BLOCK_BYTES, NVFP4_BLOCK_ELEMS,
+    NVFP4_DEV_BLOCK_BYTES, NVFP4_DEV_BLOCK_ELEMS,
+};
 mod rocmfpx;
 
 pub use iq3s::{dequant_iq3_s, IQ3_S_BLOCK_BYTES, IQ3_S_BLOCK_ELEMS};

@@ -231,17 +231,87 @@ fn e4m3(x: f32) -> f32 {
     value(best).copysign(x)
 }
 
+/// 2^ceil(log2(x)) for a positive normal `x`, read from the float's bits as
+/// DeepSeek's kernels do (inference/kernel.py `fast_round_scale`), so a value
+/// a hair above a power of two is never rounded down to it.
+fn pow2_ceil(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0);
+    2f32.powi(exp)
+}
+
 /// Round the first `nope` values of a key to FP8 (E4M3) with a power-of-two
 /// scale per 64 values, as the model's KV cache stores them.
 pub fn fp8_quantize(row: &mut [f32], nope: usize) {
+    const INV_MAX: f32 = 1.0 / 448.0;
     let nope = nope.min(row.len());
     for block in row[..nope].chunks_mut(64) {
         let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0e-4);
-        let scale = 2f32.powi((amax / 448.0).log2().ceil() as i32);
+        let scale = pow2_ceil(amax * INV_MAX);
         for v in block {
             *v = e4m3((*v / scale).clamp(-448.0, 448.0)) * scale;
         }
     }
+}
+
+/// Normalised Walsh-Hadamard transform in place (Sylvester order, scale
+/// n^-0.5), as `fast_hadamard_transform` does. Rows whose length is not a
+/// power of two are left alone.
+pub fn hadamard(row: &mut [f32]) {
+    let n = row.len();
+    if !n.is_power_of_two() {
+        return;
+    }
+    let mut h = 1;
+    while h < n {
+        for block in row.chunks_mut(2 * h) {
+            let (lo, hi) = block.split_at_mut(h);
+            for (a, b) in lo.iter_mut().zip(hi.iter_mut()) {
+                let (x, y) = (*a, *b);
+                *a = x + y;
+                *b = x - y;
+            }
+        }
+        h *= 2;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    row.iter_mut().for_each(|v| *v *= scale);
+}
+
+/// Round to FP4 (E2M1) with a power-of-two scale per 32 values, as
+/// DeepSeek's `fp4_act_quant` simulates it (ties to the even code).
+pub fn fp4_quantize(row: &mut [f32]) {
+    const GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    const INV_MAX: f32 = 1.0 / 6.0;
+    let nearest = |x: f32| {
+        let ax = x.abs();
+        let mut best = 0;
+        for (i, g) in GRID.iter().enumerate().skip(1) {
+            let (d, db) = ((ax - g).abs(), (ax - GRID[best]).abs());
+            if d < db || (d == db && i % 2 == 0) {
+                best = i;
+            }
+        }
+        GRID[best].copysign(x)
+    };
+    for block in row.chunks_mut(32) {
+        let amax = block
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()))
+            .max(6.0 * 2f32.powi(-126));
+        let scale = pow2_ceil(amax * INV_MAX);
+        for v in block {
+            *v = nearest((*v / scale).clamp(-6.0, 6.0)) * scale;
+        }
+    }
+}
+
+/// What DeepSeek-V4's indexer does to its queries and keys after RoPE: a
+/// Hadamard rotation, then FP4 rounding (its quantisation-aware training;
+/// inference/model.py `Indexer.forward` and `Compressor(rotate=True)`).
+pub fn index_qat(row: &mut [f32]) {
+    hadamard(row);
+    fp4_quantize(row);
 }
 
 /// How one compressor turns `ratio` tokens into a key.
@@ -256,6 +326,9 @@ pub struct PoolCfg<'a> {
     pub rope: &'a RopeTable,
     /// FP8-round this many leading dims of the key (0 = keep it exact).
     pub fp8_nope: usize,
+    /// The indexer's compressor: Hadamard-rotate and FP4-round the key
+    /// ([`index_qat`]).
+    pub index_qat: bool,
 }
 
 impl PoolCfg<'_> {
@@ -340,6 +413,9 @@ impl Pool {
         cfg.rope.rotate(&mut key, pos + 1 - ratio, false);
         if cfg.fp8_nope > 0 {
             fp8_quantize(&mut key, cfg.fp8_nope);
+        }
+        if cfg.index_qat {
+            index_qat(&mut key);
         }
         Ok(Some(key))
     }
@@ -576,6 +652,92 @@ mod tests {
     }
 
     #[test]
+    fn fp8_scale_is_the_exact_power_of_two_ceiling_of_amax_over_448() {
+        // DeepSeek's act_quant (inference/kernel.py fast_round_scale) takes
+        // ceil(log2(amax * (1/448))) from the float's bits. Just above
+        // amax = 1.75 that is 2^-7; a float log2 rounds to exactly -8 and
+        // picks 2^-8, which moves small values to a finer subnormal grid.
+        let mut row = vec![0.0f32; 64];
+        row[0] = 1.75 + 2f32.powi(-23);
+        row[1] = 5.0 * 2f32.powi(-19);
+        fp8_quantize(&mut row, 64);
+        // 5 * 2^-19 / 2^-7 = 0.625 * 2^-9 rounds to one E4M3 subnormal step.
+        assert_eq!(row[1], 2f32.powi(-16));
+        assert_eq!(row[0], 1.75);
+    }
+
+    #[test]
+    fn hadamard_matches_the_normalised_sylvester_matrix() {
+        // fast_hadamard_transform(x, scale=n^-0.5): H[i][j] = (-1)^popcount(i & j).
+        let x: Vec<f32> = (0..8).map(|i| i as f32 * 0.5 - 1.25).collect();
+        let want: Vec<f32> = (0..8u32)
+            .map(|i| {
+                (0..8u32)
+                    .map(|j| if (i & j).count_ones() % 2 == 0 { x[j as usize] } else { -x[j as usize] })
+                    .sum::<f32>()
+                    / 8f32.sqrt()
+            })
+            .collect();
+        let mut got = x.clone();
+        hadamard(&mut got);
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-6, "{got:?} vs {want:?}");
+        }
+    }
+
+    #[test]
+    fn fp4_rounds_each_32_block_to_e2m1_at_a_power_of_two_scale() {
+        // inference/kernel.py fp4_quant_kernel: scale 2^ceil(log2(amax / 6))
+        // per 32 values, values rounded to E2M1 {0, .5, 1, 1.5, 2, 3, 4, 6},
+        // ties to the even code.
+        let mut row = vec![0.0f32; 64];
+        row[..6].copy_from_slice(&[6.0, 2.6, -0.25, 0.75, 5.0, 1.25]);
+        row[32] = 0.3; // amax 0.3: scale 2^ceil(log2(0.05)) = 1/16
+        row[33] = 0.1;
+        fp4_quantize(&mut row);
+        assert_eq!(&row[..6], &[6.0, 3.0, 0.0, 1.0, 4.0, 1.0]);
+        assert_eq!(row[32], 4.0 / 16.0);
+        assert_eq!(row[33], 1.5 / 16.0);
+    }
+
+    #[test]
+    fn index_compressor_keys_are_hadamard_rotated_and_fp4_rounded() {
+        // inference/model.py Compressor(rotate=True), the indexer's: after the
+        // norm and RoPE, `rotate_activation` then `fp4_act_quant`.
+        let (ratio, head, n_tok) = (4usize, 64usize, 8usize);
+        let width = 2 * head;
+        let (kv, score, ape) = (noise(n_tok * width, 4), noise(n_tok * width, 5), noise(ratio * width, 6));
+        let norm = vec![1.0f32; head];
+        let rope = RopeTable::plain(10000.0, 8);
+        let cfg = PoolCfg {
+            ratio,
+            head,
+            ape: &ape,
+            norm: &norm,
+            eps: 1e-6,
+            rope: &rope,
+            fp8_nope: 0,
+            index_qat: true,
+        };
+        let mut pool = Pool::default();
+        let mut got = Vec::new();
+        for t in 0..n_tok {
+            let at = t * width..(t + 1) * width;
+            got.extend(pool.push(&cfg, t, &kv[at.clone()], &score[at]).unwrap());
+        }
+        let want = pool_groups(&kv, &score, &ape, ratio, head, n_tok);
+        assert_eq!(got.len(), want.len());
+        for (g, (key, pooled)) in got.iter().zip(&want).enumerate() {
+            let mut expect = vec![0.0f32; head];
+            rmsnorm(pooled, &norm, 1e-6, &mut expect).unwrap();
+            rope.rotate(&mut expect, g * ratio, false);
+            hadamard(&mut expect);
+            fp4_quantize(&mut expect);
+            assert_eq!(key, &expect, "group {g}");
+        }
+    }
+
+    #[test]
     fn yarn_table_keeps_fast_pairs_and_scales_slow_ones() {
         // DeepSeek-V4-Flash: 64 rotated dims, base 160000, factor 16, 64k
         // original context: correction dims 15 and 25.
@@ -666,6 +828,7 @@ mod tests {
                 eps: 1e-6,
                 rope: &rope,
                 fp8_nope: 0,
+                index_qat: false,
             };
             let mut pool = Pool::default();
             let mut got = Vec::new();
@@ -722,21 +885,23 @@ mod tests {
     use crate::KvTierManager;
 
     fn tiny(window: u32, compress_ratios: &[u32], top_k: u32) -> TinyModel {
+        tiny_with(&TinyDsv4Ctx {
+            window,
+            compress_ratios: compress_ratios.to_vec(),
+            top_k,
+            swiglu_clamp: 0.0,
+            swiglu_clamp_shexp: 0.0,
+        })
+    }
+
+    fn tiny_with(opts: &TinyDsv4Ctx) -> TinyModel {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "allpaca_tiny_dsv4_ctx-{}-{}.gguf",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        write_tiny_deepseek4_ctx_gguf(
-            &path,
-            &TinyDsv4Ctx {
-                window,
-                compress_ratios: compress_ratios.to_vec(),
-                top_k,
-                swiglu_clamp: 0.0,
-            },
-        );
+        write_tiny_deepseek4_ctx_gguf(&path, opts);
         let file = std::sync::Arc::new(GgufFile::open(&path).expect("open tiny dsv4"));
         let mut model = TinyModel::from_gguf(&file).expect("model");
         model.bind_gguf(file);
@@ -894,6 +1059,34 @@ mod tests {
         let tokens = [3u32, 4, 5, 6, 7, 3, 5, 4, 6, 7, 4, 3, 5];
         let (a, b) = (one_by_one(&all, &tokens), one_by_one(&top1, &tokens));
         assert!(max_diff(&a, &b) > 1e-4, "{}", max_diff(&a, &b));
+    }
+
+    #[test]
+    fn shared_expert_clamp_applies_to_decode_and_prefill_alike() {
+        // DeepSeek-V4 caps the shared expert's SwiGLU too (inference/model.py
+        // builds `shared_experts` with `swiglu_limit`); the file carries it as
+        // `swiglu_clamp_shexp`. A tight cap must change the logits the same way
+        // whether the prompt is decoded token by token or forwarded at once.
+        let with_cap = |limit: f32| {
+            tiny_with(&TinyDsv4Ctx {
+                window: 3,
+                compress_ratios: vec![0, 4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: limit,
+            })
+        };
+        let tokens = [3u32, 4, 5, 6, 7, 3, 4];
+        let (free, capped) = (with_cap(0.0), with_cap(1.0e-3));
+        let free_one = one_by_one(&free, &tokens);
+        let capped_one = one_by_one(&capped, &tokens);
+        let capped_chunk = last_logits(&capped, &tokens, &[tokens.len()]);
+        assert!(max_diff(&free_one, &capped_one) > 1e-4, "decode ignores the cap");
+        assert!(
+            max_diff(&capped_one, &capped_chunk) < 1e-3,
+            "prefill and decode disagree: {}",
+            max_diff(&capped_one, &capped_chunk)
+        );
     }
 
     #[test]

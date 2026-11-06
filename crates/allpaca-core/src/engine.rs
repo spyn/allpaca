@@ -42,7 +42,7 @@ use crate::model::{
     TinyModel,
 };
 use crate::packed::{temp_pack_path, HostExpertPool, PackedStore};
-use crate::sampling::{rng_from_params, sample};
+use crate::sampling::{rng_from_params, sample, sample_with_draft};
 use crate::scheduler::Scheduler;
 use crate::telemetry::{GpuSampler, Metrics};
 use crate::tokenizer::EngineTokenizer;
@@ -134,6 +134,10 @@ struct ActiveRequest {
     vision: Arc<crate::model::VisionSeq>,
     /// When vision encode landed on the draft GPU, skip draft propose for this Request.
     suppress_draft: bool,
+    /// Per-draft `q` for Leviathan rejection (P14). Empty means exact-match
+    /// verify: DFlash2/DSpark, or `experimental.rejection_sampling` off.
+    /// Greedy drafters store one-hot `(token, 1.0)` so T = 0 stays bit-identical.
+    draft_q: Vec<Vec<(u32, f32)>>,
 }
 
 /// What one [`Engine::poll_for`] tick yielded for the calling Request.
@@ -251,6 +255,8 @@ struct EngineInner {
     elastic_last_misses: u64,
     /// Optional vision encoder (placement + encode); text-only ignores it.
     vision_encoder: Option<Arc<dyn crate::VisionEncoder>>,
+    /// Copied from `config.experimental.rejection_sampling` (P14).
+    rejection_sampling: bool,
 }
 
 struct DraftAhead {
@@ -755,6 +761,7 @@ impl Engine {
             elastic_rebalance_pending: false,
             elastic_last_misses: 0,
             vision_encoder: None,
+            rejection_sampling: config.experimental.rejection_sampling,
         };
         let engine = Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -1588,6 +1595,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
         inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
+        self.apply_route_tail(&mut target);
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1598,6 +1606,7 @@ impl Engine {
                 "synthetic-draft",
             );
             self.apply_weight_working_set(&mut draft)?;
+            self.apply_route_tail(&mut draft);
             self.apply_expert_lru(&mut draft)?;
             inner.draft_model = Some(Arc::new(draft));
         }
@@ -1617,6 +1626,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::synthetic(vocab)?;
         inner.ring.resize_vocab(vocab);
         self.apply_weight_working_set(&mut target)?;
+        self.apply_route_tail(&mut target);
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1757,6 +1767,16 @@ impl Engine {
         }
         model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan)?);
         Ok(())
+    }
+
+    fn apply_route_tail(&self, model: &mut TinyModel) {
+        model.route_tail = crate::route_tail::Policy::from_experimental(
+            self.config.experimental.route_tail_skip,
+            self.config.experimental.route_tail_skip_rank,
+        );
+        if let Some(q4) = model.q4x.as_ref() {
+            q4.set_route_tail(model.route_tail);
+        }
     }
 
     fn apply_expert_lru(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
@@ -1996,6 +2016,7 @@ impl Engine {
         });
         model.name = loaded.tier.name().into();
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer =
@@ -2026,6 +2047,7 @@ impl Engine {
         let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2056,6 +2078,7 @@ impl Engine {
         let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2100,6 +2123,7 @@ impl Engine {
         }
         let skip_hip = model.dsv4.is_some() || model.q4x.is_some() || model.g4.is_some();
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
@@ -3421,6 +3445,7 @@ impl Engine {
                 deferred: None,
                 vision: Arc::new(vision_seq),
                 suppress_draft,
+                draft_q: Vec::new(),
             },
         );
         if self.config.structured_output.async_masks {
@@ -6510,6 +6535,72 @@ fn mtp_process_assumed_span(
     Ok(())
 }
 
+/// Greedy-q for MTP / n-gram / draft-model (one-hot per drafted token).
+/// Empty `draft_q` leaves verify on exact match (DFlash2, DSpark, flag off).
+fn finish_propose(
+    inner: &mut EngineInner,
+    id: u64,
+    drafts: Vec<u32>,
+    skip_rejection: bool,
+) -> Vec<u32> {
+    let q = if inner.rejection_sampling && !skip_rejection && !drafts.is_empty() {
+        drafts.iter().map(|&t| vec![(t, 1.0)]).collect()
+    } else {
+        Vec::new()
+    };
+    if let Ok(req) = request_mut(inner, id) {
+        req.draft_q = q;
+    }
+    drafts
+}
+
+fn sample_request_with_draft(
+    inner: &mut EngineInner,
+    id: u64,
+    logits: &mut [f32],
+    mask: Option<&allpaca_types::TokenMask>,
+    draft_id: Option<u32>,
+    q_index: usize,
+) -> Result<(u32, bool), AllpacaError> {
+    let active = request_mut(inner, id)?;
+    let q = active
+        .draft_q
+        .get(q_index)
+        .filter(|s| !s.is_empty())
+        .cloned();
+    Ok(sample_with_draft(
+        logits,
+        mask,
+        &active.params,
+        &mut active.rng,
+        draft_id,
+        q.as_deref(),
+    ))
+}
+
+fn sample_pending_with_draft(
+    inner: &mut EngineInner,
+    id: u64,
+    mask: Option<&allpaca_types::TokenMask>,
+    draft_id: Option<u32>,
+    q_index: usize,
+) -> Result<(u32, bool), AllpacaError> {
+    let active = request_mut(inner, id)?;
+    let q = active
+        .draft_q
+        .get(q_index)
+        .filter(|s| !s.is_empty())
+        .cloned();
+    Ok(sample_with_draft(
+        &mut active.pending_logits,
+        mask,
+        &active.params,
+        &mut active.rng,
+        draft_id,
+        q.as_deref(),
+    ))
+}
+
 /// Drafts after a deferred correction `tok`: `[tok, d1, ..]`, or empty when no
 /// provider can continue past it. Any draft-ahead span predicted `tok`'s slot
 /// from the pre-correction context and is dropped.
@@ -6533,7 +6624,7 @@ fn propose_after_deferred(
                 let mut draft = vec![tok];
                 draft.extend(more);
                 host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
-                return Ok(draft);
+                return Ok(finish_propose(inner, id, draft, true));
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
@@ -6546,7 +6637,7 @@ fn propose_after_deferred(
         if draft.len() >= 2 {
             host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
         }
-        return Ok(draft);
+        return Ok(finish_propose(inner, id, draft, false));
     }
     if inner.flags.draft_model_speculation {
         if let Some(model) = inner.draft_model.clone() {
@@ -6577,7 +6668,7 @@ fn propose_after_deferred(
             }
             if draft.len() >= 2 {
                 host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
-                return Ok(draft);
+                return Ok(finish_propose(inner, id, draft, false));
             }
         }
     }
@@ -6588,10 +6679,10 @@ fn propose_after_deferred(
         if !more.is_empty() {
             let mut draft = vec![tok];
             draft.extend(more);
-            return Ok(draft);
+            return Ok(finish_propose(inner, id, draft, false));
         }
     }
-    Ok(Vec::new())
+    Ok(finish_propose(inner, id, Vec::new(), true))
 }
 
 fn propose_drafts(
@@ -6603,7 +6694,7 @@ fn propose_drafts(
     metrics: &Metrics,
 ) -> Result<Vec<u32>, AllpacaError> {
     if request(inner, id)?.suppress_draft {
-        return Ok(Vec::new());
+        return Ok(finish_propose(inner, id, Vec::new(), true));
     }
     let ctx = request(inner, id)?.tokens.clone();
     if let Some(tok) = request(inner, id)?.deferred {
@@ -6615,7 +6706,7 @@ fn propose_drafts(
                 .draft_ahead_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             host_stage_draft_tokens(&ahead.tokens, draft_hip, metrics);
-            return Ok(ahead.tokens);
+            return Ok(finish_propose(inner, id, ahead.tokens, false));
         }
     }
     if let Some(provider) = inner.qwen4_mtp.as_mut() {
@@ -6623,13 +6714,13 @@ fn propose_drafts(
         if !draft.is_empty() {
             host_stage_draft_tokens(&draft, draft_hip, metrics);
         }
-        return Ok(draft);
+        return Ok(finish_propose(inner, id, draft, false));
     }
     if let Some(provider) = inner.dflash2.as_mut() {
         match provider.propose(&ctx, depth, temperature) {
             Ok(draft) if !draft.is_empty() => {
                 host_stage_draft_tokens(&draft, draft_hip, metrics);
-                return Ok(draft);
+                return Ok(finish_propose(inner, id, draft, true));
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "DFlash2 propose failed"),
@@ -6639,7 +6730,7 @@ fn propose_drafts(
         let draft = provider.propose(&ctx, depth, temperature)?;
         if !draft.is_empty() {
             host_stage_draft_tokens(&draft, draft_hip, metrics);
-            return Ok(draft);
+            return Ok(finish_propose(inner, id, draft, true));
         }
     }
     if inner.flags.draft_model_speculation {
@@ -6692,14 +6783,15 @@ fn propose_drafts(
                     );
                 }
                 host_stage_draft_tokens(&draft, draft_hip, metrics);
-                return Ok(draft);
+                return Ok(finish_propose(inner, id, draft, false));
             }
         }
     }
     if inner.flags.ngram_speculation {
-        return inner.ngram.propose(&ctx, depth, temperature);
+        let draft = inner.ngram.propose(&ctx, depth, temperature)?;
+        return Ok(finish_propose(inner, id, draft, false));
     }
-    Ok(Vec::new())
+    Ok(finish_propose(inner, id, Vec::new(), true))
 }
 
 /// Tokens (and only tokens) cross the device boundary via host. Weights stay put.
@@ -6885,16 +6977,13 @@ fn verify_and_sample(
         }
     }
     tap_pending_logits(inner, id)?;
-    let sampled = {
-        let active = request_mut(inner, id)?;
-        sample(
-            &mut active.pending_logits,
-            mask,
-            &active.params,
-            &mut active.rng,
-        )
-    };
-    let first_match = drafts.first().copied() == Some(sampled);
+    let (sampled, first_match) = sample_pending_with_draft(
+        inner,
+        id,
+        mask,
+        drafts.first().copied(),
+        0,
+    )?;
     let stop = is_stop(sampled, &request(inner, id)?.params);
     if first_match && drafts.len() >= 2 && !stop && remaining > 1 {
         prefetch_draft_expert_union(inner, &drafts, metrics, hip, hooks)?;
@@ -6916,8 +7005,10 @@ fn verify_and_sample(
     let mut produced = vec![sampled];
     let mut accepted = u64::from(first_match);
     let mut draft_iter = drafts.into_iter().peekable();
+    let mut q_index = 0usize;
     if first_match {
         draft_iter.next();
+        q_index = 1;
     }
     append_and_forward(
         inner,
@@ -6956,20 +7047,18 @@ fn verify_and_sample(
             hip.wait_logits_d2h(&mut active.pending_logits)?;
         }
         tap_pending_logits(inner, id)?;
-        let sampled = {
-            let active = request_mut(inner, id)?;
-            sample(
-                &mut active.pending_logits,
-                mask,
-                &active.params,
-                &mut active.rng,
-            )
-        };
+        let (sampled, matched) = sample_pending_with_draft(
+            inner,
+            id,
+            mask,
+            draft_iter.peek().copied(),
+            q_index,
+        )?;
         produced.push(sampled);
-        let matched = draft_iter.peek().copied() == Some(sampled);
         if matched {
             accepted += 1;
             draft_iter.next();
+            q_index += 1;
         }
         append_and_forward(
             inner,
@@ -7448,12 +7537,16 @@ fn packed_linear_verify_span(
             }
             let off = i * vocab;
             let row = &mut row_logits[off..off + vocab];
-            let next = {
-                let active = request_mut(inner, id)?;
-                sample(row, mask, &active.params, &mut active.rng)
-            };
+            let (next, matched) = sample_request_with_draft(
+                inner,
+                id,
+                row,
+                mask,
+                span.get(i + 1).copied(),
+                i + 1,
+            )?;
             produced.push(next);
-            if next != span[i + 1] {
+            if !matched {
                 break;
             }
             accepted += 1;
@@ -7602,12 +7695,16 @@ fn accept_span(
         }
         let off = i * vocab;
         let row = &mut row_logits[off..off + vocab];
-        let next = {
-            let active = request_mut(inner, id)?;
-            sample(row, mask, &active.params, &mut active.rng)
-        };
+        let (next, matched) = sample_request_with_draft(
+            inner,
+            id,
+            row,
+            mask,
+            span.get(i + 1).copied(),
+            i + 1,
+        )?;
         produced.push(next);
-        if next == span[i + 1] {
+        if matched {
             accepted += 1;
             keep = i + 2;
         } else {
@@ -12519,6 +12616,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejection_sampling_greedy_matches_flag_off() {
+        let params = GenerationParams {
+            max_tokens: 8,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+
+        let mut on = test_config();
+        on.features.ngram_speculation = Some(true);
+        on.experimental.rejection_sampling = true;
+        let engine_on = Engine::new(on).unwrap();
+        let out_on = engine_on.generate("hello", params.clone()).unwrap();
+        assert!(
+            engine_on.stats().draft_proposed > 0,
+            "ngram must propose under rejection sampling"
+        );
+
+        let mut off = test_config();
+        off.features.ngram_speculation = Some(true);
+        off.experimental.rejection_sampling = false;
+        let engine_off = Engine::new(off).unwrap();
+        let out_off = engine_off.generate("hello", params.clone()).unwrap();
+
+        let mut no_spec = test_config();
+        no_spec.merge_cli(&CliOverrides {
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        no_spec.experimental.rejection_sampling = true;
+        let baseline = Engine::new(no_spec).unwrap();
+        let out_base = baseline.generate("hello", params).unwrap();
+
+        assert_eq!(
+            out_on.token_ids, out_off.token_ids,
+            "T = 0 with rejection_sampling on must stay bit-identical to the flag off"
+        );
+        assert_eq!(
+            out_on.token_ids, out_base.token_ids,
+            "T = 0 with rejection_sampling on must stay bit-identical to no-spec"
+        );
+    }
+
+    #[test]
+    fn rejection_sampling_token_frequencies_match_plain_decode() {
+        let mut spec_cfg = test_config();
+        spec_cfg.features.ngram_speculation = Some(true);
+        spec_cfg.experimental.rejection_sampling = true;
+        spec_cfg.sampling.temperature = 0.7;
+        let spec_engine = Engine::new(spec_cfg).unwrap();
+
+        let mut plain_cfg = test_config();
+        plain_cfg.merge_cli(&CliOverrides {
+            speculative: Some(false),
+            ..CliOverrides::default()
+        });
+        plain_cfg.experimental.rejection_sampling = true;
+        plain_cfg.sampling.temperature = 0.7;
+        let plain_engine = Engine::new(plain_cfg).unwrap();
+
+        let n = 400u32;
+        let mut spec_counts = HashMap::new();
+        let mut plain_counts = HashMap::new();
+        for seed in 0..n {
+            let params = GenerationParams {
+                max_tokens: 1,
+                temperature: 0.7,
+                seed: Some(u64::from(seed)),
+                top_k: 0,
+                top_p: 1.0,
+                ..GenerationParams::default()
+            };
+            let spec_ids = spec_engine.generate("hello", params.clone()).unwrap().token_ids;
+            let plain_ids = plain_engine.generate("hello", params).unwrap().token_ids;
+            if let Some(&tok) = spec_ids.first() {
+                *spec_counts.entry(tok).or_insert(0u32) += 1;
+            }
+            if let Some(&tok) = plain_ids.first() {
+                *plain_counts.entry(tok).or_insert(0u32) += 1;
+            }
+        }
+        let spec_n: u32 = spec_counts.values().sum();
+        let plain_n: u32 = plain_counts.values().sum();
+        assert_eq!(spec_n, n);
+        assert_eq!(plain_n, n);
+        for tok in spec_counts.keys().copied().chain(plain_counts.keys().copied()) {
+            let f_spec = spec_counts.get(&tok).copied().unwrap_or(0) as f32 / n as f32;
+            let f_plain = plain_counts.get(&tok).copied().unwrap_or(0) as f32 / n as f32;
+            assert!(
+                (f_spec - f_plain).abs() < 0.10,
+                "tok {tok}: spec={f_spec} plain={f_plain} spec_n={} plain_n={}",
+                spec_counts.get(&tok).copied().unwrap_or(0),
+                plain_counts.get(&tok).copied().unwrap_or(0)
+            );
+        }
+    }
+
     fn is_special_token(piece: &str) -> bool {
         piece.starts_with('<') && piece.ends_with('>')
     }
@@ -13701,6 +13896,48 @@ mod tests {
             .expect("tiny DeepSeek-V4 must generate");
         assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn route_tail_skip_on_matches_off_when_there_are_no_misses() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_rts-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let run = |on: bool| -> Vec<u32> {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only: true,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            cfg.speculative.enabled = false;
+            cfg.experimental.route_tail_skip = on;
+            let engine = Engine::new(cfg).expect("tiny DeepSeek-V4 must load");
+            engine
+                .generate(
+                    "hi",
+                    GenerationParams {
+                        max_tokens: 4,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .expect("tiny DeepSeek-V4 must generate")
+                .token_ids
+        };
+        let off = run(false);
+        let on = run(true);
+        let _ = std::fs::remove_file(path);
+        assert!(!off.is_empty(), "must emit tokens");
+        assert_eq!(off, on);
     }
 
     #[cfg(feature = "cuda")]

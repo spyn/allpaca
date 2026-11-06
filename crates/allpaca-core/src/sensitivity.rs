@@ -717,6 +717,39 @@ pub fn divergence_between(
     Ok(mean_divergence(&reference, &log_probs(&other, &texts, |_| None)?.0, vocab))
 }
 
+/// What the route-tail skip (`experimental.route_tail_skip`, rank `rank`) does
+/// to a `qwen4exp` model's predictions on `texts`: the mean `KL(exact ||
+/// skipped)` in nats per token, and the share of positions where both pick the
+/// same top token. Both runs are on the CPU host forward, where every expert
+/// counts as a miss. The skipped run feeds one token at a time, so each
+/// routing window is a single token, as in decode (the exact run is batched;
+/// the two agree bit for bit with the flag off). This is NOT an upper bound
+/// for production: it skips whatever the rank allows, but a real run skips
+/// only experts that miss the cache.
+pub fn route_tail_divergence(
+    model: &Path,
+    texts: &[&str],
+    max_tokens: usize,
+    rank: u32,
+) -> Result<(f64, f64), AllpacaError> {
+    let Probe { model, texts, reference, .. } = Probe::open(model, texts, max_tokens)?;
+    let q4 = model
+        .q4x
+        .as_ref()
+        .ok_or_else(|| bad("route-tail divergence: not a qwen4exp model"))?;
+    q4.set_route_tail(crate::route_tail::Policy::from_experimental(true, rank));
+    let vocab = model.config.vocab_size;
+    // One token per routing window, as in decode.
+    let mut now = Vec::with_capacity(reference.len());
+    for text in &texts {
+        now.extend(text_log_probs(&model, text, None)?.0);
+    }
+    let top = |row: &[f32]| row.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, v)| if *v > b.1 { (i, *v) } else { b }).0;
+    let positions = (reference.len() / vocab).max(1);
+    let agree = reference.chunks(vocab).zip(now.chunks(vocab)).filter(|(p, q)| top(p) == top(q)).count();
+    Ok((mean_divergence(&reference, &now, vocab), agree as f64 / positions as f64))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1209,5 +1242,21 @@ pub(crate) mod tests {
         }
         assert!(same < 1e-9, "{same}");
         assert!(d8 > 0.0 && d8 < d2, "8 bits {d8}, 2 bits {d2}");
+    }
+    /// The route-tail skip moves a qwen4exp model's predictions: KL above zero,
+    /// finite, and the top-token agreement is a share.
+    #[test]
+    fn route_tail_divergence_is_measured_on_a_qwen4exp_model() {
+        let path = std::env::temp_dir().join(format!("allpaca_probe_tail-{}.gguf", std::process::id()));
+        crate::qwen4exp::write_tiny_qwen4exp_gguf(&path);
+        let (kl, agree) =
+            route_tail_divergence(&path, &["hello a b c d a b", "c d hello a"], 16, 1).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(kl.is_finite() && kl > 1e-9, "the skip must move the predictions: {kl}");
+        assert!((0.0..=1.0).contains(&agree), "{agree}");
+        let plain = std::env::temp_dir().join(format!("allpaca_probe_tail2-{}.gguf", std::process::id()));
+        crate::calib::tests::write_tiny_calib_gguf(&plain, 64, 128);
+        assert!(route_tail_divergence(&plain, &["hello world again hello world"], 16, 1).is_err());
+        let _ = std::fs::remove_file(&plain);
     }
 }

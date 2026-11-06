@@ -1893,14 +1893,28 @@ __device__ __forceinline__ int attn_row_tmax(int qi, int n_q, int n_kv, int caus
 
 /* A row with more than ATTN_CHUNK keys: the keys split into chunks of
  * ATTN_CHUNK, each an online softmax from an empty state (sinks in chunk 0
- * only), folded in ascending order by attn_fold. Every kernel follows this
- * order, so a row's bits do not depend on which kernel computed it, and a row
- * with one chunk is exactly the single-pass result. Decode runs the chunks of
- * a long row in parallel (attention_split_gqa_kernel + attention_merge_kernel).
+ * only), folded by attn_fold in one fixed tree (see AttnFoldStack). Every
+ * kernel builds that tree, so a row's bits do not depend on which kernel
+ * computed it, and a row with one chunk is exactly the single-pass result.
+ * The chunking depends only on the keys a row sees, never on the device.
+ * Decode runs the chunks of a long row in parallel (attention_split_gqa_kernel,
+ * then attention_merge_pair_kernel for the tree's lowest levels and
+ * attention_merge_kernel for the rest).
  * Inside a chunk the keys go ATTN_KT at a time (attn_tile_step). 128 against
  * 256 took a 2051-key MI50 decode row from 217 to 141 us. */
 constexpr int ATTN_CHUNK = 128;
 static_assert(ATTN_CHUNK % ATTN_KT == 0, "chunks are whole key tiles");
+/* The fold tree: at stride s = 1, 2, 4, ... the partial at left + s folds into
+ * the one at left, for every left that is a multiple of 2s with left + s <
+ * n_chunks. The Q-tiled kernel meets the chunks one at a time and builds the
+ * same tree with a carry stack: push a chunk, fold while the top two spans are
+ * the same size, and at the end fold what is left right to left (left to right
+ * gives another tree whenever n_chunks has three or more set bits, e.g. 7).
+ * The stack proper (blocks past the register levels, see AttnFoldRegs) holds
+ * at most floor(log2(n_chunks >> reg)) + 2 partials: 16 entries cover
+ * 2^16 chunks (8M keys) with at least one register level. Past that the
+ * kernel traps rather than fold in another order. */
+constexpr int ATTN_FOLD_STACK = 16;
 /* Floats per (row, head, chunk) partial: every lane's accumulators, m, l.
  * Sized by the head_dim bucket so the scratch holds only what the launched
  * kernels write; the host launcher uses the same value for one call. */
@@ -1934,6 +1948,153 @@ __device__ __forceinline__ void attn_fold(float &m, float &l, float *acc, float 
         acc[i] = fmaf(acc[i], a, __fmul_rn(acc_b[i], b));
     }
     m = mm;
+}
+
+/* The carry stack of the fold tree (see ATTN_FOLD_STACK), one per warp lane.
+ * Its lowest attn_fold_reg<DPT>() levels (blocks of 1, 2, 4, ... chunks) sit
+ * in registers, indexed only by unrolled loops; bigger blocks go to the stack
+ * proper, which lives in scratch memory. With every block in scratch, the
+ * Q-tiled prefill of a 4096-key row took 7.5% longer on gfx1151; 4 levels
+ * brought it to about 1%. Wider rows keep fewer levels so the kernel's
+ * occupancy stays as it was (gfx1201: 16, 16 and 12 waves for DPT 4, 8, 16).
+ * The tree does not depend on the count. */
+constexpr int ATTN_FOLD_REG_MAX = 4;
+template <int DPT>
+__host__ __device__ constexpr int attn_fold_reg() {
+    return DPT <= 4 ? 4 : DPT <= 8 ? 2 : 1;
+}
+
+/* The register levels and the stack proper are separate objects: one
+ * object with both went wholly to scratch, register levels included. */
+template <int DPT>
+struct AttnFoldRegs {
+    float racc[ATTN_FOLD_REG_MAX][attn_row_dims<DPT>()];
+    float rm[ATTN_FOLD_REG_MAX];
+    float rl[ATTN_FOLD_REG_MAX];
+    bool has[ATTN_FOLD_REG_MAX];
+};
+
+template <int DPT>
+struct AttnFoldStack {
+    float acc[ATTN_FOLD_STACK][attn_row_dims<DPT>()];
+    float m[ATTN_FOLD_STACK];
+    float l[ATTN_FOLD_STACK];
+    int span[ATTN_FOLD_STACK];
+    int sp;
+};
+
+template <int DPT>
+__device__ __forceinline__ void attn_tree_init(AttnFoldRegs<DPT> &rg, AttnFoldStack<DPT> &st) {
+#pragma unroll
+    for (int i = 0; i < attn_fold_reg<DPT>(); ++i) {
+        rg.has[i] = false;
+    }
+    st.sp = 0;
+}
+
+/* True when the stack holds no chunk. */
+template <int DPT>
+__device__ __forceinline__ bool attn_tree_empty(const AttnFoldRegs<DPT> &rg, const AttnFoldStack<DPT> &st) {
+    bool any = st.sp > 0;
+#pragma unroll
+    for (int i = 0; i < attn_fold_reg<DPT>(); ++i) {
+        any = any || rg.has[i];
+    }
+    return !any;
+}
+
+/* Pushes one finished chunk: it carries up the register levels like a binary
+ * counter (each fold is older-left, newer-right), and a carry out of the top
+ * one goes to the stack proper, folding while its top two spans match. */
+template <int DPT>
+__device__ __forceinline__ void attn_tree_push(AttnFoldRegs<DPT> &rg, AttnFoldStack<DPT> &st, const AttnRow<DPT> &r) {
+    constexpr int dims = attn_row_dims<DPT>();
+    float cacc[dims];
+#pragma unroll
+    for (int j = 0; j < dims; ++j) {
+        cacc[j] = r.acc[j];
+    }
+    float cm = r.m;
+    float cl = r.l;
+    bool done = false;
+#pragma unroll
+    for (int i = 0; i < attn_fold_reg<DPT>(); ++i) {
+        if (!done) {
+            if (!rg.has[i]) {
+#pragma unroll
+                for (int j = 0; j < dims; ++j) {
+                    rg.racc[i][j] = cacc[j];
+                }
+                rg.rm[i] = cm;
+                rg.rl[i] = cl;
+                rg.has[i] = true;
+                done = true;
+            } else {
+                attn_fold<DPT>(rg.rm[i], rg.rl[i], rg.racc[i], cm, cl, cacc);
+#pragma unroll
+                for (int j = 0; j < dims; ++j) {
+                    cacc[j] = rg.racc[i][j];
+                }
+                cm = rg.rm[i];
+                cl = rg.rl[i];
+                rg.has[i] = false;
+            }
+        }
+    }
+    if (done) {
+        return;
+    }
+    if (st.sp >= ATTN_FOLD_STACK) {
+        __builtin_trap();
+    }
+    for (int j = 0; j < dims; ++j) {
+        st.acc[st.sp][j] = cacc[j];
+    }
+    st.m[st.sp] = cm;
+    st.l[st.sp] = cl;
+    st.span[st.sp] = 1 << attn_fold_reg<DPT>();
+    ++st.sp;
+    while (st.sp >= 2 && st.span[st.sp - 1] == st.span[st.sp - 2]) {
+        attn_fold<DPT>(st.m[st.sp - 2], st.l[st.sp - 2], st.acc[st.sp - 2], st.m[st.sp - 1], st.l[st.sp - 1],
+                       st.acc[st.sp - 1]);
+        st.span[st.sp - 2] += st.span[st.sp - 1];
+        --st.sp;
+    }
+}
+
+/* Folds what the carry left, right to left, into `r`: the register levels
+ * from the lowest (the rightmost blocks), then the stack proper from its top.
+ * The stack must not be empty. */
+template <int DPT>
+__device__ __forceinline__ void attn_tree_finish(AttnFoldRegs<DPT> &rg, AttnFoldStack<DPT> &st, AttnRow<DPT> &r) {
+    constexpr int dims = attn_row_dims<DPT>();
+    bool any = false;
+#pragma unroll
+    for (int i = 0; i < attn_fold_reg<DPT>(); ++i) {
+        if (rg.has[i]) {
+            if (any) {
+                attn_fold<DPT>(rg.rm[i], rg.rl[i], rg.racc[i], r.m, r.l, r.acc);
+            }
+#pragma unroll
+            for (int j = 0; j < dims; ++j) {
+                r.acc[j] = rg.racc[i][j];
+            }
+            r.m = rg.rm[i];
+            r.l = rg.rl[i];
+            any = true;
+        }
+    }
+    for (int i = st.sp - 1; i >= 0; --i) {
+        if (any) {
+            attn_fold<DPT>(st.m[i], st.l[i], st.acc[i], r.m, r.l, r.acc);
+        }
+        for (int j = 0; j < dims; ++j) {
+            r.acc[j] = st.acc[i][j];
+        }
+        r.m = st.m[i];
+        r.l = st.l[i];
+        any = true;
+    }
 }
 
 /* One warp per (query, head), keys from global memory one at a time
@@ -2040,10 +2201,10 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
     const int block_end = mask ? n_kv : min(n_kv, attn_row_tmax(q_last, n_q, n_kv, causal) + 1);
     AttnRow<DPT> r;
     attn_row_init(r, qh, lane, head_dim, nvec, vec4, sinks, h);
-    /* Folded chunks before the current one. */
-    float m_acc[attn_row_dims<DPT>()];
-    float m_m = -1.0e30f, m_l = 0.0f;
-    bool folded = false;
+    /* Finished chunks before the current one, as the fold tree's carry stack. */
+    AttnFoldRegs<DPT> rg;
+    AttnFoldStack<DPT> st;
+    attn_tree_init(rg, st);
     int next_fold = ATTN_CHUNK;
     for (int t0 = 0; t0 < block_end; t0 += tile) {
         __syncthreads();
@@ -2053,17 +2214,7 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
         for (int s = t0; s < stop; s += ATTN_KT) {
             if (s == next_fold) {
                 next_fold += ATTN_CHUNK;
-                if (folded) {
-                    attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                        m_acc[i] = r.acc[i];
-                    }
-                    m_m = r.m;
-                    m_l = r.l;
-                    folded = true;
-                }
+                attn_tree_push<DPT>(rg, st, r);
                 attn_row_reset(r);
             }
             const int t = s + lane / 2;
@@ -2074,14 +2225,9 @@ __global__ void __launch_bounds__(32 * ATTN_QTILE) attention_qtile_kernel(const 
         }
     }
     if (active) {
-        if (folded) {
-            attn_fold<DPT>(m_m, m_l, m_acc, r.m, r.l, r.acc);
-#pragma unroll
-            for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-                r.acc[i] = m_acc[i];
-            }
-            r.m = m_m;
-            r.l = m_l;
+        if (!attn_tree_empty(rg, st)) {
+            attn_tree_push<DPT>(rg, st, r);
+            attn_tree_finish<DPT>(rg, st, r);
         }
         attn_row_store(r, oh, lane, head_dim, nvec, vec4);
     }
@@ -2157,9 +2303,65 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     }
 }
 
-/* Folds a row's chunk partials in ascending order and writes the row. */
+/* Partials attention_merge_kernel folds itself, in one warp. Below that the
+ * fold tree's lowest levels run as attention_merge_pair_kernel launches, one
+ * per level: a launch costs more than a few folds, so short rows (up to 16
+ * chunks, 2048 keys) take none. */
+constexpr int ATTN_MERGE_WARP = 16;
+
+/* The pair levels' last stride, doubled: the smallest power of two S with
+ * ceil(n_chunks / S) <= ATTN_MERGE_WARP. After the levels with stride < S,
+ * the partials at 0, S, 2S, ... hold the tree's aligned blocks, and the
+ * tree's upper levels are the same tree over those. */
+__host__ __device__ __forceinline__ int attn_merge_spacing(int n_chunks) {
+    int spacing = 1;
+    while ((n_chunks + spacing - 1) / spacing > ATTN_MERGE_WARP) {
+        spacing *= 2;
+    }
+    return spacing;
+}
+
+/* One tree level of a decode row's partials (see ATTN_FOLD_STACK): block x is
+ * the pair (2 * stride * x, + stride), block y the head; folds in place. */
 template <int DPT>
-__global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, const float *part, float *out, int n_heads,
+__global__ void __launch_bounds__(32) attention_merge_pair_kernel(float *part, int n_chunks, int stride) {
+    const int left = static_cast<int>(blockIdx.x) * 2 * stride;
+    const int right = left + stride;
+    const int h = static_cast<int>(blockIdx.y);
+    if (right >= n_chunks) {
+        return;
+    }
+    const int lane = static_cast<int>(threadIdx.x);
+    constexpr int dims = attn_row_dims<DPT>();
+    float *base = part + static_cast<size_t>(h) * n_chunks * attn_part<DPT>();
+    float *dst = base + static_cast<size_t>(left) * attn_part<DPT>();
+    const float *src = base + static_cast<size_t>(right) * attn_part<DPT>();
+    float acc[dims];
+    float acc_b[dims];
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        acc[i] = dst[lane * dims + i];
+        acc_b[i] = src[lane * dims + i];
+    }
+    float m = dst[32 * dims];
+    float l = dst[32 * dims + 1];
+    attn_fold<DPT>(m, l, acc, src[32 * dims], src[32 * dims + 1], acc_b);
+#pragma unroll
+    for (int i = 0; i < dims; ++i) {
+        dst[lane * dims + i] = acc[i];
+    }
+    if (lane == 0) {
+        dst[32 * dims] = m;
+        dst[32 * dims + 1] = l;
+    }
+}
+
+/* The fold tree's levels from attn_merge_spacing up, in place in `part`, then
+ * writes the row. The levels below have already run
+ * (attention_merge_pair_kernel). One warp owns the row's partials; each lane
+ * reads back only what it wrote, except m and l, which lane 0 writes. */
+template <int DPT>
+__global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, float *part, float *out, int n_heads,
                                        int head_dim, int n_chunks) {
     const int qi = static_cast<int>(blockIdx.x);
     const int h = static_cast<int>(blockIdx.y);
@@ -2169,23 +2371,41 @@ __global__ void __launch_bounds__(32) attention_merge_kernel(const float *q, con
     const bool vec4 = (head_dim % 4) == 0 && head_dim > 0 &&
                       (reinterpret_cast<uintptr_t>(qh) % 16u) == 0;
     const int nvec = vec4 ? head_dim / 4 : head_dim;
-    const float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * attn_part<DPT>();
+    float *src = part + (static_cast<size_t>(qi) * n_heads + h) * n_chunks * attn_part<DPT>();
+    constexpr int dims = attn_row_dims<DPT>();
+    for (int stride = attn_merge_spacing(n_chunks); stride < n_chunks; stride *= 2) {
+        for (int left = 0; left + stride < n_chunks; left += 2 * stride) {
+            float *dst = src + static_cast<size_t>(left) * attn_part<DPT>();
+            const float *pc = dst + static_cast<size_t>(stride) * attn_part<DPT>();
+            float acc[dims];
+            float acc_b[dims];
+#pragma unroll
+            for (int i = 0; i < dims; ++i) {
+                acc[i] = dst[lane * dims + i];
+                acc_b[i] = pc[lane * dims + i];
+            }
+            float m = dst[32 * dims];
+            float l = dst[32 * dims + 1];
+            attn_fold<DPT>(m, l, acc, pc[32 * dims], pc[32 * dims + 1], acc_b);
+#pragma unroll
+            for (int i = 0; i < dims; ++i) {
+                dst[lane * dims + i] = acc[i];
+            }
+            __threadfence_block();
+            if (lane == 0) {
+                dst[32 * dims] = m;
+                dst[32 * dims + 1] = l;
+            }
+            __threadfence_block();
+        }
+    }
     AttnRow<DPT> r;
 #pragma unroll
-    for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-        r.acc[i] = src[lane * attn_row_dims<DPT>() + i];
+    for (int i = 0; i < dims; ++i) {
+        r.acc[i] = src[lane * dims + i];
     }
-    r.m = src[32 * attn_row_dims<DPT>()];
-    r.l = src[32 * attn_row_dims<DPT>() + 1];
-    for (int c = 1; c < n_chunks; ++c) {
-        const float *pc = src + static_cast<size_t>(c) * attn_part<DPT>();
-        float acc_b[attn_row_dims<DPT>()];
-#pragma unroll
-        for (int i = 0; i < attn_row_dims<DPT>(); ++i) {
-            acc_b[i] = pc[lane * attn_row_dims<DPT>() + i];
-        }
-        attn_fold<DPT>(r.m, r.l, r.acc, pc[32 * attn_row_dims<DPT>()], pc[32 * attn_row_dims<DPT>() + 1], acc_b);
-    }
+    r.m = src[32 * dims];
+    r.l = src[32 * dims + 1];
     attn_row_store(r, oh, lane, head_dim, nvec, vec4);
 }
 
@@ -2531,6 +2751,14 @@ static void launch_attention_tiled(const float *q, const float *k, const float *
                                    split_grid, dim3(32 * per_block), lds, stream, q, k,
                                    v, s.p, static_cast<float *>(nullptr), n_kv, n_heads, n_kv_heads, head_dim, causal,
                                    mask, sinks, n_chunks, tile);
+                /* The fold tree's lowest levels (see attn_merge_spacing). */
+                const int spacing = attn_merge_spacing(n_chunks);
+                for (int stride = 1; stride < spacing; stride *= 2) {
+                    const int pairs = (n_chunks - stride + 2 * stride - 1) / (2 * stride);
+                    hipLaunchKernelGGL(attention_merge_pair_kernel<DPT>,
+                                       dim3(static_cast<unsigned>(pairs), static_cast<unsigned>(n_heads)), dim3(32),
+                                       0, stream, s.p, n_chunks, stride);
+                }
                 hipLaunchKernelGGL(attention_merge_kernel<DPT>, dim3(1, static_cast<unsigned>(n_heads)),
                                    dim3(32), 0, stream, q, s.p, out, n_heads, head_dim, n_chunks);
                 return;
@@ -5216,14 +5444,14 @@ struct Q2MoePicks {
  * takes it. */
 #if !defined(__gfx906__) && !defined(__gfx908__) && !defined(__gfx90a__) && !defined(__gfx942__) && \
     !defined(__gfx1100__) && !defined(__gfx1101__) && !defined(__gfx1102__) &&                       \
-    !defined(__gfx1200__) && !defined(__gfx1201__)
+    !defined(__gfx1151__) && !defined(__gfx1200__) && !defined(__gfx1201__)
 __device__ int g_allpaca_dot4_scalar_warned = 0;
 #endif
 __device__ inline int allpaca_dot4_i8(int a, int b, int c) {
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__)
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1200__) || defined(__gfx1201__)
+    defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     if (atomicCAS(&g_allpaca_dot4_scalar_warned, 0, 1) == 0) {
@@ -6356,6 +6584,26 @@ __device__ inline uint32_t rocmfp4_levels_i8x4(uint32_t code) {
     return (mag ^ neg) + (neg & 0x01010101u);
 }
 
+/* As rocmfp4_levels_i8x4 for the NVFP4 E2M1 codebook (0,1,2,3,4,6,8,12). */
+__device__ inline uint32_t nvfp4_levels_i8x4(uint32_t code) {
+    const uint32_t mag3 = code & 0x07070707u;
+    const uint32_t big = (((mag3 + 0x03030303u) >> 3) & 0x01010101u) * 0xFFu;
+    uint32_t mag = mag3 + ((((mag3 | 0x80808080u) - 0x04040404u) & 0x07070707u) & big);
+    // Index 7 is 12, not 10: add 2 where all three magnitude bits are set.
+    const uint32_t seven = mag3 & (mag3 >> 1) & (mag3 >> 2) & 0x01010101u;
+    mag += seven << 1;
+    const uint32_t nonzero = (((mag + 0x7F7F7F7Fu) >> 7) & 0x01010101u) * 0xFFu;
+    const uint32_t neg = (((code >> 3) & 0x01010101u) * 0xFFu) & nonzero;
+    return (mag ^ neg) + (neg & 0x01010101u);
+}
+
+/* f16 bits to f32 for the NVFP4 device block scales. */
+__device__ inline float nvfp4_f16_scale(const uint8_t *p) {
+    uint16_t h;
+    __builtin_memcpy(&h, p, 2);
+    return static_cast<float>(__builtin_bit_cast(_Float16, h));
+}
+
 /* ROCmFP4 GEMV on int8 activations (the K-quant int8 scheme, llama.cpp
  * mmvq): A is quantized once per GEMV to int8 with one f32 scale per 32
  * values, and each lane takes whole 32-weight blocks: two signed dot4 chains
@@ -6395,13 +6643,19 @@ __global__ void gemv_nt_rocmfp4_i8_kernel(const int8_t *aq, const float *ad, con
             // Blocks are 17 or 18 bytes: unaligned loads.
             uint32_t x[4];
             __builtin_memcpy(x, blk, 16);
-            const float d0 = rocmfp4_scale(blk[16]);
-            const float d1 = rocmfp4_scale(blk[BB - 1]);
+            // BB = 20: NVFP4 device block, f16 scales and the 12-top codebook.
+            const float d0 = BB == 20 ? nvfp4_f16_scale(blk + 16) : rocmfp4_scale(blk[16]);
+            const float d1 = BB == 20 ? nvfp4_f16_scale(blk + 18) : rocmfp4_scale(blk[BB - 1]);
             uint32_t wl[4], wh[4];
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
-                wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
-                wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                if (BB == 20) {
+                    wl[t] = nvfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                    wh[t] = nvfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                } else {
+                    wl[t] = rocmfp4_levels_i8x4(x[t] & 0x0F0F0F0Fu);
+                    wh[t] = rocmfp4_levels_i8x4((x[t] >> 4) & 0x0F0F0F0Fu);
+                }
             }
 #if ALLPACA_I8_LOADS_FIRST
             uint32_t al[MR][4], ah[MR][4];
@@ -6558,6 +6812,18 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *a, const uint8_t *b,
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *a, const uint8_t *b, float *c, int32_t m,
                                             int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_rocmfp4(a, b, c, m, n, k, as_stream(stream), 1, true);
+}
+
+/* NVFP4 (ggml type 40) after the host re-pack: 20-byte blocks of 32 weights
+ * (qs[16], two f16 scales with the tensor scale folded in). Int8 path only,
+ * so K must be a multiple of 32. */
+extern "C" int allpaca_gemm_nt_nvfp4(const float *a, const uint8_t *b, float *c, int32_t m,
+                                     int32_t n, int32_t k, allpaca_stream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || !a || !b || !c) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    return launch_rocmfp4_i8<20>(a, b, c, m, n, k, as_stream(stream));
 }
 
 /* Float-activation ROCmFP4 GEMV (32 lanes split K): the kernel the int8
@@ -9309,6 +9575,16 @@ __global__ void silu_mul_kernel(float *gate, const float *up, int n) {
     gate[idx] = det_silu_mul(gate[idx], up[idx]);
 }
 
+/* silu(min(gate, limit)) * clamp(up, -limit, limit): DeepSeek-V4's capped
+ * SwiGLU for the BF16 shared expert, same element math as mxfp4_swiglu. */
+__global__ void silu_mul_limit_kernel(float *gate, const float *up, int n, float limit) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= n) {
+        return;
+    }
+    gate[idx] = mxfp4_swiglu(gate[idx], up[idx], limit);
+}
+
 __global__ void gelu_mul_kernel(float *gate, const float *up, int n) {
     const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) {
@@ -10166,6 +10442,20 @@ extern "C" int allpaca_silu_mul(float *gate, const float *up, int32_t n, allpaca
     const int blocks = (n + threads - 1) / threads;
     hipLaunchKernelGGL(silu_mul_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_silu_mul_limit(float *gate, const float *up, int32_t n, float limit,
+                                      allpaca_stream_t stream) {
+    if (!gate || !up || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(silu_mul_limit_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), gate, up, n,
+                       limit);
     return hip_status(hipGetLastError());
 }
 
@@ -12168,6 +12458,11 @@ extern "C" int allpaca_gemm_nt_rocmfp4_untiled(const float *, const uint8_t *, f
 
 extern "C" int allpaca_gemm_nt_rocmfp4_fast(const float *, const uint8_t *, float *, int32_t,
                                             int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_nvfp4(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                     int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
