@@ -4724,6 +4724,8 @@ pub struct TinyModel {
     /// a separate `MoeFfn` reply (host top-k, F16 routed sum), so hosted
     /// output equals the separate expert-parallel path bit for bit.
     pub hosted_moe_compat: bool,
+    /// Strata route-tail skip. Off by default; set from Engine config at load.
+    pub(crate) route_tail: crate::route_tail::Policy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4904,6 +4906,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            route_tail: Default::default(),
         }
     }
 
@@ -7411,6 +7414,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            route_tail: Default::default(),
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7575,6 +7579,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            route_tail: Default::default(),
         }
     }
 
@@ -7714,6 +7719,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            route_tail: Default::default(),
         })
     }
 
@@ -7832,6 +7838,7 @@ impl TinyModel {
             expert_controls: Default::default(),
             layer_capture: Default::default(),
             hosted_moe_compat: false,
+            route_tail: Default::default(),
         })
     }
 
