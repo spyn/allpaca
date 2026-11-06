@@ -3029,6 +3029,23 @@ fn dsv4_apply_moe(
         fcomb,
         picks,
     } = prep;
+    // Hash-routed layers list experts in table order, not by score: no tail.
+    let picks = if model.route_tail.enabled && layer_idx >= spec.hash_layer_count {
+        crate::route_tail::filter_picks(
+            std::slice::from_ref(&picks),
+            |e| {
+                gpu.as_mut().is_some_and(|g| {
+                    g.cpu_miss() && g.resident_expert(blk, e).is_none() && !g.admits(blk, e)
+                })
+            },
+            model.route_tail,
+        )
+        .into_iter()
+        .next()
+        .unwrap_or(picks)
+    } else {
+        picks
+    };
     // Experts that stay out of the GPU caches run on the CPU, beside the
     // GPU work.
     let mut cpu_work: Vec<(usize, Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
@@ -3062,9 +3079,13 @@ fn dsv4_apply_moe(
             }
         }
     }
-    let shexp_y = dsv4_shexp(
-        model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp,
-    )?;
+    // With `shexp_early` the shared expert waits until the CPU-miss experts
+    // have started, so the card runs it beside them; its sum is added last
+    // either way.
+    let mut shexp_y = Vec::new();
+    if !model.shexp_early {
+        shexp_y = dsv4_shexp(model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp)?;
+    }
     let fill = gpu
         .as_ref()
         .map(|g| if g.has_expert_slots() { picks.len() } else { 0 })
@@ -3079,6 +3100,9 @@ fn dsv4_apply_moe(
         }
         _ => None,
     };
+    if model.shexp_early {
+        shexp_y = dsv4_shexp(model, dsv4, &fcur, layer_idx, metrics, &mut gpu, file, skip_shexp)?;
+    }
     let mut deferred: Vec<(usize, usize, f32)> = Vec::new();
     for (i, (e, w)) in picks.into_iter().enumerate() {
         if gpu.as_ref().is_some_and(|g| g.expert_copy_pending(blk, e)) {
@@ -3436,7 +3460,7 @@ fn dsv4_apply_moe_rows(
     model: &TinyModel,
     dsv4: &Dsv4Weights,
     states: &mut HcBatch,
-    preps: Vec<Dsv4FfnPrep>,
+    mut preps: Vec<Dsv4FfnPrep>,
     layer_idx: usize,
     metrics: &Metrics,
     gpu: Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
@@ -3492,6 +3516,21 @@ fn dsv4_apply_moe_rows(
             shexp_limit,
         )?;
         shexp_done = true;
+    }
+    if model.route_tail.enabled && layer_idx >= dsv4.spec.hash_layer_count {
+        let ranked: Vec<Vec<(usize, f32)>> = preps.iter().map(|p| p.picks.clone()).collect();
+        let filtered = crate::route_tail::filter_picks(
+            &ranked,
+            |e| {
+                gpu.as_mut().is_some_and(|g| {
+                    g.cpu_miss() && g.resident_expert(blk, e).is_none() && !g.admits(blk, e)
+                })
+            },
+            model.route_tail,
+        );
+        for (prep, picks) in preps.iter_mut().zip(filtered) {
+            prep.picks = picks;
+        }
     }
     let hint: Vec<usize> = {
         let mut u = Vec::new();

@@ -7,12 +7,14 @@ pub fn rng_from_params(params: &GenerationParams, fallback_seed: Option<u64>) ->
     StdRng::seed_from_u64(seed)
 }
 
-pub fn sample(
+/// Softmaxed `(id, probability)` list for `logits` under `params`.
+/// Greedy (`temperature <= 1e-5`) is a one-hot on argmax. Mutates `logits`
+/// the same way [`sample`] does (mask, then temperature).
+pub fn softmax_candidates(
     logits: &mut [f32],
     mask: Option<&TokenMask>,
     params: &GenerationParams,
-    rng: &mut StdRng,
-) -> u32 {
+) -> Vec<(u32, f32)> {
     if let Some(mask) = mask {
         for (i, logit) in logits.iter_mut().enumerate() {
             if !mask.allowed(i) {
@@ -21,27 +23,122 @@ pub fn sample(
         }
     }
     if logits.iter().all(|l| !l.is_finite()) {
-        return 0;
+        return vec![(0, 1.0)];
     }
     if params.temperature <= 1e-5 {
-        return argmax(logits);
+        return vec![(argmax(logits), 1.0)];
     }
     apply_temperature(logits, params.temperature);
     let mut candidates = collect_finite(logits);
     if candidates.is_empty() {
-        return argmax(logits);
+        return vec![(argmax(logits), 1.0)];
     }
     apply_top_k(&mut candidates, params.top_k);
     apply_top_p(&mut candidates, params.top_p);
     softmax_pairs(&mut candidates);
+    candidates
+}
+
+/// Draw from a softmaxed candidate list with the same unit-interval walk
+/// [`sample`] has always used. Greedy skips the RNG.
+fn draw_softmaxed(candidates: &[(u32, f32)], temperature: f32, rng: &mut StdRng) -> u32 {
+    if temperature <= 1e-5 {
+        return candidates.first().map(|(id, _)| *id).unwrap_or(0);
+    }
     let mut r: f32 = rng.gen();
-    for (id, p) in &candidates {
+    for (id, p) in candidates {
         r -= *p;
         if r <= 0.0 {
             return *id;
         }
     }
     candidates.last().map(|(id, _)| *id).unwrap_or(0)
+}
+
+pub fn sample(
+    logits: &mut [f32],
+    mask: Option<&TokenMask>,
+    params: &GenerationParams,
+    rng: &mut StdRng,
+) -> u32 {
+    let candidates = softmax_candidates(logits, mask, params);
+    draw_softmaxed(&candidates, params.temperature, rng)
+}
+
+/// Draw the next token. When `q` is a non-empty draft distribution and
+/// temperature is above greedy, use Leviathan rejection against `draft_id`.
+/// Otherwise sample as usual and report whether the result equals `draft_id`.
+pub fn sample_with_draft(
+    logits: &mut [f32],
+    mask: Option<&TokenMask>,
+    params: &GenerationParams,
+    rng: &mut StdRng,
+    draft_id: Option<u32>,
+    q: Option<&[(u32, f32)]>,
+) -> (u32, bool) {
+    if params.temperature > 1e-5 {
+        if let (Some(draft_id), Some(q)) = (draft_id, q) {
+            if !q.is_empty() {
+                let p = softmax_candidates(logits, mask, params);
+                return rejection_sample(&p, q, draft_id, rng);
+            }
+        }
+    }
+    let tok = sample(logits, mask, params, rng);
+    (tok, draft_id == Some(tok))
+}
+
+/// Probability of `id` in a softmaxed candidate list. Missing ids are 0.
+fn prob_of(dist: &[(u32, f32)], id: u32) -> f32 {
+    dist.iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, p)| *p)
+        .unwrap_or(0.0)
+}
+
+fn sample_weighted(dist: &[(u32, f32)], rng: &mut StdRng) -> u32 {
+    let sum: f32 = dist.iter().map(|(_, p)| *p).sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return dist.first().map(|(id, _)| *id).unwrap_or(0);
+    }
+    let mut r: f32 = rng.gen::<f32>() * sum;
+    for (id, p) in dist {
+        r -= *p;
+        if r <= 0.0 {
+            return *id;
+        }
+    }
+    dist.last().map(|(id, _)| *id).unwrap_or(0)
+}
+
+/// Accept `draft_id` with probability `min(1, p/q)`, else sample from
+/// `norm(max(0, p − q))`. `p` and `q` are softmaxed `(id, probability)` lists.
+/// Returns `(token, accepted)`.
+///
+/// Leviathan et al. / llama.cpp #27694. Greedy one-hot `p` and `q` accept
+/// iff they name the same token, so T = 0 stays bit-identical to exact match.
+pub fn rejection_sample(
+    p: &[(u32, f32)],
+    q: &[(u32, f32)],
+    draft_id: u32,
+    rng: &mut StdRng,
+) -> (u32, bool) {
+    let p_x = prob_of(p, draft_id);
+    let q_x = prob_of(q, draft_id);
+    if p_x > 0.0 && (q_x <= 0.0 || p_x >= q_x || rng.gen::<f32>() < p_x / q_x) {
+        return (draft_id, true);
+    }
+    let mut residual = Vec::with_capacity(p.len());
+    for &(id, p_i) in p {
+        let r = p_i - prob_of(q, id);
+        if r > 0.0 {
+            residual.push((id, r));
+        }
+    }
+    if residual.is_empty() {
+        return (p.first().map(|(id, _)| *id).unwrap_or(draft_id), false);
+    }
+    (sample_weighted(&residual, rng), false)
 }
 
 pub fn argmax(logits: &[f32]) -> u32 {
@@ -167,6 +264,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejection_accepts_greedy_match_without_rng() {
+        let p = [(1u32, 1.0f32)];
+        let q = [(1u32, 1.0f32)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let (tok, accepted) = rejection_sample(&p, &q, 1, &mut rng);
+        assert_eq!(tok, 1);
+        assert!(accepted);
+    }
+
+    #[test]
+    fn rejection_greedy_mismatch_resamples_target_argmax() {
+        let p = [(3u32, 1.0f32)];
+        let q = [(1u32, 1.0f32)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let (tok, accepted) = rejection_sample(&p, &q, 1, &mut rng);
+        assert_eq!(tok, 3);
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn rejection_always_accepts_when_p_covers_q() {
+        let p = [(0u32, 0.8), (1u32, 0.2)];
+        let q = [(0u32, 0.5), (1u32, 0.5)];
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (tok, accepted) = rejection_sample(&p, &q, 0, &mut rng);
+            assert_eq!(tok, 0);
+            assert!(accepted, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn rejection_never_accepts_zero_p_draft() {
+        let p = [(1u32, 1.0f32)];
+        let q = [(0u32, 1.0f32)];
+        for seed in 0..32u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (tok, accepted) = rejection_sample(&p, &q, 0, &mut rng);
+            assert!(!accepted, "seed {seed}");
+            assert_eq!(tok, 1);
+        }
+    }
+
+    #[test]
+    fn rejection_token_frequencies_match_target_p() {
+        // p = [0.7, 0.3], greedy-draft q = one-hot on token 0.
+        // Accept with p(0)=0.7; residual is token 1 with mass 0.3.
+        let p = [(0u32, 0.7), (1u32, 0.3)];
+        let q = [(0u32, 1.0)];
+        let n = 20_000u32;
+        let mut counts = [0u32; 2];
+        let mut rng = StdRng::seed_from_u64(0xA11_0ACA);
+        for _ in 0..n {
+            let (tok, _) = rejection_sample(&p, &q, 0, &mut rng);
+            counts[tok as usize] += 1;
+        }
+        let f0 = counts[0] as f32 / n as f32;
+        let f1 = counts[1] as f32 / n as f32;
+        assert!((f0 - 0.7).abs() < 0.02, "f0={f0}");
+        assert!((f1 - 0.3).abs() < 0.02, "f1={f1}");
+    }
+
+    #[test]
+    fn sample_with_draft_greedy_matches_exact_match() {
+        let mut logits = [0.1f32, 3.0, 0.2];
+        let params = GenerationParams {
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let q = [(1u32, 1.0f32)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let (tok, accepted) =
+            sample_with_draft(&mut logits, None, &params, &mut rng, Some(1), Some(&q));
+        assert_eq!(tok, 1);
+        assert!(accepted);
+        let mut logits = [0.1f32, 3.0, 0.2];
+        let (tok, accepted) =
+            sample_with_draft(&mut logits, None, &params, &mut rng, Some(0), Some(&q));
+        assert_eq!(tok, 1);
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn sample_with_draft_without_q_equals_sample() {
+        let logits = [0.2f32, 1.5, 0.4, 0.1];
+        let params = GenerationParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        for seed in 0..32u64 {
+            let mut a = logits;
+            let mut b = logits;
+            let mut rng_a = StdRng::seed_from_u64(seed);
+            let mut rng_b = StdRng::seed_from_u64(seed);
+            let from_sample = sample(&mut a, None, &params, &mut rng_a);
+            let (from_draft, accepted) =
+                sample_with_draft(&mut b, None, &params, &mut rng_b, Some(1), None);
+            assert_eq!(from_sample, from_draft, "seed {seed}");
+            assert_eq!(accepted, from_draft == 1, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn softmax_candidates_greedy_is_one_hot_argmax() {
+        let mut logits = [0.1, 3.0, 0.2];
+        let params = GenerationParams {
+            temperature: 0.0,
+            ..GenerationParams::default()
+        };
+        let p = softmax_candidates(&mut logits, None, &params);
+        assert_eq!(p, vec![(1, 1.0)]);
+    }
+
+    #[test]
+    fn softmax_candidates_then_weighted_draw_matches_sample() {
+        let logits = [0.2f32, 1.5, 0.4, 0.1];
+        let params = GenerationParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        for seed in 0..32u64 {
+            let mut a = logits;
+            let mut b = logits;
+            let mut rng_a = StdRng::seed_from_u64(seed);
+            let mut rng_b = StdRng::seed_from_u64(seed);
+            let from_sample = sample(&mut a, None, &params, &mut rng_a);
+            let p = softmax_candidates(&mut b, None, &params);
+            let from_p = draw_softmaxed(&p, params.temperature, &mut rng_b);
+            assert_eq!(from_sample, from_p, "seed {seed}");
+        }
+    }
+
+    #[test]
     fn greedy_picks_max() {
         let mut logits = [0.1, 3.0, 0.2];
         let mut rng = StdRng::seed_from_u64(1);
@@ -195,7 +429,9 @@ mod tests {
         let mut seed = 0x9E37_79B9u64;
         let logits: Vec<f32> = (0..5000)
             .map(|i| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 // Coarse values so ties occur; a few clear winners.
                 ((seed >> 40) % 97) as f32 * 0.05 + if i % 1250 == 7 { 6.0 } else { 0.0 }
             })

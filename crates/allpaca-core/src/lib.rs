@@ -54,6 +54,7 @@ pub mod propagate;
 pub mod rco;
 pub mod requant;
 mod rpc_runtime;
+mod route_tail;
 mod sampling;
 mod scheduler;
 pub mod sensitivity;
