@@ -1588,6 +1588,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::synthetic(target.config.vocab_size)?;
         inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
+        self.apply_route_tail(&mut target);
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1598,6 +1599,7 @@ impl Engine {
                 "synthetic-draft",
             );
             self.apply_weight_working_set(&mut draft)?;
+            self.apply_route_tail(&mut draft);
             self.apply_expert_lru(&mut draft)?;
             inner.draft_model = Some(Arc::new(draft));
         }
@@ -1617,6 +1619,7 @@ impl Engine {
         let tokenizer = EngineTokenizer::synthetic(vocab)?;
         inner.ring.resize_vocab(vocab);
         self.apply_weight_working_set(&mut target)?;
+        self.apply_route_tail(&mut target);
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1757,6 +1760,16 @@ impl Engine {
         }
         model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan)?);
         Ok(())
+    }
+
+    fn apply_route_tail(&self, model: &mut TinyModel) {
+        model.route_tail = crate::route_tail::Policy::from_experimental(
+            self.config.experimental.route_tail_skip,
+            self.config.experimental.route_tail_skip_rank,
+        );
+        if let Some(q4) = model.q4x.as_ref() {
+            q4.set_route_tail(model.route_tail);
+        }
     }
 
     fn apply_expert_lru(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
@@ -1996,6 +2009,7 @@ impl Engine {
         });
         model.name = loaded.tier.name().into();
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer =
@@ -2026,6 +2040,7 @@ impl Engine {
         let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2056,6 +2071,7 @@ impl Engine {
         let vocab = load_tokenizer_sidecar(&tokenizer_path)?;
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2100,6 +2116,7 @@ impl Engine {
         }
         let skip_hip = model.dsv4.is_some() || model.q4x.is_some() || model.g4.is_some();
         self.apply_weight_working_set(&mut model)?;
+        self.apply_route_tail(&mut model);
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
@@ -13638,6 +13655,48 @@ mod tests {
             .expect("tiny DeepSeek-V4 must generate");
         assert!(!out.token_ids.is_empty(), "must emit tokens; got {out:?}");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn route_tail_skip_on_matches_off_when_there_are_no_misses() {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_rts-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_gguf(&path);
+        let run = |on: bool| -> Vec<u32> {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only: true,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            cfg.speculative.enabled = false;
+            cfg.experimental.route_tail_skip = on;
+            let engine = Engine::new(cfg).expect("tiny DeepSeek-V4 must load");
+            engine
+                .generate(
+                    "hi",
+                    GenerationParams {
+                        max_tokens: 4,
+                        temperature: 0.0,
+                        seed: Some(7),
+                        ..GenerationParams::default()
+                    },
+                )
+                .expect("tiny DeepSeek-V4 must generate")
+                .token_ids
+        };
+        let off = run(false);
+        let on = run(true);
+        let _ = std::fs::remove_file(path);
+        assert!(!off.is_empty(), "must emit tokens");
+        assert_eq!(off, on);
     }
 
     #[cfg(feature = "cuda")]

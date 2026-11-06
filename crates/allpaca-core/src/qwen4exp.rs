@@ -279,6 +279,8 @@ pub struct Qwen4Weights {
     swapped: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     /// Matrices and experts on the GPU, once attached.
     pub(crate) gpu: Mutex<Option<Qwen4Gpu>>,
+    route_tail_on: std::sync::atomic::AtomicBool,
+    route_tail_rank: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for Qwen4Weights {
@@ -301,7 +303,27 @@ impl Qwen4Weights {
             keep_dense: std::sync::atomic::AtomicBool::new(true),
             swapped: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
+            route_tail_on: std::sync::atomic::AtomicBool::new(false),
+            route_tail_rank: std::sync::atomic::AtomicU32::new(7),
         })
+    }
+
+    pub(crate) fn set_route_tail(&self, policy: crate::route_tail::Policy) {
+        self.route_tail_on
+            .store(policy.enabled, std::sync::atomic::Ordering::Relaxed);
+        self.route_tail_rank
+            .store(policy.rank_threshold, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn route_tail(&self) -> crate::route_tail::Policy {
+        crate::route_tail::Policy {
+            enabled: self
+                .route_tail_on
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rank_threshold: self
+                .route_tail_rank
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Read tensor `name` from `weights` instead of the file (`None`: from
@@ -1124,6 +1146,11 @@ fn ffn_layer(
     let router = q4.w(&name("ffn_gate_inp.weight"))?;
     let mut scores = gemv(x, &router, cfg.n_experts)?;
     let picks = topk_from_logits(&mut scores, cfg.n_active, cfg, block_mask(mem.expert_mask.as_ref(), blk, cfg.n_experts), &[]);
+    let picks =
+        crate::route_tail::filter_picks(std::slice::from_ref(&picks), |_| true, q4.route_tail())
+            .into_iter()
+            .next()
+            .unwrap_or(picks);
     if let Some(routes) = mem.routes.as_mut() {
         routes.extend(picks.iter().map(|(e, _)| (blk as u16, *e as u16)));
     }
@@ -1819,10 +1846,13 @@ fn ffn_rows(
     for (row, scores) in rows.iter().zip(scores.chunks_mut(cfg.n_experts)) {
         let mem = &mut mems[row.seq];
         let row_picks = topk_from_logits(scores, cfg.n_active, cfg, block_mask(mem.expert_mask.as_ref(), blk, cfg.n_experts), &[]);
-        if let Some(routes) = mem.routes.as_mut() {
+        picks.push(row_picks);
+    }
+    let picks = crate::route_tail::filter_picks(&picks, |_| true, q4.route_tail());
+    for (row, row_picks) in rows.iter().zip(&picks) {
+        if let Some(routes) = mems[row.seq].routes.as_mut() {
             routes.extend(row_picks.iter().map(|(e, _)| (blk as u16, *e as u16)));
         }
-        picks.push(row_picks);
     }
     let mut out = routed_experts_pooled(q4, cfg, blk, x, &picks, Some(tap))?;
     if q4.has(&name("ffn_up_shexp.weight")) {
@@ -2265,6 +2295,12 @@ fn forward_device(
             .chunks_mut(n_experts.max(1))
             .map(|row| topk_from_logits(row, cfg.n_active, cfg, block_mask(mem.expert_mask.as_ref(), blk, n_experts), &[]))
             .collect();
+        let host_or_rpc = !gpu.has_experts(blk);
+        let picks = if host_or_rpc {
+            crate::route_tail::filter_picks(&picks, |_| true, q4.route_tail())
+        } else {
+            picks
+        };
         if let Some(routes) = mem.routes.as_mut() {
             routes.extend(picks.iter().flatten().map(|(e, _)| (blk as u16, *e as u16)));
         }
