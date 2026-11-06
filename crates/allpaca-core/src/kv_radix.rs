@@ -1034,13 +1034,22 @@ impl KvRadixForest {
 
     /// The checkpoint at `path`, with the keys and values of a state
     /// checkpoint taken from a longer prompt's checkpoint below it.
+    ///
+    /// A sliding-window checkpoint stores only its tail, so its row count is
+    /// shorter than the tokens it covers. Those rows are not a prefix, and
+    /// taking them would restore the wrong keys.
     fn resume_at(&mut self, path: &[u32]) -> Option<(usize, RadixCheckpoint)> {
         let mut cp = self.load(path)?;
         if cp.state_only {
             let rest = kv_below(node_at(&self.root, path)?)?;
             let mut below = path.to_vec();
             below.extend(rest);
-            cp.kv = self.load(&below)?.prefix(path.len()).kv;
+            let donor = self.load(&below)?;
+            let rows = donor.kv.iter().map(EncodedRows::rows).min().unwrap_or(0);
+            if rows > 0 && rows < below.len() {
+                return None;
+            }
+            cp.kv = donor.prefix(path.len()).kv;
             cp.state_only = false;
         }
         Some((path.len(), cp))
@@ -2087,6 +2096,36 @@ mod tests {
         let (n, cp) = forest.lookup_checkpoint(&[1, 2, 3, 9]).expect("the shorter one");
         assert_eq!(n, 1);
         assert_eq!(cp.recurrent.gdn_state, state(1.0).gdn_state);
+    }
+
+    /// A sliding-window checkpoint stores only its tail. A state node above
+    /// that tail must not pretend those rows are the earlier prefix.
+    #[test]
+    fn a_state_checkpoint_does_not_resume_a_sliding_window_tail() {
+        let mut forest = KvRadixForest::new();
+        let tokens: Vec<u32> = (0..16).collect();
+        let early = forest.checkpoint(state(8.0), window_tail(1000.0, 8));
+        forest.insert_checkpoint(&tokens[..8], early);
+        let late = forest.checkpoint(state(16.0), window_tail(2000.0, 8));
+        forest.insert_checkpoint(&tokens, late);
+        forest.insert_state(&tokens[..14], state(14.0), None);
+
+        let mut query = tokens[..14].to_vec();
+        query.push(99);
+        let (n, cp) = forest.lookup_checkpoint(&query).expect("the earlier window");
+        assert_eq!(n, 8, "the tail at 16 is not the prefix through 14");
+        let rows = cp.kv_rows();
+        assert_eq!(rows[0][0].k[0], 1000.0);
+        assert_eq!(rows[0].len(), 8);
+    }
+
+    fn window_tail(marker: f32, n: usize) -> Vec<Vec<KvRow>> {
+        vec![(0..n)
+            .map(|t| KvRow {
+                k: vec![marker + t as f32; 4],
+                v: vec![-(marker + t as f32); 4],
+            })
+            .collect()]
     }
 
     #[test]

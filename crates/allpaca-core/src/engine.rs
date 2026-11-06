@@ -16,7 +16,7 @@ use allpaca_types::{
 use futures::Stream;
 use rand::rngs::StdRng;
 
-use crate::anchors::{restore_kv, restore_kv_from, snapshot_kv, AnchorCache, RecurrentState};
+use crate::anchors::{restore_kv, restore_kv_from, snapshot_kv_span, AnchorCache, RecurrentState};
 use crate::batch_gemm::{
     apply_packed_attn_hip, apply_packed_ffn_hip, apply_packed_lm_head, batch_gemm_other_ids,
     decode_layer_attn_shared_a_weights, packed_gemm_nt_hip, plan_batch_gemm, residual_add_rows,
@@ -4998,8 +4998,13 @@ impl Engine {
             if message_boundary || end + 1 == total {
                 self.capture_qwen4_prompt(inner, id, &target, end)?;
             }
-        } else if dsv4_window > 0 && end > 0 && end % dsv4_window == 0 {
-            self.capture_dsv4_prompt(inner, id, &target, end, dsv4_window)?;
+        } else if dsv4_window > 0 {
+            // Compressed memory is exact only on a window stride, and the
+            // checkpoint stores that stride's tail. An off-stride state node
+            // must not borrow those rows.
+            if end > 0 && end % dsv4_window == 0 {
+                self.capture_dsv4_prompt(inner, id, &target, end, dsv4_window)?;
+            }
         } else if end >= total {
             self.capture_prompt(inner, id, &target)?;
         } else {
@@ -5163,11 +5168,6 @@ impl Engine {
         if window == 0 || end == 0 {
             return Ok(());
         }
-        // Raw window rows live in KvTierManager; HIP D2H of growing pages
-        // is the GPU slice. CPU host pages are enough for exact replay.
-        if self.hip.is_some() {
-            return Ok(());
-        }
         let (tokens, pages, state) = {
             let active = request(inner, id)?;
             if !active.vision.is_empty() || active.probe.is_some() {
@@ -5181,13 +5181,9 @@ impl Engine {
             }
             (active.tokens[..end].to_vec(), active.pages.clone(), state)
         };
-        let mut rows = snapshot_kv(&inner.kv, &pages, &target.config)?;
-        for layer in &mut rows {
-            let skip = layer.len().saturating_sub(window);
-            if skip > 0 {
-                layer.drain(..skip);
-            }
-        }
+        let start = end.saturating_sub(window);
+        let n_rows = end.saturating_sub(start);
+        let rows = snapshot_kv_span(&inner.kv, &pages, &target.config, start, n_rows)?;
         let cp = inner.kv_radix.checkpoint(state, rows);
         inner.kv_radix.insert_checkpoint(&tokens, cp);
         Ok(())
@@ -13886,6 +13882,73 @@ mod tests {
             )
             .expect("tiny DeepSeek-V4 must generate");
         (out.token_ids, engine.stats())
+    }
+
+    /// A HIP workspace still has to keep the window checkpoint. F32 stays on
+    /// CPU gemv, but the raw rows live in device pages, and a later prompt
+    /// must restore them.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn tiny_dsv4_swa_checkpoint_replays_with_a_hip_workspace() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip tiny_dsv4_swa_checkpoint_replays_with_a_hip_workspace: no HIP device");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_swa_hip-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_ctx_gguf(
+            &path,
+            &crate::deepseek4::TinyDsv4Ctx {
+                window: 8,
+                compress_ratios: vec![4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: 0.0,
+            },
+        );
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let words = ["hi", "a", "b", "c", "d"];
+        let prompt: String = (0..24).map(|i| words[i % 5]).collect::<Vec<_>>().join(" ");
+        let config = |cpu_only: bool| {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(path.clone());
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg
+        };
+        let cold = Engine::new(config(true))
+            .expect("tiny DSV4 must load")
+            .generate(&prompt, params.clone())
+            .expect("cold generate");
+        let engine = Engine::new(config(false)).expect("tiny DSV4 must load on HIP");
+        let _warm = engine.generate(&prompt, params.clone()).expect("warm generate");
+        let hit = engine.generate(&prompt, params).expect("restored generate");
+        let stats = engine.stats();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            stats.radix_hits >= 1,
+            "a HIP workspace must store the window checkpoint; {stats:?}"
+        );
+        assert_eq!(
+            hit.token_ids, cold.token_ids,
+            "restored tokens must equal a cold prefill"
+        );
     }
 
     #[cfg(feature = "hip")]

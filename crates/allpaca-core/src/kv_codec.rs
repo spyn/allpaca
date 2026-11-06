@@ -63,7 +63,6 @@ impl EncodedRows {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }

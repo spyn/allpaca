@@ -336,6 +336,83 @@ pub(crate) fn snapshot_kv(
     Ok(out)
 }
 
+/// Raw KV rows of positions `start_pos..start_pos+n_rows` only.
+///
+/// A sliding-window checkpoint must not read every page of a long prompt:
+/// those pages stay on the device and grow with the sequence.
+pub(crate) fn snapshot_kv_span(
+    kv: &KvTierManager,
+    pages: &[Vec<u64>],
+    cfg: &ModelConfig,
+    start_pos: usize,
+    n_rows: usize,
+) -> Result<Vec<Vec<KvRow>>, AllpacaError> {
+    let kv_width = cfg.n_kv_heads.saturating_mul(cfg.head_dim());
+    if n_rows == 0 || kv_width == 0 {
+        return Ok(pages.iter().map(|_| Vec::new()).collect());
+    }
+    let end = start_pos.saturating_add(n_rows);
+    let mut out = Vec::with_capacity(pages.len());
+    for layer_pages in pages {
+        let cap = layer_pages
+            .first()
+            .and_then(|id| kv.get(*id))
+            .map(|p| p.capacity_tokens as usize)
+            .unwrap_or(128)
+            .max(1);
+        let mut rows = Vec::with_capacity(n_rows);
+        let mut pos = start_pos;
+        while pos < end {
+            let page_index = pos / cap;
+            let slot = pos % cap;
+            let page_id = *layer_pages.get(page_index).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "kv span missing page {page_index}"
+                )))
+            })?;
+            let run = (end - pos).min(cap - slot);
+            let slot_u32 = u32::try_from(slot).map_err(|_| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "kv slot {slot} does not fit u32"
+                )))
+            })?;
+            let run_u32 = u32::try_from(run).map_err(|_| {
+                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "kv run {run} does not fit u32"
+                )))
+            })?;
+            let (k, v) = kv.read_kv_slots_for_cache(
+                page_id,
+                slot_u32,
+                run_u32,
+                cfg.n_kv_heads,
+                cfg.head_dim(),
+            )?;
+            for i in 0..run {
+                let a = i.saturating_mul(kv_width);
+                let b = a.saturating_add(kv_width);
+                let key = k.get(a..b).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "kv span key row is short".into(),
+                    ))
+                })?;
+                let value = v.get(a..b).ok_or_else(|| {
+                    AllpacaError::Fatal(FatalError::InvalidConfig(
+                        "kv span value row is short".into(),
+                    ))
+                })?;
+                rows.push(KvRow {
+                    k: key.to_vec(),
+                    v: value.to_vec(),
+                });
+            }
+            pos = pos.saturating_add(run);
+        }
+        out.push(rows);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +432,64 @@ mod tests {
         });
         let (_, _, n) = cache.lookup(&[1, 3, 4]).expect("must hit");
         assert_eq!(n, 2, "deepest surviving anchor is the longer prefix");
+    }
+
+    /// A window checkpoint copies that window, not every earlier page.
+    fn span_copies_only_the_window(mut kv: crate::kv_tier::KvTierManager) {
+        let metrics = crate::telemetry::Metrics::default();
+        let cfg = crate::model::ModelConfig::tiny();
+        let width = cfg.n_kv_heads * cfg.head_dim();
+        let page_tokens = 4u32;
+        let n_pages = 6usize;
+        let mut layer = Vec::with_capacity(n_pages);
+        for page in 0..n_pages {
+            let id = kv
+                .alloc_page(0, page as u32, page_tokens, cfg.n_kv_heads, cfg.head_dim(), &metrics)
+                .expect("page");
+            for slot in 0..page_tokens {
+                let pos = page * page_tokens as usize + slot as usize;
+                let mut k = vec![0.0f32; width];
+                let mut v = vec![0.0f32; width];
+                k[0] = pos as f32;
+                v[0] = -(pos as f32) - 1.0;
+                kv.write_slot(id, slot, cfg.n_kv_heads, cfg.head_dim(), &k, &v)
+                    .expect("write");
+            }
+            layer.push(id);
+        }
+        let window = 8usize;
+        let start = n_pages * page_tokens as usize - window;
+        let rows = snapshot_kv_span(&kv, &[layer], &cfg, start, window).expect("span");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), window);
+        assert_eq!(rows[0][0].k[0], start as f32);
+        assert_eq!(rows[0][window - 1].v[0], -((start + window - 1) as f32) - 1.0);
+        let row_bytes = width.saturating_mul(2).saturating_mul(4);
+        let copied = kv.cache_d2h_bytes();
+        assert_eq!(
+            copied,
+            (window * row_bytes) as u64,
+            "a window snapshot must copy {window} rows, not the {n_pages} pages before it"
+        );
+    }
+
+    #[test]
+    fn snapshot_kv_span_copies_only_the_window() {
+        span_copies_only_the_window(crate::kv_tier::KvTierManager::new(1 << 20, 1 << 20, 0.9));
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn snapshot_kv_span_copies_only_the_window_on_hip() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip snapshot_kv_span_copies_only_the_window_on_hip: no HIP device");
+            return;
+        }
+        span_copies_only_the_window(crate::kv_tier::KvTierManager::with_hip(
+            1 << 20,
+            1 << 20,
+            0.9,
+            Some(0),
+        ));
     }
 }
