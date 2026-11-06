@@ -669,6 +669,11 @@ pub struct Qwen4Gpu {
     /// worker's end once it has them.
     to_host: Vec<usize>,
     hosted: Option<Arc<crate::qwen4_remote::RemoteBlocks>>,
+    /// Queue a host-routed block's shared expert after its router scores
+    /// come back, so the card runs it while the host picks and runs the
+    /// routed experts ([`Self::ffn_shared`]). `false` queues it ahead of the
+    /// download as before. From `ALLPACA_SHEXP_EARLY` (board task P8).
+    pub(crate) shexp_early: bool,
 }
 
 impl std::fmt::Debug for Qwen4Gpu {
@@ -854,6 +859,7 @@ impl Qwen4Gpu {
             block_dense,
             to_host,
             hosted: None,
+            shexp_early: crate::model::shexp_early_from_env(),
         };
         let expert_bytes = gpu.upload_experts(file, cfg, slot)?;
         tracing::info!(
@@ -1058,6 +1064,7 @@ impl Qwen4Gpu {
             block_dense: Vec::new(),
             to_host: Vec::new(),
             hosted: None,
+            shexp_early: crate::model::shexp_early_from_env(),
         })
     }
 
@@ -1131,6 +1138,7 @@ impl Qwen4Gpu {
             self.combine(card, rows)?;
             self.mix(card, &format!("blk.{blk}.hc_ffn"), true, rows)?;
             self.ffn_route(blk, rows, None, &mut x)?;
+            self.ffn_shared(blk, rows)?;
             self.ffn_finish_routed(blk, rows, shape.n_active, shape.scale)?;
             self.combine(card, rows)?;
         }
@@ -1745,10 +1753,11 @@ impl Qwen4Gpu {
     }
 
     /// Start block `blk`'s feed-forward on the mixed inputs of `rows`
-    /// tokens: the shared expert runs on the card, and the router's scores
-    /// come back in `scores` (a row per token) unless it is `None` (the
-    /// card will route, [`Self::ffn_finish_routed`]). `x` also gets the
-    /// mixed inputs when the experts are not on a card.
+    /// tokens: the router's scores come back in `scores` (a row per token)
+    /// unless it is `None` (the card will route,
+    /// [`Self::ffn_finish_routed`]). `x` also gets the mixed inputs when
+    /// the experts are not on a card. The shared expert is
+    /// [`Self::ffn_shared`]'s: queue it before the finish.
     pub fn ffn_route(
         &self,
         blk: usize,
@@ -1757,21 +1766,10 @@ impl Qwen4Gpu {
         x: &mut Vec<f32>,
     ) -> Result<(), AllpacaError> {
         let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
-        let name = |s: &str| format!("blk.{blk}.{s}");
         let (input, n_scores) = (card.at(act.x), rows * self.n_experts);
         // SAFETY: the input part holds MAX_ROWS rows of inputs and of scores.
         let device_scores = unsafe { input.add(rows * dim) };
-        self.launch(card, self.matrix(&name("ffn_gate_inp.weight"), dim)?, input, device_scores, rows)?;
-        if self.has(&name("ffn_up_shexp.weight")) {
-            let gate = self.matrix(&name("ffn_gate_shexp.weight"), dim)?;
-            let (g, u) = (card.at(act.shared_gate), card.at(act.shared_up));
-            self.launch(card, gate, input, g, rows)?;
-            self.launch(card, self.matrix(&name("ffn_up_shexp.weight"), dim)?, input, u, rows)?;
-            self.step(card, "silu_mul", || card.hip.silu_mul_device(g, u, (rows * gate.n) as i32))?;
-            self.launch(card, self.matrix(&name("ffn_down_shexp.weight"), gate.n)?, g, card.at(act.shared), rows)?;
-            let open = self.matrix(&name("ffn_gate_inp_shexp.weight"), dim)?;
-            self.launch(card, open, input, card.at(act.shared_open), rows)?;
-        }
+        self.launch(card, self.matrix(&format!("blk.{blk}.ffn_gate_inp.weight"), dim)?, input, device_scores, rows)?;
         x.clear();
         let Some(scores) = scores else {
             return match card.pools.contains_key(&blk) {
@@ -1787,6 +1785,27 @@ impl Qwen4Gpu {
         scores[..n_scores].copy_from_slice(&x[rows * dim..]);
         x.truncate(rows * dim);
         Ok(())
+    }
+
+    /// Queue block `blk`'s shared expert and its gate on the mixed inputs
+    /// of `rows` tokens (nothing for a block without one). Its own buffers:
+    /// any time between [`Self::ffn_route`]'s router and the finish gives
+    /// the same outputs.
+    pub fn ffn_shared(&self, blk: usize, rows: usize) -> Result<(), AllpacaError> {
+        let name = |s: &str| format!("blk.{blk}.{s}");
+        if !self.has(&name("ffn_up_shexp.weight")) {
+            return Ok(());
+        }
+        let (card, act, dim) = (&self.cards[self.card_of(blk)], &self.act, self.dim);
+        let input = card.at(act.x);
+        let gate = self.matrix(&name("ffn_gate_shexp.weight"), dim)?;
+        let (g, u) = (card.at(act.shared_gate), card.at(act.shared_up));
+        self.launch(card, gate, input, g, rows)?;
+        self.launch(card, self.matrix(&name("ffn_up_shexp.weight"), dim)?, input, u, rows)?;
+        self.step(card, "silu_mul", || card.hip.silu_mul_device(g, u, (rows * gate.n) as i32))?;
+        self.launch(card, self.matrix(&name("ffn_down_shexp.weight"), gate.n)?, g, card.at(act.shared), rows)?;
+        let open = self.matrix(&name("ffn_gate_inp_shexp.weight"), dim)?;
+        self.launch(card, open, input, card.at(act.shared_open), rows)
     }
 
     /// Finish block `blk`'s feed-forward with the routing on the card:
