@@ -6518,7 +6518,11 @@ fn mtp_process_assumed_span(
     Ok(())
 }
 
-/// Greedy-q for MTP / n-gram / draft-model (one-hot per drafted token).
+/// `q` for Leviathan verify (P14). MTP and n-gram stay one-hot `(token, 1.0)`:
+/// MTP drafts by argmax and the n-gram table has no usable model distribution,
+/// and a one-hot `q` is always valid (accept with `p_x`, else residual `p`
+/// minus the draft), it just cannot raise acceptance. The draft model supplies
+/// its real sampled distribution through [`finish_propose_q`] at T > 0.
 /// Empty `draft_q` leaves verify on exact match (DFlash2, DSpark, flag off).
 fn finish_propose(
     inner: &mut EngineInner,
@@ -6526,8 +6530,24 @@ fn finish_propose(
     drafts: Vec<u32>,
     skip_rejection: bool,
 ) -> Vec<u32> {
+    finish_propose_q(inner, id, drafts, skip_rejection, Vec::new())
+}
+
+/// [`finish_propose`] with the drafter's own per-token distributions. A `q`
+/// that does not line up with `drafts` is ignored (one-hot instead).
+fn finish_propose_q(
+    inner: &mut EngineInner,
+    id: u64,
+    drafts: Vec<u32>,
+    skip_rejection: bool,
+    sampled_q: Vec<Vec<(u32, f32)>>,
+) -> Vec<u32> {
     let q = if inner.rejection_sampling && !skip_rejection && !drafts.is_empty() {
-        drafts.iter().map(|&t| vec![(t, 1.0)]).collect()
+        if sampled_q.len() == drafts.len() && sampled_q.iter().all(|d| !d.is_empty()) {
+            sampled_q
+        } else {
+            drafts.iter().map(|&t| vec![(t, 1.0)]).collect()
+        }
     } else {
         Vec::new()
     };
@@ -6535,6 +6555,24 @@ fn finish_propose(
         req.draft_q = q;
     }
     drafts
+}
+
+/// Draft-model provider for a propose. With `rejection_sampling` on and
+/// T > 0 it samples drafts from its own distribution; the seed comes from the
+/// request RNG so drafts vary across seeds and steps. Otherwise unchanged.
+fn draft_model_provider(
+    inner: &mut EngineInner,
+    id: u64,
+    model: &TinyModel,
+    temperature: f32,
+) -> DraftModelProvider {
+    let provider = DraftModelProvider::new(model.clone());
+    if inner.rejection_sampling && temperature > 1e-5 {
+        if let Ok(req) = request_mut(inner, id) {
+            return provider.with_sampled_q(rand::Rng::gen::<u64>(&mut req.rng));
+        }
+    }
+    provider
 }
 
 fn sample_request_with_draft(
@@ -6629,7 +6667,7 @@ fn propose_after_deferred(
             if mtp && seed.len() == model.config.dim {
                 inner.draft_kv.seed_h_nextn_from_target(&seed);
             }
-            let mut provider = DraftModelProvider::new((*model).clone());
+            let mut provider = draft_model_provider(inner, id, &model, temperature);
             let resident = inner.draft_resident.clone();
             let draft = provider.propose_after(
                 ctx,
@@ -6651,7 +6689,8 @@ fn propose_after_deferred(
             }
             if draft.len() >= 2 {
                 host_stage_draft_tokens(&draft[1..], draft_hip, metrics);
-                return Ok(finish_propose(inner, id, draft, false));
+                let q = provider.take_q();
+                return Ok(finish_propose_q(inner, id, draft, false, q));
             }
         }
     }
@@ -6733,7 +6772,7 @@ fn propose_drafts(
                     inner.draft_kv.seed_h_nextn_from_target(&seed);
                 }
             }
-            let mut provider = DraftModelProvider::new((*model).clone());
+            let mut provider = draft_model_provider(inner, id, &model, temperature);
             let resident = inner.draft_resident.clone();
             let draft = provider.propose_on(
                 &ctx,
@@ -6766,7 +6805,8 @@ fn propose_drafts(
                     );
                 }
                 host_stage_draft_tokens(&draft, draft_hip, metrics);
-                return Ok(finish_propose(inner, id, draft, false));
+                let q = provider.take_q();
+                return Ok(finish_propose_q(inner, id, draft, false, q));
             }
         }
     }
@@ -12580,12 +12620,49 @@ mod tests {
         );
     }
 
+    /// Two-sample chi-square over token counts; bins with a small combined
+    /// count are pooled. Returns `(statistic, degrees_of_freedom)`.
+    fn chi_square_two_sample(a: &HashMap<u32, u32>, b: &HashMap<u32, u32>) -> (f64, f64) {
+        let na: f64 = a.values().map(|c| f64::from(*c)).sum();
+        let nb: f64 = b.values().map(|c| f64::from(*c)).sum();
+        let mut toks: Vec<u32> = a.keys().chain(b.keys()).copied().collect();
+        toks.sort_unstable();
+        toks.dedup();
+        let (mut stat, mut bins) = (0.0f64, 0.0f64);
+        let (mut pool_a, mut pool_b) = (0.0f64, 0.0f64);
+        let mut term = |ca: f64, cb: f64| {
+            let tot = ca + cb;
+            let ea = tot * na / (na + nb);
+            let eb = tot * nb / (na + nb);
+            stat += (ca - ea).powi(2) / ea + (cb - eb).powi(2) / eb;
+            bins += 1.0;
+        };
+        for t in toks {
+            let ca = f64::from(a.get(&t).copied().unwrap_or(0));
+            let cb = f64::from(b.get(&t).copied().unwrap_or(0));
+            if ca + cb >= 10.0 {
+                term(ca, cb);
+            } else {
+                pool_a += ca;
+                pool_b += cb;
+            }
+        }
+        if pool_a + pool_b >= 10.0 {
+            term(pool_a, pool_b);
+        }
+        (stat, (bins - 1.0).max(1.0))
+    }
+
+    /// P14: with a draft model that samples its own `q`, tokens after a draft
+    /// must follow the same distribution as plain decoding. The draft model must
+    /// actually be used (proposed and accepted > 0), and positions 1.. are the
+    /// ones that came out of speculation (position 0 is prefill's).
     #[test]
     fn rejection_sampling_token_frequencies_match_plain_decode() {
         let mut spec_cfg = test_config();
-        spec_cfg.features.ngram_speculation = Some(true);
+        spec_cfg.features.draft_model_speculation = Some(true);
+        spec_cfg.features.ngram_speculation = Some(false);
         spec_cfg.experimental.rejection_sampling = true;
-        spec_cfg.sampling.temperature = 0.7;
         let spec_engine = Engine::new(spec_cfg).unwrap();
 
         let mut plain_cfg = test_config();
@@ -12594,42 +12671,47 @@ mod tests {
             ..CliOverrides::default()
         });
         plain_cfg.experimental.rejection_sampling = true;
-        plain_cfg.sampling.temperature = 0.7;
         let plain_engine = Engine::new(plain_cfg).unwrap();
 
-        let n = 400u32;
-        let mut spec_counts = HashMap::new();
-        let mut plain_counts = HashMap::new();
+        let n = 3000u64;
+        let positions = 4usize;
+        let mut spec_counts = vec![HashMap::<u32, u32>::new(); positions];
+        let mut plain_counts = vec![HashMap::<u32, u32>::new(); positions];
         for seed in 0..n {
             let params = GenerationParams {
-                max_tokens: 1,
+                max_tokens: positions,
                 temperature: 0.7,
-                seed: Some(u64::from(seed)),
+                seed: Some(seed),
                 top_k: 0,
                 top_p: 1.0,
                 ..GenerationParams::default()
             };
             let spec_ids = spec_engine.generate("hello", params.clone()).unwrap().token_ids;
             let plain_ids = plain_engine.generate("hello", params).unwrap().token_ids;
-            if let Some(&tok) = spec_ids.first() {
-                *spec_counts.entry(tok).or_insert(0u32) += 1;
+            for (pos, counts) in spec_counts.iter_mut().enumerate() {
+                if let Some(&tok) = spec_ids.get(pos) {
+                    *counts.entry(tok).or_insert(0) += 1;
+                }
             }
-            if let Some(&tok) = plain_ids.first() {
-                *plain_counts.entry(tok).or_insert(0u32) += 1;
+            for (pos, counts) in plain_counts.iter_mut().enumerate() {
+                if let Some(&tok) = plain_ids.get(pos) {
+                    *counts.entry(tok).or_insert(0) += 1;
+                }
             }
         }
-        let spec_n: u32 = spec_counts.values().sum();
-        let plain_n: u32 = plain_counts.values().sum();
-        assert_eq!(spec_n, n);
-        assert_eq!(plain_n, n);
-        for tok in spec_counts.keys().copied().chain(plain_counts.keys().copied()) {
-            let f_spec = spec_counts.get(&tok).copied().unwrap_or(0) as f32 / n as f32;
-            let f_plain = plain_counts.get(&tok).copied().unwrap_or(0) as f32 / n as f32;
+        let stats = spec_engine.stats();
+        let (proposed, accepted) = (stats.draft_proposed, stats.draft_accepted);
+        assert!(proposed > 0, "the draft model must propose");
+        assert!(accepted > 0, "drafts must be accepted sometimes (proposed {proposed})");
+        assert!(accepted < proposed, "drafts must also be rejected sometimes ({accepted}/{proposed})");
+        for pos in 1..positions {
+            let (stat, df) = chi_square_two_sample(&spec_counts[pos], &plain_counts[pos]);
+            // Mean df, sd sqrt(2 df): fail beyond 3 sigma. Seeds are fixed, so
+            // this is deterministic.
+            let limit = df + 3.0 * (2.0 * df).sqrt();
             assert!(
-                (f_spec - f_plain).abs() < 0.10,
-                "tok {tok}: spec={f_spec} plain={f_plain} spec_n={} plain_n={}",
-                spec_counts.get(&tok).copied().unwrap_or(0),
-                plain_counts.get(&tok).copied().unwrap_or(0)
+                stat <= limit,
+                "position {pos}: chi2 {stat:.1} > {limit:.1} (df {df}) accepted {accepted}/{proposed}"
             );
         }
     }
