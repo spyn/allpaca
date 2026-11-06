@@ -14443,6 +14443,8 @@ mod tests {
             cfg.model.path = Some(path.clone());
             cfg.speculative.enabled = false;
             cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            // Window checkpoints are opt-in (P12); this test is about them.
+            cfg.prompt_cache.dsv4_window_checkpoints = true;
             cfg
         };
         let cold = Engine::new(config(true))
