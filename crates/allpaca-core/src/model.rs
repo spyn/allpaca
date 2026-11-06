@@ -685,6 +685,9 @@ struct WeightRef {
     off: usize,
     n: usize,
     kind: WeightKind,
+    /// Per-tensor output multiplier from a GGUF `<name>.scale` tensor (NVFP4
+    /// files, also after conversion to ROCmFP4); 1.0 when there is none.
+    scale: f32,
 }
 
 impl WeightRef {
@@ -693,6 +696,7 @@ impl WeightRef {
             off,
             n,
             kind: WeightKind::F32,
+            scale: 1.0,
         }
     }
 
@@ -2484,7 +2488,11 @@ impl ResidentModel {
             WeightKind::Nvfp4 => {
                 hip.gemm_nt_nvfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+        }?;
+        if w.scale != 1.0 {
+            hip.scale_f32(c, m as usize * n as usize, w.scale)?;
         }
+        Ok(())
     }
 
     fn embed_gather(
@@ -3926,6 +3934,7 @@ fn append_gguf_lm_head<'a>(
         off: *off,
         n,
         kind: WeightKind::Q4_0,
+        scale: 1.0,
     };
     *off += part.len();
     tracing::info!(tensor = name, bytes = part.len(), "MTP draft LM head staged as Q4_0");
@@ -4223,6 +4232,11 @@ fn append_gguf_tensor_as<'a>(
                 } else {
                     allpaca_cpu::dequant_rocmfp4(packed, n, &mut f32s)?;
                 }
+                if let Some(scale) = file.nvfp4_tensor_scale(name)? {
+                    for v in &mut f32s {
+                        *v *= scale;
+                    }
+                }
                 let mut bytes = Vec::with_capacity(n * 4);
                 for v in f32s {
                     bytes.extend_from_slice(&v.to_le_bytes());
@@ -4393,7 +4407,17 @@ fn append_gguf_tensor_as<'a>(
         parts.push(UploadPart::Owned(vec![0u8; pad]));
         *off += pad;
     }
-    let w = WeightRef { off: *off, n, kind };
+    let scale = if matches!(kind, WeightKind::RocmFp4 | WeightKind::RocmFp4Fast) {
+        file.nvfp4_tensor_scale(name)?.unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    let w = WeightRef {
+        off: *off,
+        n,
+        kind,
+        scale,
+    };
     *off += part.len();
     parts.push(part);
     Ok(w)
@@ -4419,16 +4443,19 @@ fn split_fused_qkv_ref(
         off: fused.off,
         n: q_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     let k = WeightRef {
         off: q.off + q_out * row_bytes,
         n: kv_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     let v = WeightRef {
         off: k.off + kv_out * row_bytes,
         n: kv_out * input_dim,
         kind: fused.kind,
+        scale: fused.scale,
     };
     Ok([q, k, v])
 }
@@ -4575,6 +4602,7 @@ fn split_packed_experts(
             off: w.off + e * stride,
             n: n_per,
             kind: w.kind,
+            scale: w.scale,
         })
         .collect())
 }
