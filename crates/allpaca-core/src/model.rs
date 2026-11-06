@@ -3942,9 +3942,6 @@ fn append_gguf_lm_head<'a>(
     Ok(w)
 }
 
-/// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
-/// types re-pack to Q8_0 at load: every value lands on (or within half a step
-/// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
 /// An NVFP4 weight runs through the native device GEMV (re-packed at load)
 /// when it is big, whole 64-weight blocks per row, and `ALLPACA_NVFP4_Q8=1` is
 /// not set (that keeps the Q8_0 re-pack, for A/B).
@@ -3956,6 +3953,9 @@ fn nvfp4_native(info: &allpaca_gguf::TensorInfo) -> bool {
         && std::env::var("ALLPACA_NVFP4_Q8").map_or(true, |v| v != "1")
 }
 
+/// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
+/// types re-pack to Q8_0 at load: every value lands on (or within half a step
+/// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
 fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
     use allpaca_gguf::GgmlType as T;
     matches!(
