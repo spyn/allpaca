@@ -675,6 +675,9 @@ enum WeightKind {
     RocmFp4Fast,
     /// MoESQ paired-4:8 sparse FP4 (tensor type 200): 12-byte blocks.
     P48Fp4,
+    /// NVFP4 (ggml type 40) re-packed at load: 20-byte blocks of 32 weights,
+    /// f16 scales with the tensor `.scale` folded in (`repack_nvfp4_dev`).
+    Nvfp4,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2425,6 +2428,7 @@ impl ResidentModel {
             | WeightKind::TQ2_0
             | WeightKind::RocmFp4
             | WeightKind::RocmFp4Fast
+            | WeightKind::Nvfp4
             | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4 norm must be F32 at load".into(),
             ))),
@@ -2477,6 +2481,9 @@ impl ResidentModel {
             WeightKind::P48Fp4 => {
                 hip.gemm_nt_p48fp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::Nvfp4 => {
+                hip.gemm_nt_nvfp4_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }
     }
 
@@ -2513,6 +2520,7 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Nvfp4
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -2564,6 +2572,7 @@ impl ResidentModel {
                 dim,
             ),
             WeightKind::P48Fp4
+            | WeightKind::Nvfp4
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -3927,6 +3936,17 @@ fn append_gguf_lm_head<'a>(
 /// Low-bit ggml types with no fused HIP GEMV. Large GEMM weights of these
 /// types re-pack to Q8_0 at load: every value lands on (or within half a step
 /// of) the Q8_0 grid, at ~1.1 B/elem instead of a 4 B/elem F32 expand.
+/// An NVFP4 weight runs through the native device GEMV (re-packed at load)
+/// when it is big, whole 64-weight blocks per row, and `ALLPACA_NVFP4_Q8=1` is
+/// not set (that keeps the Q8_0 re-pack, for A/B).
+fn nvfp4_native(info: &allpaca_gguf::TensorInfo) -> bool {
+    let k = info.dims.first().copied().unwrap_or(0) as usize;
+    info.n_elements() > 65_536
+        && k != 0
+        && k % allpaca_cpu::NVFP4_BLOCK_ELEMS == 0
+        && std::env::var("ALLPACA_NVFP4_Q8").map_or(true, |v| v != "1")
+}
+
 fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
     use allpaca_gguf::GgmlType as T;
     matches!(
@@ -4020,6 +4040,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         T::Q4_K | T::Q5_K | T::Q6_K | T::TQ1_0 | T::TQ2_0 | T::RocmFp4 | T::RocmFp4Fast | T::P48Fp4 => {
             info.nbytes() as u64
         }
+        T::Nvfp4 if nvfp4_native(info) => n / 32 * allpaca_cpu::NVFP4_DEV_BLOCK_BYTES as u64,
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
         T::Q8_0 | T::RocmFpxQ8 => q8_staged,
         ty if rocmfpx_as_f16(ty) => n * 2,
@@ -4325,6 +4346,18 @@ fn append_gguf_tensor_as<'a>(
             }
             (UploadPart::Owned(bytes), WeightKind::F16)
         }
+        allpaca_gguf::GgmlType::Nvfp4 if !gather && nvfp4_native(info) => {
+            let k = *info.dims.first().unwrap_or(&1) as usize;
+            if n % k != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "NVFP4 GEMV {name} dims {:?} do not tile n={n}",
+                    info.dims
+                ))));
+            }
+            let scale = file.nvfp4_tensor_scale(name)?.unwrap_or(1.0);
+            let dev = allpaca_cpu::repack_nvfp4_dev(file.tensor_bytes(name)?, n, scale)?;
+            (UploadPart::Owned(dev), WeightKind::Nvfp4)
+        }
         ty if !gather && n > 65_536 && requant_q8_0_on_load(ty) => {
             let k = *info.dims.first().unwrap_or(&1) as usize;
             if k == 0 || k % 32 != 0 || n % k != 0 {
@@ -4448,6 +4481,11 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::ROCMFP4_BLOCK_ELEMS).saturating_mul(block_bytes)
+        }
+        WeightKind::Nvfp4 => {
+            return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                "{what}: NVFP4 experts have no device kernel yet; set ALLPACA_NVFP4_Q8=1"
+            ))));
         }
         WeightKind::P48Fp4 => {
             if n_per % allpaca_cpu::P48FP4_BLOCK_ELEMS != 0 {

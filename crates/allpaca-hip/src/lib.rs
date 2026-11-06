@@ -607,6 +607,15 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_gemm_nt_nvfp4(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_gemm_nt_p48fp4(
             a: *const f32,
             b: *const u8,
@@ -3201,6 +3210,31 @@ pub fn gemm_nt_rocmfp4_fast_device(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_rocmfp4_fast unavailable".into(),
+        )))
+    }
+}
+
+/// `C[m,n] = A[m,k] * W^T` for NVFP4 weights re-packed by
+/// `allpaca_cpu::repack_nvfp4_dev` (20-byte blocks, f16 scales). `k` must be a
+/// multiple of 32.
+pub fn gemm_nt_nvfp4_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_nvfp4(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_nvfp4")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_nvfp4 unavailable".into(),
         )))
     }
 }
@@ -7473,6 +7507,24 @@ impl HipWorkspace {
             DecodeOp::Q8Gemm
         };
         self.timed_gpu(op, || gemm_nt_rocmfp4_fast_device(a, b, c, m, n, k))
+    }
+
+    /// NVFP4 GEMV on the device layout; accounted like [`Self::gemm_nt_rocmfp4_dev`].
+    pub fn gemm_nt_nvfp4_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        let op = if self.lm_head.load(Ordering::Relaxed) != 0 {
+            DecodeOp::LmHead
+        } else {
+            DecodeOp::Q8Gemm
+        };
+        self.timed_gpu(op, || gemm_nt_nvfp4_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q6_k_dev(
@@ -16590,6 +16642,65 @@ mod tests {
                 assert!(
                     i8_gemv_close(got[i], cpu[i], abs_max(&cpu)),
                     "gemm_nt_rocmfp4_fast vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
+                    got[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// NVFP4 device-layout GEMV equals the CPU decode of the same blocks
+    /// within the int8-activation tolerance, for decode and multi-row shapes.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_nvfp4_matches_cpu_dequant() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(1, 4, 64), (1, 8, 256), (3, 5, 128), (1, 70, 512), (9, 9, 320)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let mut a = vec![0.0f32; m * k];
+            for (i, v) in a.iter_mut().enumerate() {
+                *v = ((i * 17 + si * 3) % 50) as f32 * 0.02 - 0.5;
+            }
+            // Pseudo-random NVFP4 blocks with finite scales.
+            let nb = n * k / 64;
+            let mut raw = vec![0u8; nb * allpaca_cpu::NVFP4_BLOCK_BYTES];
+            for (i, b) in raw.iter_mut().enumerate() {
+                *b = (i.wrapping_mul(2654435761usize) >> 7) as u8;
+            }
+            for blk in raw.chunks_exact_mut(allpaca_cpu::NVFP4_BLOCK_BYTES) {
+                for (i, s) in blk[..4].iter_mut().enumerate() {
+                    *s = 0x30 + ((*s as usize + i) % 16) as u8;
+                }
+            }
+            let ts = 2.5e-3f32;
+            let dev = allpaca_cpu::repack_nvfp4_dev(&raw, n * k, ts).unwrap();
+            let mut b_deq = vec![0.0f32; n * k];
+            allpaca_cpu::dequant_nvfp4_dev(&dev, n * k, &mut b_deq);
+            let mut cpu = vec![0.0f32; m * n];
+            cpu_gemm_nt(&a, &b_deq, &mut cpu, m, n, k);
+
+            let da = device_malloc(a.len() * 4, 0).unwrap();
+            let db = device_malloc(dev.len(), 0).unwrap();
+            let dc = device_malloc(m * n * 4, 0).unwrap();
+            set_device(0).unwrap();
+            memcpy(da, a.as_ptr().cast(), a.len() * 4, MEMCPY_H2D).unwrap();
+            memcpy(db, dev.as_ptr(), dev.len(), MEMCPY_H2D).unwrap();
+            gemm_nt_nvfp4_device(da.cast(), db, dc.cast(), m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_nvfp4 must run when a device is present");
+            let mut got = vec![0.0f32; m * n];
+            memcpy(got.as_mut_ptr().cast(), dc, m * n * 4, MEMCPY_D2H).unwrap();
+            device_free(da, a.len() * 4);
+            device_free(db, dev.len());
+            device_free(dc, m * n * 4);
+            for i in 0..m * n {
+                assert!(
+                    i8_gemv_close(got[i], cpu[i], abs_max(&cpu)),
+                    "gemm_nt_nvfp4 vs cpu, shape {m}x{n}x{k} idx={i}: {} vs {}",
                     got[i],
                     cpu[i]
                 );
