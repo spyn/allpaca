@@ -138,6 +138,31 @@ enabled = false
 min_confidence = 0.9
 min_calibration_margin = 0.05
 
+# EXPERIMENTAL: techniques that leave the exact-output path. Every option is
+# off by default, a run with one on is reported as `lossy` (or
+# `distribution-exact`) in the startup log, /stats and every bench sample, and
+# the option is part of the prompt-cache key.
+[experimental]
+# Route-tail skip (Strata): on a block whose routed experts are NOT resident
+# on the GPU (host RAM, SSD tier, RPC worker), drop an expert that misses the
+# cache when every token of the verify/prefill window ranks it at or below
+# `route_tail_skip_rank` among its top-k picks. The other picks keep their
+# weights (no renormalisation); the top pick of a token is never dropped.
+# Fewer expert fetches per token, at a cost in quality. Lossy.
+route_tail_skip = false
+# Rank 0 is a token's best pick. At least 1; capped at k-1 of the window's
+# longest pick list, so a model with fewer picks than the rank (DSV4 picks 6)
+# still skips its last-ranked experts. Lower = more skipped = faster and worse.
+route_tail_skip_rank = 7
+# Measured (CPU host forward, where every expert counts as a miss, so this is
+# an upper bound on the loss; Qwen3.8-Flash-Next GSQ-RCO Q2_0, KL of the run
+# against the exact run, ~1300 positions of English documentation):
+#   rank 7: 0.0116 nats/token, same top token 94.4%
+#   rank 5: 0.0172,            92.9%
+#   rank 3: 0.0335,            91.7%
+# A smaller sample (~190 positions) gave 0.0071 at rank 7: check on your own
+# prompts before relying on it. The speed gain has not been measured yet.
+
 # Overlay pipeline-mode defaults. Uncomment only the flags you want to force.
 # [features]
 # asymmetric_drafting = true

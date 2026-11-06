@@ -579,8 +579,13 @@ impl std::fmt::Display for ExactnessLevel {
 #[serde(default)]
 pub struct ExperimentalSection {
     pub rejection_sampling: bool,
+    /// Strata route-tail skip: drop missed (non-resident) experts that every
+    /// token of the window ranks at or below `route_tail_skip_rank`. Lossy:
+    /// KL 0.0116 nats/token at rank 7 on Flash-Next Q2_0 (measured, CPU upper
+    /// bound). See the `[experimental]` section of `allpaca.example.toml`.
     pub route_tail_skip: bool,
     /// Rank at or below which missed experts are skipped (Strata default 7).
+    /// Clamped to at least 1 and to the window's pick count minus 1.
     pub route_tail_skip_rank: u32,
     pub row_variant_kernels: bool,
     pub chunked_gdn: bool,
