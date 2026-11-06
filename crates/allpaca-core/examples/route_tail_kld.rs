@@ -1,6 +1,7 @@
 //! What the route-tail skip does to a qwen4exp model's predictions: KL
 //! divergence (nats per token) and top-token agreement against the exact run,
-//! both on the CPU host forward.
+//! both on the CPU host forward, the skipped run one token per routing window
+//! (as in decode). Slow: about a token per second or two on a big model.
 //!
 //!     cargo run --release -p allpaca-core --example route_tail_kld -- <model.gguf> <text.txt> [--tokens N] [--rank R]...
 //!
