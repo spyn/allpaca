@@ -820,6 +820,15 @@ pub struct PromptCacheSection {
     /// back only if that is this many times faster than prefilling the
     /// tokens it gains, by measured rates. 0 = always read it back.
     pub min_fetch_speedup: f64,
+    /// DeepSeek-V4: cut every prefill chunk at the sliding-window stride and
+    /// keep a checkpoint (the compressed attention memory plus the last
+    /// window of keys and values) at each one, so a prompt that shares a
+    /// prefix resumes instead of prefilling it again. Lossless, but it costs
+    /// extra, shorter prefill chunks and RAM (and disk, when the disk tier
+    /// is on, which this switch also enables for DSV4). Its bytes and
+    /// time-to-first-token are unmeasured. Off = DSV4 prefills as before and
+    /// keeps no prompt cache.
+    pub dsv4_window_checkpoints: bool,
 }
 
 impl Default for PromptCacheSection {
@@ -832,6 +841,7 @@ impl Default for PromptCacheSection {
             worker: false,
             boundary_tokens: 2048,
             min_fetch_speedup: 2.0,
+            dsv4_window_checkpoints: false,
         }
     }
 }
@@ -1582,6 +1592,7 @@ mod tests {
         assert_eq!(cfg.prompt_cache.disk_bytes, 2048);
         assert_eq!(defaults.prompt_cache.disk_dir, None);
         assert_eq!(defaults.prompt_cache.boundary_tokens, 2048);
+        assert!(!defaults.prompt_cache.dsv4_window_checkpoints);
         assert!(!defaults.prompt_cache.worker);
     }
 }

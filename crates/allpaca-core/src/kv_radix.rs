@@ -1989,6 +1989,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Files written by earlier builds stay readable: v3 has no drafter
+    /// trailer and no Dsv4Memory byte, v4 has the drafter but no Dsv4Memory
+    /// byte. A version this build does not know is refused, not guessed at.
+    #[test]
+    fn old_checkpoint_files_still_decode_and_newer_ones_are_refused() {
+        let tokens = [4u32, 5, 6];
+        let cp = rich_cp(3);
+        let v5 = encode_file(&tokens, &cp);
+        // Nothing to carry: the drafter trailer is one 0 byte and so is the
+        // Dsv4Memory flag, in that order, at the end.
+        assert_eq!(&v5[v5.len() - 2..], &[0, 0]);
+        let with_version = |mut bytes: Vec<u8>, version: u32, cut: usize| {
+            bytes.truncate(bytes.len() - cut);
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            bytes
+        };
+        let v4 = with_version(v5.clone(), 4, 1);
+        let v3 = with_version(v5.clone(), 3, 2);
+        for (name, file) in [("v5", v5.clone()), ("v4", v4), ("v3", v3)] {
+            let back = decode_file(&file, &tokens).unwrap_or_else(|| panic!("{name} file must decode"));
+            assert_eq!(back.kv_rows(), cp.kv_rows(), "{name} keys and values");
+            assert_eq!(back.recurrent.gdn_state, cp.recurrent.gdn_state, "{name} state");
+            assert!(back.recurrent.dsv4.is_empty(), "{name} has no DSV4 memory");
+            assert!(back.draft.is_none(), "{name} has no drafter");
+        }
+        let v6 = with_version(v5.clone(), 6, 0);
+        assert!(decode_file(&v6, &tokens).is_none(), "a v6 file must be refused");
+        assert!(header_of(&v6).is_none(), "a v6 header must be refused");
+        let v2 = with_version(v5, 2, 0);
+        assert!(decode_file(&v2, &tokens).is_none(), "a v2 file must be refused");
+    }
+
     /// A later turn resumes the drafter that was warmed with this prefix.
     /// The bytes ride in the checkpoint file, so a RAM miss still brings them back.
     #[test]

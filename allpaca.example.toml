@@ -132,6 +132,12 @@ disk_bytes = 17179869184     # 16 GiB
 worker = false               # keep them on an RPC worker's store instead of disk_dir
 boundary_tokens = 2048       # hybrids also keep their state every this many tokens
 min_fetch_speedup = 2.0      # read a checkpoint back from disk/worker only if 2x faster than prefill (measured); 0 = always
+# DeepSeek-V4 only. true = cut each prefill chunk at the sliding-window stride (128 tokens, not
+# prefill.chunk_tokens) and keep a checkpoint there, so a shared prefix resumes. Output stays
+# identical to a cold prefill. Cost: more, shorter prefill chunks, RAM (about 13 KB per token plus
+# the window rows per checkpoint) and, with disk_dir/worker set, disk writes. The cost is UNMEASURED
+# on a real model. false = DSV4 prefills as before and keeps no prompt cache (RAM, disk or worker).
+dsv4_window_checkpoints = false
 
 [early_exit]
 enabled = false

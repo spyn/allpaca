@@ -475,6 +475,30 @@ impl Dsv4Memory {
         self.layers.is_empty()
     }
 
+    /// Whether this memory has taken in exactly `n` tokens: every layer that
+    /// keeps one (a layer without a compressor never does) is at `n`, and
+    /// with `needed` at least one is. A checkpoint whose memory is short or
+    /// long for the rows it resumes would continue from the wrong state.
+    pub(crate) fn covers(&self, n: usize, needed: bool) -> bool {
+        let mut any = false;
+        for layer in self.layers.iter().filter(|l| l.tokens != 0) {
+            if layer.tokens != n {
+                return false;
+            }
+            any = true;
+        }
+        any || !needed
+    }
+
+    /// Drop the last `by` tokens' claim from every layer, as a truncated or
+    /// stale checkpoint would look.
+    #[cfg(test)]
+    pub(crate) fn pretend_short(&mut self, by: usize) {
+        for layer in &mut self.layers {
+            layer.tokens = layer.tokens.saturating_sub(by);
+        }
+    }
+
     /// Append to a prompt-cache checkpoint file.
     pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
         use crate::kv_codec::write_f32s;
@@ -706,6 +730,20 @@ pub fn attend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_memory_covers_only_the_tokens_it_took_in() {
+        let mem = Dsv4Memory::from_test_keys(vec![1.0; 4], 12);
+        assert!(mem.covers(12, true));
+        assert!(!mem.covers(11, true), "one token short");
+        assert!(!mem.covers(13, false), "one token long");
+        let mut short = mem.clone();
+        short.pretend_short(1);
+        assert!(!short.covers(12, true), "a truncated memory");
+        // No compressed layer in the model: nothing to hold, nothing to check.
+        assert!(Dsv4Memory::default().covers(12, false));
+        assert!(!Dsv4Memory::default().covers(12, true), "an empty memory where one is needed");
+    }
 
     #[test]
     fn fp8_rounds_each_block_to_e4m3_at_its_own_scale() {
