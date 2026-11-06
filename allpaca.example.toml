@@ -154,14 +154,20 @@ route_tail_skip = false
 # longest pick list, so a model with fewer picks than the rank (DSV4 picks 6)
 # still skips its last-ranked experts. Lower = more skipped = faster and worse.
 route_tail_skip_rank = 7
-# Measured (CPU host forward, where every expert counts as a miss, so this is
-# an upper bound on the loss; Qwen3.8-Flash-Next GSQ-RCO Q2_0, KL of the run
-# against the exact run, ~1300 positions of English documentation):
-#   rank 7: 0.0116 nats/token, same top token 94.4%
-#   rank 5: 0.0172,            92.9%
-#   rank 3: 0.0335,            91.7%
-# A smaller sample (~190 positions) gave 0.0071 at rank 7: check on your own
-# prompts before relying on it. The speed gain has not been measured yet.
+# Measured loss, decode-style (one token per routing window), on the CPU host
+# forward where every expert counts as a miss; Qwen3.8-Flash-Next GSQ-RCO Q2_0
+# (10 picks per token), 8 English paragraphs, ~380 positions, KL of the run
+# against the exact run in nats per token, and how often both pick the same
+# top token:
+#   rank 9: 0.0264, 92.2%    (drops only the last-ranked pick)
+#   rank 8: 0.0477, 88.0%
+#   rank 7: 0.0778, 83.9%
+# A real run only skips experts that actually miss the cache, so its loss is
+# lower than this, by an amount that depends on the miss rate; nobody has
+# measured that yet, and the speed gain has not been measured either. Batch
+# windows (prefill, verify) skip less than a single token does. Skipped
+# experts get no cache heat, so an expert that only ever ranks in the tail is
+# never cached. Check the quality on your own prompts before relying on it.
 
 # Overlay pipeline-mode defaults. Uncomment only the flags you want to force.
 # [features]

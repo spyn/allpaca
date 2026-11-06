@@ -581,8 +581,10 @@ pub struct ExperimentalSection {
     pub rejection_sampling: bool,
     /// Strata route-tail skip: drop missed (non-resident) experts that every
     /// token of the window ranks at or below `route_tail_skip_rank`. Lossy:
-    /// KL 0.0116 nats/token at rank 7 on Flash-Next Q2_0 (measured, CPU upper
-    /// bound). See the `[experimental]` section of `allpaca.example.toml`.
+    /// KL 0.078 nats/token at rank 7 and 0.026 at rank 9 on Flash-Next Q2_0
+    /// with one token per window and every expert a miss (measured; a real run
+    /// skips only cache misses, so less). See the `[experimental]` section of
+    /// `allpaca.example.toml`.
     pub route_tail_skip: bool,
     /// Rank at or below which missed experts are skipped (Strata default 7).
     /// Clamped to at least 1 and to the window's pick count minus 1.
