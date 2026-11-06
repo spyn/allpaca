@@ -3338,6 +3338,18 @@ impl Engine {
                 },
                 found => found,
             };
+            // A DSV4 checkpoint resumes only if its compressed memory holds
+            // exactly the `n` tokens being restored; otherwise prefill cold.
+            let found = match (found, target.dsv4.as_ref()) {
+                (Some((n, cp)), Some(w)) if !cp.recurrent.dsv4.covers(n, w.spec.attn.compresses()) => {
+                    tracing::warn!(
+                        tokens = n,
+                        "prompt cache: a DSV4 checkpoint's memory does not cover its depth, prefilling cold"
+                    );
+                    None
+                }
+                (found, _) => found,
+            };
             if let Some((n, cp)) = found {
                 if n > prefill_pos {
                     resumed_draft = cp.draft.clone();
@@ -4641,10 +4653,13 @@ impl Engine {
         // still has to forward its last prompt token: the checkpoint goes one
         // token before the end, so the same prompt again finds it.
         let q4x = inner.target.as_ref().is_some_and(|t| t.q4x.is_some());
+        // 0 = no window stride: default chunking and no DSV4 checkpoints
+        // unless `prompt_cache.dsv4_window_checkpoints` is on.
         let dsv4_window = inner
             .target
             .as_ref()
             .and_then(|t| t.dsv4.as_ref())
+            .filter(|_| self.config.prompt_cache.dsv4_window_checkpoints)
             .map(|w| w.spec.attn.window)
             .unwrap_or(0);
         let (start, total, toks, pages) = {
@@ -5074,8 +5089,11 @@ impl Engine {
         inner.prefill_rate = Default::default();
         let pc = &self.config.prompt_cache;
         // Hosted worker state is not part of a checkpoint file. DSV4
-        // compressed memory is, as of APKC v5.
-        if target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted()) {
+        // compressed memory is, as of APKC v5, but DSV4 checkpoints (and so
+        // the disk and worker tiers) are opt-in.
+        if target.rpc.as_ref().is_some_and(|rpc| rpc.has_hosted())
+            || (target.dsv4.is_some() && !pc.dsv4_window_checkpoints)
+        {
             return;
         }
         if settings.is_none() && (pc.worker || pc.disk_dir.is_some()) {
@@ -14090,6 +14108,7 @@ mod tests {
             cfg.model.path = Some(path.clone());
             cfg.speculative.enabled = false;
             cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg.prompt_cache.dsv4_window_checkpoints = true;
             cfg
         };
         let cold = Engine::new(config())
@@ -14110,6 +14129,118 @@ mod tests {
             hit.token_ids, cold.token_ids,
             "restored tokens must equal a cold prefill"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A tiny window-8 DSV4 file, a 24-token prompt and a CPU config with the
+    /// window checkpoints `on` or off.
+    fn tiny_dsv4_swa_setup(on: bool) -> (std::path::PathBuf, String, GenerationParams, impl Fn() -> Config) {
+        let path = std::env::temp_dir().join(format!(
+            "allpaca_tiny_dsv4_swa_opt-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::deepseek4::write_tiny_deepseek4_ctx_gguf(
+            &path,
+            &crate::deepseek4::TinyDsv4Ctx {
+                window: 8,
+                compress_ratios: vec![4],
+                top_k: 0,
+                swiglu_clamp: 0.0,
+                swiglu_clamp_shexp: 0.0,
+            },
+        );
+        let params = GenerationParams {
+            max_tokens: 4,
+            temperature: 0.0,
+            seed: Some(7),
+            ..GenerationParams::default()
+        };
+        let words = ["hi", "a", "b", "c", "d"];
+        let prompt: String = (0..24).map(|i| words[i % 5]).collect::<Vec<_>>().join(" ");
+        let file = path.clone();
+        let config = move || {
+            let mut cfg = Config::compiled_defaults();
+            cfg.merge_cli(&CliOverrides {
+                cpu_only: true,
+                ..CliOverrides::default()
+            });
+            cfg.model.synthetic = false;
+            cfg.model.path = Some(file.clone());
+            cfg.speculative.enabled = false;
+            cfg.prompt_cache.codec = allpaca_types::KvCodec::F32;
+            cfg.prompt_cache.dsv4_window_checkpoints = on;
+            cfg
+        };
+        (path, prompt, params, config)
+    }
+
+    /// Off (the default): DSV4 prefills in one default-sized chunk, keeps no
+    /// checkpoint, restores nothing, and a repeated prompt is a cold prefill
+    /// that gives the same tokens as the first.
+    #[test]
+    fn dsv4_window_checkpoints_are_off_by_default() {
+        assert!(!Config::compiled_defaults().prompt_cache.dsv4_window_checkpoints);
+        let (path, prompt, params, config) = tiny_dsv4_swa_setup(false);
+        let engine = Engine::new(config()).expect("tiny DSV4 must load");
+        let first = engine.generate(&prompt, params.clone()).expect("first generate");
+        let after_first = engine.stats();
+        assert_eq!(after_first.prefill_chunks, 1, "one default-sized chunk, not window strides; {after_first:?}");
+        let again = engine.generate(&prompt, params).expect("repeated generate");
+        let stats = engine.stats();
+        assert_eq!(stats.radix_bytes, 0, "no checkpoint is captured; {stats:?}");
+        assert_eq!(stats.radix_hits, 0, "nothing to restore; {stats:?}");
+        assert_eq!(stats.prefill_chunks, 2, "the repeat prefills in one chunk too; {stats:?}");
+        assert_eq!(again.token_ids, first.token_ids);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// On: the prompt is cut at window strides and each leaves a checkpoint.
+    #[test]
+    fn dsv4_window_checkpoints_cut_chunks_and_capture_when_on() {
+        let (path, prompt, params, config) = tiny_dsv4_swa_setup(true);
+        let engine = Engine::new(config()).expect("tiny DSV4 must load");
+        engine.generate(&prompt, params).expect("generate");
+        let stats = engine.stats();
+        assert!(stats.prefill_chunks >= 3, "24 tokens at window 8 are 3+ chunks; {stats:?}");
+        assert!(stats.radix_bytes > 0, "stride checkpoints are held; {stats:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A checkpoint whose compressed memory does not cover the rows it would
+    /// resume is a miss: the prompt prefills cold and still matches.
+    #[test]
+    fn a_dsv4_checkpoint_with_a_short_memory_is_a_miss() {
+        let (path, prompt, params, config) = tiny_dsv4_swa_setup(true);
+        let cold = Engine::new(config())
+            .expect("tiny DSV4 must load")
+            .generate(&prompt, params.clone())
+            .expect("cold generate");
+        let engine = Engine::new(config()).expect("tiny DSV4 must load");
+        engine.generate(&prompt, params.clone()).expect("warm generate");
+        {
+            let mut inner = engine.lock().expect("lock");
+            let tokens = inner.tokenizer.as_ref().expect("tokenizer").encode(&prompt).expect("encode");
+            // The deepest one a request for this prompt may resume.
+            let (n, mut cp) = inner
+                .kv_radix
+                .lookup_checkpoint_capped(&tokens, tokens.len() - 1, crate::kv_radix::FetchRule::ALWAYS)
+                .expect("a stride checkpoint is held");
+            assert!(n >= 16, "the deep stride, so a restore would skip most of the prompt: {n}");
+            assert!(cp.recurrent.dsv4.covers(n, true), "a captured memory covers its depth");
+            cp.recurrent.dsv4.pretend_short(1);
+            inner.kv_radix.reset();
+            inner.kv_radix.insert_checkpoint(&tokens[..n], cp);
+        }
+        let chunks_before = engine.stats().prefill_chunks;
+        let out = engine.generate(&prompt, params).expect("generate over a bad checkpoint");
+        // Cold is a chunk per 8-token stride (3+); a restore leaves at most one.
+        let chunks = engine.stats().prefill_chunks - chunks_before;
+        assert!(chunks >= 3, "a mismatched checkpoint is not restored, the prompt prefills cold; {chunks} chunks");
+        assert_eq!(out.token_ids, cold.token_ids, "and the cold prefill matches");
         let _ = std::fs::remove_file(path);
     }
 
