@@ -4,7 +4,7 @@ use allpaca_hip::HipWorkspace;
 use allpaca_types::{AllpacaError, GenerationParams};
 
 use crate::model::{DenseKv, ResidentModel, TinyModel};
-use crate::sampling::{argmax, rng_from_params, sample};
+use crate::sampling::{argmax, rng_from_params, sample, sample_from_distribution, softmax_candidates};
 use crate::telemetry::Metrics;
 
 pub trait DraftProvider {
@@ -110,11 +110,38 @@ impl DraftProvider for NGramProvider {
 /// proposes on that warmed process KV (not an empty DenseKv clone).
 pub struct DraftModelProvider {
     model: TinyModel,
+    /// P14: when set (and T > 0) drafts are sampled from the model's own
+    /// softmaxed distribution with this RNG seed, and that distribution is kept
+    /// in `last_q`. Leviathan is only valid if the draft was drawn from `q`.
+    q_seed: Option<u64>,
+    last_q: Vec<Vec<(u32, f32)>>,
 }
+
+/// Candidates kept in a sampled draft distribution. The draft is drawn from
+/// the truncated, renormalised list, so it is still exactly `q`.
+const DRAFT_Q_TOP_K: usize = 64;
 
 impl DraftModelProvider {
     pub fn new(model: TinyModel) -> Self {
-        Self { model }
+        Self {
+            model,
+            q_seed: None,
+            last_q: Vec::new(),
+        }
+    }
+
+    /// Sample drafts from the draft model's own distribution (seeded by
+    /// `seed`) instead of the fixed-seed `top_k: 1` path. Opt-in (P14).
+    pub fn with_sampled_q(mut self, seed: u64) -> Self {
+        self.q_seed = Some(seed);
+        self
+    }
+
+    /// Per-token draft distributions of the last propose, aligned with its
+    /// tokens (a forced token gets a one-hot). Empty unless `with_sampled_q`
+    /// was set and the temperature was above greedy.
+    pub fn take_q(&mut self) -> Vec<Vec<(u32, f32)>> {
+        std::mem::take(&mut self.last_q)
     }
 
     pub fn propose_on(
@@ -236,8 +263,31 @@ impl DraftModelProvider {
             ..GenerationParams::default()
         };
         let mut rng = rng_from_params(&params, Some(1));
+        let sampled_q = self.q_seed.filter(|_| temperature > 1e-5);
+        let mut q_rng = rng_from_params(
+            &GenerationParams {
+                seed: sampled_q,
+                ..GenerationParams::default()
+            },
+            Some(1),
+        );
+        let q_params = GenerationParams {
+            temperature,
+            top_k: DRAFT_Q_TOP_K,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        self.last_q.clear();
         for i in 0..max_tokens {
             let next = if let (0, Some(tok)) = (i, forced) {
+                if sampled_q.is_some() {
+                    self.last_q.push(vec![(tok, 1.0)]);
+                }
+                tok
+            } else if sampled_q.is_some() {
+                let q = softmax_candidates(&mut logits, None, &q_params);
+                let tok = sample_from_distribution(&q, &mut q_rng);
+                self.last_q.push(q);
                 tok
             } else if temperature <= 1e-5 {
                 argmax(&logits)

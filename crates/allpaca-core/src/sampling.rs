@@ -15,6 +15,17 @@ pub fn softmax_candidates(
     mask: Option<&TokenMask>,
     params: &GenerationParams,
 ) -> Vec<(u32, f32)> {
+    softmax_inner(logits, mask, params).0
+}
+
+/// [`softmax_candidates`] plus whether a plain draw consumes the RNG. Main's
+/// `sample` returned without touching the RNG when every logit was
+/// non-finite or no candidate survived temperature; keep those streams.
+fn softmax_inner(
+    logits: &mut [f32],
+    mask: Option<&TokenMask>,
+    params: &GenerationParams,
+) -> (Vec<(u32, f32)>, bool) {
     if let Some(mask) = mask {
         for (i, logit) in logits.iter_mut().enumerate() {
             if !mask.allowed(i) {
@@ -23,20 +34,20 @@ pub fn softmax_candidates(
         }
     }
     if logits.iter().all(|l| !l.is_finite()) {
-        return vec![(0, 1.0)];
+        return (vec![(0, 1.0)], false);
     }
     if params.temperature <= 1e-5 {
-        return vec![(argmax(logits), 1.0)];
+        return (vec![(argmax(logits), 1.0)], false);
     }
     apply_temperature(logits, params.temperature);
     let mut candidates = collect_finite(logits);
     if candidates.is_empty() {
-        return vec![(argmax(logits), 1.0)];
+        return (vec![(argmax(logits), 1.0)], false);
     }
     apply_top_k(&mut candidates, params.top_k);
     apply_top_p(&mut candidates, params.top_p);
     softmax_pairs(&mut candidates);
-    candidates
+    (candidates, true)
 }
 
 /// Draw from a softmaxed candidate list with the same unit-interval walk
@@ -61,7 +72,10 @@ pub fn sample(
     params: &GenerationParams,
     rng: &mut StdRng,
 ) -> u32 {
-    let candidates = softmax_candidates(logits, mask, params);
+    let (candidates, draws) = softmax_inner(logits, mask, params);
+    if !draws {
+        return candidates.first().map(|(id, _)| *id).unwrap_or(0);
+    }
     draw_softmaxed(&candidates, params.temperature, rng)
 }
 
@@ -94,6 +108,12 @@ fn prob_of(dist: &[(u32, f32)], id: u32) -> f32 {
         .find(|(i, _)| *i == id)
         .map(|(_, p)| *p)
         .unwrap_or(0.0)
+}
+
+/// Draw one id from a softmaxed `(id, probability)` list. This is how a
+/// drafter samples from the `q` it then reports for Leviathan verify.
+pub fn sample_from_distribution(dist: &[(u32, f32)], rng: &mut StdRng) -> u32 {
+    sample_weighted(dist, rng)
 }
 
 fn sample_weighted(dist: &[(u32, f32)], rng: &mut StdRng) -> u32 {
@@ -136,7 +156,11 @@ pub fn rejection_sample(
         }
     }
     if residual.is_empty() {
-        return (p.first().map(|(id, _)| *id).unwrap_or(draft_id), false);
+        // p == q up to rounding and the draft was rejected: draw from p.
+        if p.is_empty() {
+            return (draft_id, false);
+        }
+        return (sample_weighted(p, rng), false);
     }
     (sample_weighted(&residual, rng), false)
 }
@@ -398,6 +422,71 @@ mod tests {
             let from_p = draw_softmaxed(&p, params.temperature, &mut rng_b);
             assert_eq!(from_sample, from_p, "seed {seed}");
         }
+    }
+
+    /// Main never touched the RNG when no candidate survived at T > 0; the
+    /// softmax refactor must not shift the stream in those edge cases.
+    #[test]
+    fn sample_leaves_rng_untouched_when_every_logit_is_non_finite() {
+        let params = GenerationParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        let mut logits = [f32::NEG_INFINITY, f32::NAN, f32::NEG_INFINITY];
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut fresh = StdRng::seed_from_u64(5);
+        assert_eq!(sample(&mut logits, None, &params, &mut rng), 0);
+        assert_eq!(rng.gen::<u64>(), fresh.gen::<u64>());
+    }
+
+    #[test]
+    fn sample_leaves_rng_untouched_when_temperature_overflows_every_logit() {
+        let params = GenerationParams {
+            temperature: 0.5,
+            top_k: 0,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        let mut logits = [3.0e38f32, 2.0e38];
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut fresh = StdRng::seed_from_u64(5);
+        assert_eq!(sample(&mut logits, None, &params, &mut rng), 0);
+        assert_eq!(rng.gen::<u64>(), fresh.gen::<u64>());
+    }
+
+    #[test]
+    fn sample_still_draws_once_for_a_single_candidate() {
+        let params = GenerationParams {
+            temperature: 0.8,
+            top_k: 1,
+            top_p: 1.0,
+            ..GenerationParams::default()
+        };
+        let mut logits = [0.1f32, 3.0, 0.2];
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut fresh = StdRng::seed_from_u64(5);
+        assert_eq!(sample(&mut logits, None, &params, &mut rng), 1);
+        let _: f32 = fresh.gen();
+        assert_eq!(rng.gen::<u64>(), fresh.gen::<u64>());
+    }
+
+    #[test]
+    fn rejection_with_an_all_zero_residual_draws_from_p() {
+        // q covers p exactly and the draft id has p_x < q_x only through
+        // rounding: force the empty-residual path with p == q and a draft
+        // token p gives zero mass.
+        let p = vec![(1u32, 0.5f32), (2, 0.5)];
+        let q = vec![(1u32, 0.5f32), (2, 0.5)];
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (tok, accepted) = rejection_sample(&p, &q, 7, &mut rng);
+            assert!(!accepted);
+            seen.insert(tok);
+        }
+        assert_eq!(seen, [1u32, 2].into_iter().collect(), "must draw from p, not p.first()");
     }
 
     #[test]
