@@ -2924,6 +2924,16 @@ impl Dsv4Gpu {
             })
     }
 
+    /// Forget the device `curs` buffer (P21). `device_a_if_curs` matches a host input by
+    /// address and length only, so once the host `curs` vector is freed a new vector at the
+    /// same address would be mistaken for it and the GEMM would read stale device data.
+    pub fn invalidate_hc_curs(&mut self) {
+        self.hc_curs = 0;
+        self.hc_curs_n = 0;
+        self.hc_curs_host = 0;
+        self.hc_curs_synced = false;
+    }
+
     pub fn invalidate_hc_device(&mut self) {
         self.hc_on_device = false;
         self.hc_curs = 0;

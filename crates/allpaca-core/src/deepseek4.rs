@@ -4074,6 +4074,11 @@ fn dsv4_lm_head(
     }
     let mut used_gpu_head = false;
     let mut gpu = gpu;
+    if std::env::var("ALLPACA_DSV4_NO_CURS_FIX").is_err() {
+        if let Some(g) = gpu.as_deref_mut() {
+            g.invalidate_hc_curs();
+        }
+    }
     if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
         if g.gemv_bf16(
             f,
@@ -4339,6 +4344,49 @@ pub fn forward_dsv4_token(
 
 #[allow(clippy::too_many_arguments)]
 
+/// P21 debug: `ALLPACA_DSV4_LAYER_HASH=1` downloads the packed hidden state after
+/// every layer of a chunk and prints `layer_hash pos layer n fnv max_abs nonfinite`
+/// to stderr, to find the first layer where two runs (or a corrupted step) differ.
+/// The download waits for the device, so it changes timing. Off by default.
+fn debug_layer_hash(
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    states: &mut HcBatch,
+    start_pos: usize,
+    layer_idx: usize,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ALLPACA_DSV4_LAYER_HASH").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let Some(g) = gpu.as_mut() else { return };
+    let mut scratch = vec![0.0f32; states.data.len()];
+    if g.download_hc_packed(&mut scratch).is_err() {
+        return;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut max_abs = 0.0f32;
+    let mut nonfinite = 0usize;
+    for v in &scratch {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        if v.is_finite() {
+            max_abs = max_abs.max(v.abs());
+        } else {
+            nonfinite += 1;
+        }
+    }
+    eprintln!(
+        "layer_hash {} {} {} {:016x} {:.4} {}",
+        start_pos,
+        layer_idx,
+        states.n_tok,
+        h,
+        max_abs,
+        nonfinite
+    );
+}
+
 pub fn forward_dsv4_tokens(
     model: &TinyModel,
     tokens: &[u32],
@@ -4426,6 +4474,7 @@ pub fn forward_dsv4_tokens(
             file,
             skip_shexp,
         )?;
+        debug_layer_hash(&mut gpu, &mut states, start_pos, layer_idx);
     }
     if write_logits {
         if states.n_tok > 0 {
