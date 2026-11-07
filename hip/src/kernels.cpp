@@ -118,11 +118,38 @@ static inline hipError_t counted_hip_memcpy(void *dst, const void *src, size_t b
     }
     return err;
 }
+/* Debug (P21): ALLPACA_SYNC_COPY is a bit mask of copy kinds that wait for their
+ * stream right after the call (1 host->device, 2 device->host, 4 device->device,
+ * 8 any other); add 16 to limit it to the null stream, 32 to side streams, 64 to copies of 1 MiB or more, 128 to smaller ones.
+ * 0 (unset) leaves every copy asynchronous. */
+static inline unsigned debug_sync_copy_mask() {
+    static const unsigned mask = []() -> unsigned {
+        const char *v = std::getenv("ALLPACA_SYNC_COPY");
+        return v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    return mask;
+}
 static inline hipError_t counted_hip_memcpy_async(void *dst, const void *src, size_t bytes,
                                                   hipMemcpyKind kind, hipStream_t stream) {
-    const hipError_t err = ::hipMemcpyAsync(dst, src, bytes, kind, stream);
+    hipError_t err = ::hipMemcpyAsync(dst, src, bytes, kind, stream);
     if (kind != hipMemcpyDeviceToHost) {
         note_device_write();
+    }
+    if (err == hipSuccess) {
+        const unsigned m = debug_sync_copy_mask();
+        if (m) {
+            const unsigned bit = kind == hipMemcpyHostToDevice     ? 1u
+                                 : kind == hipMemcpyDeviceToHost   ? 2u
+                                 : kind == hipMemcpyDeviceToDevice ? 4u
+                                                                    : 8u;
+            const bool stream_ok = ((m & 16u) == 0 || stream == nullptr) &&
+                                   ((m & 32u) == 0 || stream != nullptr);
+            const bool size_ok = ((m & 64u) == 0 || bytes >= (1u << 20)) &&
+                                 ((m & 128u) == 0 || bytes < (1u << 20));
+            if ((m & bit) && stream_ok && size_ok) {
+                err = ::hipStreamSynchronize(stream);
+            }
+        }
     }
     return err;
 }
@@ -8870,6 +8897,11 @@ extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
     return hip_status(hipStreamSynchronize(as_stream(stream)));
 }
 
+/* Debug only (P21): wait for every stream on the current device. */
+extern "C" int allpaca_hip_device_synchronize(void) {
+    return hip_status(hipDeviceSynchronize());
+}
+
 extern "C" int allpaca_hip_stream_create(allpaca_stream_t *stream) {
     if (!stream) {
         return ALLPACA_ERR_INVALID;
@@ -12365,6 +12397,8 @@ extern "C" int allpaca_hip_blas_warmup(int32_t) { return ALLPACA_ERR_NOT_IMPLEME
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
+
+extern "C" int allpaca_hip_device_synchronize(void) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
 
 extern "C" int allpaca_hip_stream_create(allpaca_stream_t *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;

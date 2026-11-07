@@ -477,6 +477,7 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_hip_has_memcpy_batch() -> i32;
         pub fn allpaca_hip_stream_synchronize(stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_device_synchronize() -> i32;
         pub fn allpaca_hip_stream_create(stream: *mut *mut c_void) -> i32;
         pub fn allpaca_hip_stream_destroy(stream: *mut c_void) -> i32;
         pub fn allpaca_hip_stream_wait_event(stream: *mut c_void, event: *mut c_void) -> i32;
@@ -2308,6 +2309,20 @@ pub fn has_memcpy_batch() -> bool {
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         false
+    }
+}
+
+/// Debug (P21): wait for every stream on the current device. Used by the
+/// `ALLPACA_DSV4_SYNC` experiment only.
+pub fn device_synchronize() -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_device_synchronize() };
+        status(rc, "device_synchronize")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        Ok(())
     }
 }
 

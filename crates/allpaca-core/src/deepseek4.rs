@@ -3400,6 +3400,7 @@ fn run_expert_job_pair(
     gpu_out: &mut Vec<(Vec<f32>, Vec<(usize, f32)>)>,
     cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>,
 ) -> bool {
+    crate::dsv4_gpu::dbg_sync(4, hip0.map(|h| &**h), hip1.map(|h| &**h));
     let take_fail = |failed: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
                      cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>| {
         for job in failed {

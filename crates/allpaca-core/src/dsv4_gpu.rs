@@ -1479,6 +1479,7 @@ impl Dsv4Gpu {
         if plan.is_empty() {
             return (false, false);
         }
+        dbg_sync(16, Some(&self.hip), self.draft.as_deref());
         let hip = self.hip.clone();
         let draft = self.draft.clone();
         let nbytes0: u64 = plan.parts0.iter().map(|(_, s)| s.len() as u64).sum();
@@ -1561,6 +1562,7 @@ impl Dsv4Gpu {
             drop(ready);
         });
         let _ = hip.bind();
+        dbg_sync(1, Some(&self.hip), self.draft.as_deref());
         add_bytes(metrics, nbytes0.saturating_add(nbytes1));
         if let Some(m) = metrics {
             if plan.n0 > 0 {
@@ -1636,6 +1638,7 @@ impl Dsv4Gpu {
         metrics: Option<&Metrics>,
         keep_layer: usize,
     ) -> Result<ExpertCopyPlan<'a>, AllpacaError> {
+        dbg_sync(32, Some(&self.hip), self.draft.as_deref());
         self.reset_expert_h2d_host();
         if ids.is_empty() || self.has_prefill_layer(layer) {
             return Ok(ExpertCopyPlan::empty());
@@ -1668,6 +1671,7 @@ impl Dsv4Gpu {
             self.h2d1_inflight = false;
             let _ = self.hip.bind();
         }
+        dbg_sync(8, Some(&self.hip), self.draft.as_deref());
     }
 
     pub fn resident_expert(&self, layer: usize, expert: usize) -> Option<(*const u8, i32)> {
@@ -1712,6 +1716,7 @@ impl Dsv4Gpu {
         if !h0.moe_active() {
             return false;
         }
+        dbg_sync(2, Some(&self.hip), self.draft.as_deref());
         if h1.moe_join_compute().is_err() {
             return false;
         }
@@ -1771,6 +1776,7 @@ impl Dsv4Gpu {
         if h0.residual_add(acc, staging.cast(), n as i32).is_err() {
             return false;
         }
+        dbg_sync(2, Some(&self.hip), self.draft.as_deref());
         h1.moe_release();
         true
     }
@@ -4480,6 +4486,35 @@ pub fn apply_keep_set(model: &TinyModel, ids: &[ExpertId]) -> Result<(), Allpaca
         gpu.warmup_experts(file.as_ref(), layer, &experts, &model.config, None)?;
     }
     Ok(())
+}
+
+/// P21 debug: `ALLPACA_DSV4_SYNC` is a bit mask of points where the DSV4 path
+/// waits for every stream on both cards (1 after each copy plan, 2 around the
+/// GPU1 -> GPU0 fold, 4 before each expert job pair, 8 after the H2D join,
+/// 16 before each copy plan runs, 32 before a hint prefetch is planned).
+/// Off (0) by default.
+pub(crate) fn dbg_sync(
+    bit: u32,
+    a: Option<&allpaca_hip::HipWorkspace>,
+    b: Option<&allpaca_hip::HipWorkspace>,
+) {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let bits = *BITS.get_or_init(|| {
+        std::env::var("ALLPACA_DSV4_SYNC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if bits & bit == 0 {
+        return;
+    }
+    for w in [a, b].into_iter().flatten() {
+        let _ = w.bind();
+        let _ = allpaca_hip::device_synchronize();
+    }
+    if let Some(w) = a {
+        let _ = w.bind();
+    }
 }
 
 fn add_ns(metrics: Option<&Metrics>, field: impl Fn(&Metrics) -> &AtomicU64, t: Instant) {

@@ -132,6 +132,7 @@ int allpaca_hip_set_device(int32_t device);
 int allpaca_hip_blas_warmup(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
+int allpaca_hip_device_synchronize(void);
 
 /* Non-blocking side stream (expert H2D) so copies overlap the null compute
  * stream instead of serializing behind it. */
