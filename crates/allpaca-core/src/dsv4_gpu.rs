@@ -1717,20 +1717,22 @@ impl Dsv4Gpu {
             return false;
         }
         dbg_sync(2, Some(&self.hip), self.draft.as_deref());
+        // Fold the fixed-point sums, not the floats: float(S0) + float(S1) depends on how
+        // the experts were split between the cards, S0 + S1 in integers does not (P21).
         if h1.moe_join_compute().is_err() {
             return false;
         }
-        let (Ok(src), Ok(n)) = (h1.moe_acc_device(), h1.moe_floats()) else {
+        let (Ok(src), Ok(n)) = (h1.moe_acci_device(), h1.moe_floats()) else {
             return false;
         };
-        let (Ok(staging), Ok(acc)) = (h0.moe_staging_device(), h0.moe_acc_device()) else {
+        let Ok(staging) = h0.moe_acci_stage_device() else {
             return false;
         };
         if n == 0 || n > i32::MAX as usize {
             h1.moe_release();
             return true;
         }
-        let bytes = n.saturating_mul(4);
+        let bytes = n.saturating_mul(8);
         let pin = self.pin0.as_ref();
         let bounce = pin.filter(|p| !p.window && !p.a.is_null() && p.bytes > 0);
         if let Some(pin) = bounce {
@@ -1773,7 +1775,7 @@ impl Dsv4Gpu {
                 return false;
             }
         }
-        if h0.residual_add(acc, staging.cast(), n as i32).is_err() {
+        if h0.moe_acci_add_staged().is_err() {
             return false;
         }
         dbg_sync(2, Some(&self.hip), self.draft.as_deref());
@@ -1793,24 +1795,22 @@ impl Dsv4Gpu {
                 ))
             })?;
             d.bind()?;
-            self.h2d1
-                .as_ref()
-                .ok_or_else(|| {
-                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                        "GPU1 H2D stream missing".into(),
-                    ))
-                })?
-                .wait_ready_compute(idx)
+            let h2d1 = self.h2d1.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "GPU1 H2D stream missing".into(),
+                ))
+            })?;
+            h2d1.wait_ready_compute(idx)?;
+            h2d1.wait_ready_on(idx, &d.swiglu_streams())
         } else {
             self.hip.bind()?;
-            self.h2d
-                .as_ref()
-                .ok_or_else(|| {
-                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                        "GPU0 H2D stream missing".into(),
-                    ))
-                })?
-                .wait_ready_compute(idx)
+            let h2d = self.h2d.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "GPU0 H2D stream missing".into(),
+                ))
+            })?;
+            h2d.wait_ready_compute(idx)?;
+            h2d.wait_ready_on(idx, &self.hip.swiglu_streams())
         }
     }
 

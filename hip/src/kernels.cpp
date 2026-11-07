@@ -10955,6 +10955,54 @@ __global__ void scatter_add_scale_rows_kernel(const float *src, const int32_t *i
                   w[row]);
 }
 
+/* P21: order-independent version of the kernel above. Each term is rounded to a
+ * 2^-32 fixed-point integer and added with a 64-bit integer atomic; integer addition is
+ * associative, so the sum does not depend on which expert or stream lands first. The
+ * result is turned back into float by `moe_acc_finalize_kernel`. */
+__global__ void scatter_add_scale_rows_i64_kernel(const float *src, const int32_t *idx,
+                                                  const float *w, long long *acc, int m, int dim,
+                                                  int n_tok) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= m || j >= dim) {
+        return;
+    }
+    const int t = idx[row];
+    if (t < 0 || t >= n_tok) {
+        return;
+    }
+    double d = static_cast<double>(src[static_cast<size_t>(row) * static_cast<size_t>(dim) +
+                                       static_cast<size_t>(j)] *
+                                   w[row]) *
+               4294967296.0;
+    d = fmin(fmax(d, -4.0e18), 4.0e18);
+    const long long q = static_cast<long long>(__double2ll_rn(d));
+    atomicAdd(reinterpret_cast<unsigned long long *>(
+                  &acc[static_cast<size_t>(t) * static_cast<size_t>(dim) + static_cast<size_t>(j)]),
+              static_cast<unsigned long long>(q));
+}
+
+/* acc += fixed-point sum, then clear it so a second call adds nothing. */
+__global__ void moe_acc_finalize_kernel(float *acc, long long *acci, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) {
+        return;
+    }
+    const long long a = acci[i];
+    if (a != 0) {
+        acc[i] += static_cast<float>(static_cast<double>(a) * 2.3283064365386963e-10);
+        acci[i] = 0;
+    }
+}
+
+/* dst += src on the fixed-point expert sums, used to fold GPU1's into GPU0's exactly. */
+__global__ void moe_acci_add_kernel(long long *dst, const long long *src, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        dst[i] += src[i];
+    }
+}
+
 /* curs[t, i] = sum_s packed[t, s, i] * pre[t, s] */
 __global__ void hc_mix_pre_kernel(const float *packed, const float *pre, float *curs, int n_tok,
                                   int hc, int dim) {
@@ -11458,6 +11506,49 @@ extern "C" int allpaca_scatter_add_scale_rows(const float *src, const int32_t *i
                        dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(m)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), src, idx, w, acc,
                        m, dim, n_tok);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_scatter_add_scale_rows_i64(const float *src, const int32_t *idx,
+                                                  const float *w, long long *acc, int32_t m,
+                                                  int32_t dim, int32_t n_tok,
+                                                  allpaca_stream_t stream) {
+    if (!src || !idx || !w || !acc || m <= 0 || dim <= 0 || n_tok <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(scatter_add_scale_rows_i64_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(m)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), src, idx, w, acc,
+                       m, dim, n_tok);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_moe_acci_add(long long *dst, const long long *src, int32_t n,
+                                    allpaca_stream_t stream) {
+    if (!dst || !src || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(moe_acci_add_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), dst, src, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_moe_acc_finalize(float *acc, long long *acci, int32_t n,
+                                        allpaca_stream_t stream) {
+    if (!acc || !acci || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(moe_acc_finalize_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), acc, acci, n);
     return hip_status(hipGetLastError());
 }
 
@@ -12838,6 +12929,20 @@ extern "C" int allpaca_vision_rope_rows(float *, const int32_t *, const int32_t 
 
 extern "C" int allpaca_scatter_add_scale_rows(const float *, const int32_t *, const float *, float *,
                                               int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scatter_add_scale_rows_i64(const float *, const int32_t *, const float *,
+                                                  long long *, int32_t, int32_t, int32_t,
+                                                  allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_moe_acc_finalize(float *, long long *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_moe_acci_add(long long *, const long long *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

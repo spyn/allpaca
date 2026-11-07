@@ -3676,6 +3676,25 @@ fn dsv4_apply_moe_rows(
             _ => cpu_work.push((e, gx, group)),
         }
     }
+    if debug_stage_on(layer_idx) {
+        let ids = |v: &Vec<crate::dsv4_gpu::ExpertSwigluJob>| {
+            let mut e: Vec<usize> = v.iter().map(|j| j.expert).collect();
+            e.sort_unstable();
+            e
+        };
+        let mut cpu_ids: Vec<usize> = cpu_work.iter().map(|w| w.0).collect();
+        cpu_ids.sort_unstable();
+        eprintln!(
+            "moe_place layer {} gpu0_ready {:?} gpu0_wait {:?} gpu1_ready {:?} gpu1_wait {:?} cpu {:?} cpu_miss {}",
+            layer_idx,
+            ids(&jobs0_ready),
+            ids(&jobs0_wait),
+            ids(&jobs1_ready),
+            ids(&jobs1_wait),
+            cpu_ids,
+            cpu_miss
+        );
+    }
     if gpu.is_some() {
         if let Some(h) = hip0.as_ref() {
             match gpu.as_ref().and_then(|g| g.hc_curs_device()) {
@@ -3909,6 +3928,8 @@ fn dsv4_apply_moe_rows(
     }
     if let Some(h0) = hip0.as_ref() {
         if h0.moe_active() {
+            // Join only: GPU1's fixed-point sums are folded in next and the float
+            // accumulator is finalized once after that.
             let _ = h0.moe_join_compute();
         }
     }
@@ -3923,6 +3944,16 @@ fn dsv4_apply_moe_rows(
             }
         }
     }
+    if let Some(h0) = hip0.as_ref() {
+        if h0.moe_active() {
+            let _ = h0.moe_join_finalize();
+            debug_moe_acc("moe_acc0_final", layer_idx, h0, n_tok, dim);
+        }
+    }
+    if let Some(sum) = cpu_sum.as_ref() {
+        debug_stage("cpu_sum", layer_idx, sum);
+    }
+    debug_stage("shexp_y", layer_idx, &shexp_y);
     let leftover = !gpu_out.is_empty() || !cpu_work.is_empty();
     let mut device_hc = false;
     let t_hc = Instant::now();
@@ -4360,9 +4391,37 @@ pub fn forward_dsv4_token(
 
 /// P21 debug: `ALLPACA_DSV4_STAGE_HASH=1` prints `stage_hash layer tag n fnv` for a few
 /// stages of layers 0 and 1, to find which stage first differs between two starts.
+fn debug_stage_on(layer_idx: usize) -> bool {
+    // `ALLPACA_DSV4_STAGE_HASH=N` hashes the stages of layers 0..=N (default off).
+    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("ALLPACA_DSV4_STAGE_HASH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    max.is_some_and(|m| layer_idx <= m)
+}
+
+fn debug_moe_acc(
+    tag: &str,
+    layer_idx: usize,
+    h: &std::sync::Arc<allpaca_hip::HipWorkspace>,
+    n_tok: usize,
+    dim: usize,
+) {
+    if !debug_stage_on(layer_idx) {
+        return;
+    }
+    if let Ok(p) = h.moe_acc_device() {
+        let mut v = vec![0.0f32; n_tok.saturating_mul(dim)];
+        if h.copy_d2h_f32(p as *const f32, &mut v).is_ok() {
+            debug_stage(tag, layer_idx, &v);
+        }
+    }
+}
+
 fn debug_stage(tag: &str, layer_idx: usize, data: &[f32]) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if layer_idx > 1 || !*ON.get_or_init(|| std::env::var("ALLPACA_DSV4_STAGE_HASH").is_ok_and(|v| v == "1")) {
+    if !debug_stage_on(layer_idx) {
         return;
     }
     let mut h: u64 = 0xcbf29ce484222325;
