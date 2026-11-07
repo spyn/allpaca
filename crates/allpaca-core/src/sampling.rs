@@ -72,11 +72,32 @@ pub fn sample(
     params: &GenerationParams,
     rng: &mut StdRng,
 ) -> u32 {
+    trace_top2(logits);
     let (candidates, draws) = softmax_inner(logits, mask, params);
     if !draws {
         return candidates.first().map(|(id, _)| *id).unwrap_or(0);
     }
     draw_softmaxed(&candidates, params.temperature, rng)
+}
+
+/// `ALLPACA_LOGIT_TRACE=1`: print the two largest logits of every sampled
+/// step to stderr (`logit_trace id1 l1 id2 l2`), to see whether a greedy
+/// divergence sits on a near tie (P21). Off by default.
+fn trace_top2(logits: &[f32]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ALLPACA_LOGIT_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let (mut a, mut b) = ((u32::MAX, f32::NEG_INFINITY), (u32::MAX, f32::NEG_INFINITY));
+    for (i, &l) in logits.iter().enumerate() {
+        if l > a.1 {
+            b = a;
+            a = (i as u32, l);
+        } else if l > b.1 {
+            b = (i as u32, l);
+        }
+    }
+    eprintln!("logit_trace {} {:.6} {} {:.6}", a.0, a.1, b.0, b.1);
 }
 
 /// Draw the next token. When `q` is a non-empty draft distribution and
