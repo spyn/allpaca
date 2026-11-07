@@ -3241,16 +3241,16 @@ fn dsv4_apply_moe(
 /// Routed experts that are not in a GPU cache, computed on the CPU from the
 /// mapped MXFP4 file. `work` is `(expert, its m rows of dim, [(token, weight)])`;
 /// the result is the weighted sum per token, `n_tok * dim`.
-fn dsv4_cpu_experts(
+/// Each work item's expert output (`m * dim` floats, before the routing weight).
+fn dsv4_cpu_expert_ys(
     file: &GgufFile,
     blk: usize,
     cfg: &ModelConfig,
     work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
-    n_tok: usize,
     limit: f32,
     metrics: &Metrics,
     ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
-) -> Result<Vec<f32>, AllpacaError> {
+) -> Result<Vec<Vec<f32>>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let t = Instant::now();
     // Through the RAM tier (cached, else read from the file in large direct
@@ -3316,16 +3316,61 @@ fn dsv4_cpu_experts(
     };
     // Half the logical cores: the rest drive the GPUs and the copies.
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
-    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads);
-    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
-    for (y, (_, _, group)) in ys.iter().zip(work) {
-        scatter_expert_rows(&mut sum, y, group, dim);
-    }
+    // The exact path reproduces the GPU kernels' bits, so an expert gives the same result
+    // whether it ran here or on a card (P21). `ALLPACA_DSV4_CPU_FAST=1` uses the faster
+    // kernel that sums in its own order.
+    let ys = if std::env::var("ALLPACA_DSV4_CPU_FAST").is_ok_and(|v| v == "1") {
+        allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads)
+    } else {
+        allpaca_cpu::mxfp4_swiglu_experts_exact(&experts, dim, ff, limit, threads)
+    };
     metrics.expert_lru_misses.fetch_add(work.len() as u64, Ordering::Relaxed);
     metrics.expert_cpu_runs.fetch_add(work.len() as u64, Ordering::Relaxed);
     metrics
         .dsv4_cpu_expert_ns
         .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(ys)
+}
+
+/// The experts' weighted outputs summed per token in float (the single-token paths).
+fn dsv4_cpu_experts(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    limit: f32,
+    metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
+) -> Result<Vec<f32>, AllpacaError> {
+    let ys = dsv4_cpu_expert_ys(file, blk, cfg, work, limit, metrics, ram)?;
+    let dim = cfg.dim;
+    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows(&mut sum, y, group, dim);
+    }
+    Ok(sum)
+}
+
+/// The same sum as 2^-32 fixed-point integers, rounded exactly as the GPU `scatter_add` does
+/// per term, so adding it to the GPU's integer sum gives the bits an expert on a card would
+/// have given, wherever the expert ran (P21).
+fn dsv4_cpu_experts_fixed(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    limit: f32,
+    metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
+) -> Result<Vec<i64>, AllpacaError> {
+    let ys = dsv4_cpu_expert_ys(file, blk, cfg, work, limit, metrics, ram)?;
+    let dim = cfg.dim;
+    let mut sum = vec![0i64; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows_fixed(&mut sum, y, group, dim);
+    }
     Ok(sum)
 }
 
@@ -3339,6 +3384,32 @@ fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], di
         for j in 0..dim {
             routed[dst + j] += y[src + j] * w;
         }
+    }
+}
+
+/// `round_to_nearest_even(float(y * w) * 2^32)`, clamped, as the GPU fixed-point scatter does.
+fn fixed_q(v: f32) -> i64 {
+    let d = (f64::from(v) * 4_294_967_296.0).clamp(-4.0e18, 4.0e18);
+    d.round_ties_even() as i64
+}
+
+fn scatter_expert_rows_fixed(sum: &mut [i64], y: &[f32], group: &[(usize, f32)], dim: usize) {
+    for (i, &(t, w)) in group.iter().enumerate() {
+        let src = i.saturating_mul(dim);
+        let dst = t.saturating_mul(dim);
+        if src + dim > y.len() || dst + dim > sum.len() {
+            continue;
+        }
+        for j in 0..dim {
+            sum[dst + j] = sum[dst + j].wrapping_add(fixed_q(y[src + j] * w));
+        }
+    }
+}
+
+/// `routed += fixed / 2^32` (the host fallback when the device accumulator is not used).
+fn add_fixed_slice(routed: &mut [f32], fixed: &[i64]) {
+    for (dst, &q) in routed.iter_mut().zip(fixed) {
+        *dst += (q as f64 * 2.328_306_436_538_696_3e-10) as f32;
     }
 }
 
@@ -3726,7 +3797,7 @@ fn dsv4_apply_moe_rows(
     } else {
         Vec::new()
     };
-    let mut cpu_sum: Option<Vec<f32>> = None;
+    let mut cpu_sum: Option<Vec<i64>> = None;
     let mut cpu_err: Option<AllpacaError> = None;
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
@@ -3740,7 +3811,7 @@ fn dsv4_apply_moe_rows(
             Some(f) if !cpu_now.is_empty() => {
                 let work = &cpu_now;
                 let ram = gpu.as_ref().and_then(|g| g.expert_ram());
-                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
+                Some(s.spawn(move || dsv4_cpu_experts_fixed(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
             }
             _ => None,
         };
@@ -3946,12 +4017,16 @@ fn dsv4_apply_moe_rows(
     }
     if let Some(h0) = hip0.as_ref() {
         if h0.moe_active() {
+            // The CPU experts join the same fixed-point sum before the single finalize, so
+            // the result does not depend on which experts ran on the CPU.
+            if let Some(sum) = cpu_sum.as_ref() {
+                if h0.moe_acci_add_from_host(sum).is_ok() {
+                    cpu_sum = None;
+                }
+            }
             let _ = h0.moe_join_finalize();
             debug_moe_acc("moe_acc0_final", layer_idx, h0, n_tok, dim);
         }
-    }
-    if let Some(sum) = cpu_sum.as_ref() {
-        debug_stage("cpu_sum", layer_idx, sum);
     }
     debug_stage("shexp_y", layer_idx, &shexp_y);
     let leftover = !gpu_out.is_empty() || !cpu_work.is_empty();
@@ -3968,14 +4043,8 @@ fn dsv4_apply_moe_rows(
                         folded = false;
                     }
                 }
-                if folded {
-                    if let Some(sum) = cpu_sum.as_ref() {
-                        if h0.moe_add_from_host(sum).is_ok() {
-                            cpu_sum = None;
-                        } else {
-                            folded = false;
-                        }
-                    }
+                if folded && cpu_sum.is_some() {
+                    folded = false;
                 }
                 if folded && !shexp_dev {
                     if h0.moe_add_from_host(&shexp_y).is_ok() {
@@ -4009,7 +4078,7 @@ fn dsv4_apply_moe_rows(
             add_acc_slice(&mut routed, tmp);
         }
         if let Some(sum) = cpu_sum.as_ref() {
-            add_acc_slice(&mut routed, sum);
+            add_fixed_slice(&mut routed, sum);
         }
         let _ = hip0.as_ref().map(|h| h.bind());
         for (y, group) in gpu_out {

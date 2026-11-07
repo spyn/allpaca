@@ -8872,6 +8872,33 @@ impl HipWorkspace {
         self.residual_add(acc.cast(), x.cast(), n as i32)
     }
 
+    /// Add `n_tok * dim` fixed-point sums computed on the host (the CPU experts) into the
+    /// stage's integer sum, so they are finalized together with the cards' (exact, order free).
+    pub fn moe_acci_add_from_host(&self, add: &[i64]) -> Result<(), AllpacaError> {
+        let (stage, n) = {
+            let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+            let s = g.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+            })?;
+            if !s.active {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "moe stage inactive".into(),
+                )));
+            }
+            (s.acci2, s.n_tok.saturating_mul(s.dim))
+        };
+        if add.len() < n || n > i32::MAX as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "moe_acci_add_from_host size mismatch".into(),
+            )));
+        }
+        let bytes = n * 8;
+        self.bind()?;
+        memcpy(stage, add.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        self.add_h2d(bytes);
+        self.moe_acci_add_staged()
+    }
+
     /// Drop the moe stage without downloading `moe_acc`.
     pub fn moe_release(&self) {
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -17527,6 +17554,101 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// P21: the CPU "exact" MXFP4 expert path gives the same bits as the GPU kernels, at every
+    /// stage and for every row-count class (1 = wide kernel, 2..=8 and >8 = tiled kernels),
+    /// including a shape whose `k` is not a multiple of the 256-element tile.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mxfp4_expert_cpu_exact_matches_gpu_bits() {
+        if device_count() == 0 {
+            return;
+        }
+        let limit = 10.0f32;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        let quant = |w: &[f32], rows: usize, k: usize| -> Vec<u8> {
+            let mut q = Vec::new();
+            for r in 0..rows {
+                q.extend(allpaca_cpu::quantize_mxfp4(&w[r * k..(r + 1) * k]));
+            }
+            q
+        };
+        set_device(0).expect("bind");
+        let hip = HipWorkspace::new(0, 64 * 1024 * 1024, 8).expect("hip");
+        hip.set_mxfp4_swiglu_limit(limit);
+        // (dim, ff, row counts): the DeepSeek-V4 size, and a small odd one (k = 96 = 3 blocks)
+        for (dim, ff, rows) in [
+            (4096usize, 2048usize, vec![1usize, 2, 3, 8, 9, 16, 17, 33]),
+            (96, 64, vec![1, 2, 5, 9, 20]),
+        ] {
+            let gate_q = quant(&rnd(ff * dim, 0.5), ff, dim);
+            let up_q = quant(&rnd(ff * dim, 0.5), ff, dim);
+            let down_q = quant(&rnd(dim * ff, 0.5), dim, ff);
+            let gb = device_malloc(gate_q.len(), 0).expect("gate");
+            let ub = device_malloc(up_q.len(), 0).expect("up");
+            let db = device_malloc(down_q.len(), 0).expect("down");
+            memcpy(gb, gate_q.as_ptr(), gate_q.len(), MEMCPY_H2D).expect("h2d gate");
+            memcpy(ub, up_q.as_ptr(), up_q.len(), MEMCPY_H2D).expect("h2d up");
+            memcpy(db, down_q.as_ptr(), down_q.len(), MEMCPY_H2D).expect("h2d down");
+            for m in rows {
+                let x = rnd(m * dim, 4.0);
+                let same = |what: &str, gpu: &[f32], cpu: &[f32]| {
+                    for (i, (a, b)) in gpu.iter().zip(cpu).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{what} dim={dim} ff={ff} m={m} idx={i}: gpu {a} cpu {b}"
+                        );
+                    }
+                };
+                let mut gpu_gemm = vec![0.0f32; m * ff];
+                super::gemm_nt_mxfp4(&x, &gate_q, &mut gpu_gemm, m as i32, ff as i32, dim as i32)
+                    .expect("gpu gemm");
+                same("gemm", &gpu_gemm, &allpaca_cpu::mxfp4_gemm_exact(&x, &gate_q, m, ff, dim));
+                let mut gpu_gu = vec![0.0f32; m * ff];
+                super::mxfp4_swiglu_gate_up(
+                    &x, &gate_q, &up_q, &mut gpu_gu, m as i32, ff as i32, dim as i32, limit,
+                )
+                .expect("gpu gate_up");
+                same(
+                    "gate_up",
+                    &gpu_gu,
+                    &allpaca_cpu::mxfp4_gate_up_exact(&x, &gate_q, &up_q, m, ff, dim, limit),
+                );
+                let mut gpu = vec![0.0f32; m * dim];
+                hip.mxfp4_swiglu_gemm(&x, gb, ub, db, &mut gpu, m as i32, dim as i32, ff as i32)
+                    .expect("gpu expert");
+                let exact = allpaca_cpu::mxfp4_swiglu_experts_exact(
+                    &[allpaca_cpu::Mxfp4Expert {
+                        gate: &gate_q,
+                        up: &up_q,
+                        down: &down_q,
+                        x: &x,
+                        m,
+                    }],
+                    dim,
+                    ff,
+                    limit,
+                    4,
+                )
+                .remove(0);
+                same("expert", &gpu, &exact);
+            }
+            device_free(gb, gate_q.len());
+            device_free(ub, up_q.len());
+            device_free(db, down_q.len());
         }
     }
 

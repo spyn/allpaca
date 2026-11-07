@@ -7149,8 +7149,8 @@ __global__ void gemm_nt_mxfp4_tiled_m_kernel(const float *a, const uint8_t *b, f
 #pragma unroll 8
                     for (int r = 0; r < TILE_M; ++r) {
                         const float *ar = As + r * TILE_K + base;
-                        acc[r] += ar[j] * c0;
-                        acc[r] += ar[16 + j] * c1;
+                        acc[r] = fmaf(ar[j], c0, acc[r]);
+                        acc[r] = fmaf(ar[16 + j], c1, acc[r]);
                     }
                 }
             }
@@ -7193,13 +7193,15 @@ __device__ inline float mxfp4_block_dot(const uint8_t *blk, const float *x) {
         xs[4 * q + 2] = v.z;
         xs[4 * q + 3] = v.w;
     }
+    /* The fused multiply-adds are written out (nothing else here has a product feeding a sum), so the CPU path in
+     * allpaca-cpu `mxfp4_exact.rs` reproduces the bits with `mul_add` in the same places (P21). */
     float s = 0.f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const uint32_t b0 = static_cast<uint32_t>(q0 >> (8 * j)) & 0xFFu;
         const uint32_t b1 = static_cast<uint32_t>(q1 >> (8 * j)) & 0xFFu;
-        s += xs[j] * mxfp4_code(b0 & 15u) + xs[16 + j] * mxfp4_code(b0 >> 4);
-        s += xs[8 + j] * mxfp4_code(b1 & 15u) + xs[24 + j] * mxfp4_code(b1 >> 4);
+        s = s + fmaf(xs[j], mxfp4_code(b0 & 15u), xs[16 + j] * mxfp4_code(b0 >> 4));
+        s = s + fmaf(xs[8 + j], mxfp4_code(b1 & 15u), xs[24 + j] * mxfp4_code(b1 >> 4));
     }
     return s;
 }
@@ -7224,12 +7226,12 @@ __global__ void gemv_nt_mxfp4_wide_kernel(const float *a, const uint8_t *b, floa
         const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
         for (int ib = lane; ib < nblocks; ib += 32) {
             const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
-            acc += mxfp4_e8m0_half(blk[0]) * mxfp4_block_dot(blk, arow + ib * 32);
+            acc = fmaf(mxfp4_e8m0_half(blk[0]), mxfp4_block_dot(blk, arow + ib * 32), acc);
         }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor(acc, off, 32);
+        acc = acc + __shfl_xor(acc, off, 32);
     }
     if (col < n && lane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
@@ -7261,14 +7263,14 @@ __global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *
             const uint8_t *g = grow + static_cast<size_t>(ib) * 17;
             const uint8_t *u = urow + static_cast<size_t>(ib) * 17;
             const float *x = arow + ib * 32;
-            acc_g += mxfp4_e8m0_half(g[0]) * mxfp4_block_dot(g, x);
-            acc_u += mxfp4_e8m0_half(u[0]) * mxfp4_block_dot(u, x);
+            acc_g = fmaf(mxfp4_e8m0_half(g[0]), mxfp4_block_dot(g, x), acc_g);
+            acc_u = fmaf(mxfp4_e8m0_half(u[0]), mxfp4_block_dot(u, x), acc_u);
         }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc_g += __shfl_xor(acc_g, off, 32);
-        acc_u += __shfl_xor(acc_u, off, 32);
+        acc_g = acc_g + __shfl_xor(acc_g, off, 32);
+        acc_u = acc_u + __shfl_xor(acc_u, off, 32);
     }
     if (col < n && lane == 0) {
         const float x = acc_g;
@@ -7339,7 +7341,8 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, f
     return launch_gemm_nt_mxfp4(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
-__device__ inline float mxfp4_silu(float x) { return x / (1.0f + expf(-x)); }
+/* silu(g) * u with the shared det_expf and explicit roundings (bit-identical to the CPU path). */
+__device__ inline float mxfp4_silu_mul(float g, float u) { return det_silu_mul(g, u); }
 
 /* silu(gate) * up; with limit > 0 the gate is capped at limit first and up to +-limit
  * (DeepSeek-V4 swiglu_clamp_exp). */
@@ -7348,7 +7351,7 @@ __device__ inline float mxfp4_swiglu(float g, float u, float limit) {
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
     }
-    return mxfp4_silu(g) * u;
+    return mxfp4_silu_mul(g, u);
 }
 
 /* One A-tile load, two MXFP4 B rows, write silu(gate)*up. */
@@ -7468,10 +7471,10 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
 #pragma unroll 8
                     for (int r = 0; r < TILE_M; ++r) {
                         const float *ar = As + r * TILE_K + base;
-                        acc_g[r] += ar[j] * g0;
-                        acc_g[r] += ar[16 + j] * g1;
-                        acc_u[r] += ar[j] * u0;
-                        acc_u[r] += ar[16 + j] * u1;
+                        acc_g[r] = fmaf(ar[j], g0, acc_g[r]);
+                        acc_g[r] = fmaf(ar[16 + j], g1, acc_g[r]);
+                        acc_u[r] = fmaf(ar[j], u0, acc_u[r]);
+                        acc_u[r] = fmaf(ar[16 + j], u1, acc_u[r]);
                     }
                 }
             }

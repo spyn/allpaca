@@ -544,7 +544,11 @@ impl Dsv4Gpu {
             heat_routes: gpu_heat_routes,
             heat_file,
             heat_profile,
-            cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
+            // Off by default (P21): the CPU and GPU expert kernels do not give identical
+            // bits and which experts run on the CPU depends on the GPU cache size, so
+            // output would change from start to start. `ALLPACA_DSV4_CPU_MISS=1` turns the
+            // CPU path (and with it the host RAM expert tier) back on.
+            cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").is_ok_and(|v| v == "1")
                 && cpu_expert_kernel_fits(file, cfg),
             ram: None,
             mapped_used: Vec::new(),
@@ -5757,6 +5761,8 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
+        // These exercise the RAM expert tier, which exists only with the CPU path on (P21).
+        std::env::set_var("ALLPACA_DSV4_CPU_MISS", "1");
         let dir = std::env::temp_dir().join(format!("allpaca-dsv4-gpu-heat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model_path = dir.join("tiny.gguf");
@@ -5801,6 +5807,8 @@ mod tests {
         if allpaca_hip::device_count() == 0 {
             return;
         }
+        // These exercise the RAM expert tier, which exists only with the CPU path on (P21).
+        std::env::set_var("ALLPACA_DSV4_CPU_MISS", "1");
         let dir = std::env::temp_dir().join(format!("allpaca-dsv4-drop-heat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model_path = dir.join("tiny.gguf");
