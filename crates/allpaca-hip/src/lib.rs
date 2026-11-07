@@ -2178,6 +2178,42 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
     memcpy_on(dst, src, bytes, kind, std::ptr::null_mut())
 }
 
+/// P21 debug: `ALLPACA_H2D_LOG=1` prints, once per distinct (bytes, stream)
+/// of a host-to-device copy under 1 MiB, the Rust frames that issued it, and
+/// a running count every 5000 copies. Off by default.
+#[cfg(all(feature = "hip", allpaca_hip_runtime))]
+fn debug_log_small_h2d(bytes: usize, kind: i32, stream: *mut std::ffi::c_void) {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<(usize, bool), u64>>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ALLPACA_H2D_LOG").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    if kind != MEMCPY_H2D || bytes >= (1 << 20) {
+        return;
+    }
+    let key = (bytes, stream.is_null());
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    let n = seen.entry(key).or_insert(0);
+    *n += 1;
+    if *n == 1 {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = bt
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("allpaca_") && !l.contains("debug_log_small_h2d") && !l.contains("memcpy"))
+            .take(6)
+            .collect();
+        eprintln!("h2d_log new bytes={} null_stream={} frames={:?}", bytes, key.1, frames);
+    }
+    let total: u64 = seen.values().sum();
+    if total % 5000 == 0 {
+        let mut v: Vec<_> = seen.iter().map(|(k, c)| (k.0, k.1, *c)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        eprintln!("h2d_log counts {:?}", &v[..v.len().min(12)]);
+    }
+}
+
 /// Same as [`memcpy`], queued on `stream` (null is the default stream).
 pub fn memcpy_on(
     dst: *mut u8,
@@ -2188,6 +2224,7 @@ pub fn memcpy_on(
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
+        debug_log_small_h2d(bytes, kind, stream);
         let rc = unsafe { ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream) };
         status(rc, "memcpy")
     }
