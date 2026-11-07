@@ -177,6 +177,12 @@ pub struct StatsSnapshot {
     /// Read-ahead experts that were then needed.
     #[serde(default)]
     pub expert_prefetch_hits: u64,
+    /// Nanoseconds blocked reading expert bytes from the SSD tier.
+    #[serde(default)]
+    pub expert_fetch_wait_ns: u64,
+    /// Fetch calls that read from the file.
+    #[serde(default)]
+    pub expert_fetch_waits: u64,
     /// Measured expert H2D bandwidth (bytes/s) used by `q*`. 0 = unmeasured.
     #[serde(default)]
     pub expert_pcie_bps: u64,

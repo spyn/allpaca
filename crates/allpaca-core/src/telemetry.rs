@@ -115,6 +115,10 @@ pub struct Metrics {
     pub expert_ram_hits: AtomicU64,
     pub expert_prefetch_reads: AtomicU64,
     pub expert_prefetch_hits: AtomicU64,
+    /// Nanoseconds the forward thread spent blocked reading expert bytes from the SSD tier (P18).
+    pub expert_fetch_wait_ns: AtomicU64,
+    /// `ExpertRam::fetch` calls that had to read from the file.
+    pub expert_fetch_waits: AtomicU64,
     pub expert_pcie_bps: AtomicU64,
     pub expert_host_bps: AtomicU64,
     pub expert_host_slots: AtomicU64,
@@ -333,6 +337,8 @@ impl Metrics {
             expert_ram_hits: self.expert_ram_hits.load(Ordering::Relaxed),
             expert_prefetch_reads: self.expert_prefetch_reads.load(Ordering::Relaxed),
             expert_prefetch_hits: self.expert_prefetch_hits.load(Ordering::Relaxed),
+            expert_fetch_wait_ns: self.expert_fetch_wait_ns.load(Ordering::Relaxed),
+            expert_fetch_waits: self.expert_fetch_waits.load(Ordering::Relaxed),
             expert_pcie_bps: self.expert_pcie_bps.load(Ordering::Relaxed),
             expert_host_bps: self.expert_host_bps.load(Ordering::Relaxed),
             expert_host_slots: self.expert_host_slots.load(Ordering::Relaxed),
