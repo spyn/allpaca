@@ -2574,6 +2574,7 @@ fn dsv4_attn_and_route_rows(
     };
     let t_hc = Instant::now();
     let attn_mix = format!("blk.{blk}.hc_attn_fn.weight");
+    debug_stage("layer_in", layer_idx, &states.data);
     let (mut curs, posts, combs) = hc_pre_packed(
         &mut states.data,
         n_tok,
@@ -2587,6 +2588,10 @@ fn dsv4_attn_and_route_rows(
         Some(metrics),
         false,
     )?;
+    if let Some(g) = gpu.as_deref_mut() {
+        let _ = g.ensure_hc_curs_host(&mut curs);
+    }
+    debug_stage("attn_curs", layer_idx, &curs);
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2815,6 +2820,7 @@ fn dsv4_attn_and_route_rows(
         &host.ffn_norm
     };
     let t_hc = Instant::now();
+    debug_stage("attn_out", layer_idx, &attn_outs);
     let xs_dev = gpu.as_ref().and_then(|g| g.last_o_device());
     let _ = hc_post_batch(
         &attn_outs,
@@ -2830,7 +2836,7 @@ fn dsv4_attn_and_route_rows(
         },
         xs_dev,
     );
-    let (xs, fposts, fcombs) = {
+    let (mut xs, fposts, fcombs) = {
         let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");
         hc_pre_packed(
             &mut states.data,
@@ -2849,6 +2855,10 @@ fn dsv4_attn_and_route_rows(
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if let Some(g) = gpu.as_deref_mut() {
+        let _ = g.ensure_hc_curs_host(&mut xs);
+    }
+    debug_stage("ffn_xs", layer_idx, &xs);
     let mut fcurs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
     for t in 0..n_tok {
         fcurs.push(xs[t * dim..(t + 1) * dim].to_vec());
@@ -2870,6 +2880,10 @@ fn dsv4_attn_and_route_rows(
     metrics
         .dsv4_router_ns
         .fetch_add(t_route.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    for r in &routes {
+        let flat: Vec<f32> = r.iter().flat_map(|(e, w)| [*e as f32, *w]).collect();
+        debug_stage("picks", layer_idx, &flat);
+    }
     let mut preps = Vec::with_capacity(n_tok);
     for (((fcur, fpost), fcomb), picks) in fcurs.into_iter().zip(fposts).zip(fcombs).zip(routes) {
         preps.push(Dsv4FfnPrep {
@@ -4343,6 +4357,22 @@ pub fn forward_dsv4_token(
 }
 
 #[allow(clippy::too_many_arguments)]
+
+/// P21 debug: `ALLPACA_DSV4_STAGE_HASH=1` prints `stage_hash layer tag n fnv` for a few
+/// stages of layers 0 and 1, to find which stage first differs between two starts.
+fn debug_stage(tag: &str, layer_idx: usize, data: &[f32]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if layer_idx > 1 || !*ON.get_or_init(|| std::env::var("ALLPACA_DSV4_STAGE_HASH").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in data {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    eprintln!("stage_hash {} {} {} {:016x}", layer_idx, tag, data.len(), h);
+}
 
 /// P21 debug: `ALLPACA_DSV4_LAYER_HASH=1` downloads the packed hidden state after
 /// every layer of a chunk and prints `layer_hash pos layer n fnv max_abs nonfinite`
