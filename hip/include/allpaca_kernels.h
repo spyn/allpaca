@@ -132,6 +132,7 @@ int allpaca_hip_set_device(int32_t device);
 int allpaca_hip_blas_warmup(int32_t device);
 
 int allpaca_hip_stream_synchronize(allpaca_stream_t stream);
+int allpaca_hip_device_synchronize(void);
 
 /* Non-blocking side stream (expert H2D) so copies overlap the null compute
  * stream instead of serializing behind it. */
@@ -469,6 +470,16 @@ int allpaca_round_f16(float *x, int32_t n, allpaca_stream_t stream);
 int allpaca_scatter_add_scale_rows(const float *src, const int32_t *idx, const float *w,
                                    float *acc, int32_t m, int32_t dim, int32_t n_tok,
                                    allpaca_stream_t stream);
+
+/* Order-independent form (P21): adds `src * w` as 2^-32 fixed-point into the int64 buffer
+ * `acc`; `allpaca_moe_acc_finalize` then adds that sum into the float accumulator once and
+ * clears it. */
+int allpaca_scatter_add_scale_rows_i64(const float *src, const int32_t *idx, const float *w,
+                                       long long *acc, int32_t m, int32_t dim, int32_t n_tok,
+                                       allpaca_stream_t stream);
+int allpaca_moe_acc_finalize(float *acc, long long *acci, int32_t n, allpaca_stream_t stream);
+/* dst += src on the fixed-point sums (folds the second card's into the first's). */
+int allpaca_moe_acci_add(long long *dst, const long long *src, int32_t n, allpaca_stream_t stream);
 
 /* Packed HC residual layout `[n_tok][hc][dim]`. `pre`/`post` are `[n_tok][hc]`;
  * `comb` is `[n_tok][src][dst]` with `comb[t, src, dst] = comb[t*hc*hc + dst + src*hc]`.

@@ -477,6 +477,7 @@ mod ffi {
         ) -> i32;
         pub fn allpaca_hip_has_memcpy_batch() -> i32;
         pub fn allpaca_hip_stream_synchronize(stream: *mut c_void) -> i32;
+        pub fn allpaca_hip_device_synchronize() -> i32;
         pub fn allpaca_hip_stream_create(stream: *mut *mut c_void) -> i32;
         pub fn allpaca_hip_stream_destroy(stream: *mut c_void) -> i32;
         pub fn allpaca_hip_stream_wait_event(stream: *mut c_void, event: *mut c_void) -> i32;
@@ -1231,6 +1232,28 @@ mod ffi {
             m: i32,
             dim: i32,
             n_tok: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_scatter_add_scale_rows_i64(
+            src: *const f32,
+            idx: *const i32,
+            w: *const f32,
+            acc: *mut i64,
+            m: i32,
+            dim: i32,
+            n_tok: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_moe_acc_finalize(
+            acc: *mut f32,
+            acci: *mut i64,
+            n: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_moe_acci_add(
+            dst: *mut i64,
+            src: *const i64,
+            n: i32,
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_hc_mix_pre(
@@ -2177,6 +2200,42 @@ pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(
     memcpy_on(dst, src, bytes, kind, std::ptr::null_mut())
 }
 
+/// P21 debug: `ALLPACA_H2D_LOG=1` prints, once per distinct (bytes, stream)
+/// of a host-to-device copy under 1 MiB, the Rust frames that issued it, and
+/// a running count every 5000 copies. Off by default.
+#[cfg(all(feature = "hip", allpaca_hip_runtime))]
+fn debug_log_small_h2d(bytes: usize, kind: i32, stream: *mut std::ffi::c_void) {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<std::collections::HashMap<(usize, bool), u64>>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ALLPACA_H2D_LOG").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    if kind != MEMCPY_H2D || bytes >= (1 << 20) {
+        return;
+    }
+    let key = (bytes, stream.is_null());
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    let n = seen.entry(key).or_insert(0);
+    *n += 1;
+    if *n == 1 {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = bt
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("allpaca_") && !l.contains("debug_log_small_h2d") && !l.contains("memcpy"))
+            .take(6)
+            .collect();
+        eprintln!("h2d_log new bytes={} null_stream={} frames={:?}", bytes, key.1, frames);
+    }
+    let total: u64 = seen.values().sum();
+    if total % 5000 == 0 {
+        let mut v: Vec<_> = seen.iter().map(|(k, c)| (k.0, k.1, *c)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        eprintln!("h2d_log counts {:?}", &v[..v.len().min(12)]);
+    }
+}
+
 /// Same as [`memcpy`], queued on `stream` (null is the default stream).
 pub fn memcpy_on(
     dst: *mut u8,
@@ -2187,6 +2246,7 @@ pub fn memcpy_on(
 ) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
+        debug_log_small_h2d(bytes, kind, stream);
         let rc = unsafe { ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream) };
         status(rc, "memcpy")
     }
@@ -2308,6 +2368,20 @@ pub fn has_memcpy_batch() -> bool {
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
     {
         false
+    }
+}
+
+/// Debug (P21): wait for every stream on the current device. Used by the
+/// `ALLPACA_DSV4_SYNC` experiment only.
+pub fn device_synchronize() -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_hip_device_synchronize() };
+        status(rc, "device_synchronize")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        Ok(())
     }
 }
 
@@ -2557,6 +2631,35 @@ impl H2dStream {
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
         {
             let _ = idx;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP stream_wait_event unavailable".into(),
+            )))
+        }
+    }
+
+    /// Make each of `streams` wait for ready-ring `idx` (host does not block). The expert
+    /// SwiGLU kernels run on their own non-blocking streams, which the default-stream wait
+    /// above does not order, so without this a kernel can start before its weights land (P21).
+    pub fn wait_ready_on(
+        &self,
+        idx: usize,
+        streams: &[*mut std::ffi::c_void],
+    ) -> Result<(), AllpacaError> {
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let ev = *self.ready_ev.get(idx).ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "H2D ready ring out of range".into(),
+                ))
+            })?;
+            for &s in streams {
+                stream_wait_event(s, ev)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (idx, streams);
             Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
                 "HIP stream_wait_event unavailable".into(),
             )))
@@ -6997,9 +7100,15 @@ struct Mamba2WeightResident {
 struct MoeStage {
     x: *mut u8,
     acc: *mut u8,
+    /// `n_tok * dim` int64 fixed-point partial sums of the expert outputs (P21). Added
+    /// into `acc` once by `moe_finalize` so the float sum order never depends on timing.
+    acci: *mut u8,
+    /// Landing buffer for the other card's `acci`, so the two fold in integers.
+    acci2: *mut u8,
     meta: *mut u8,
     x_bytes: usize,
     acc_bytes: usize,
+    acci_bytes: usize,
     meta_bytes: usize,
     n_tok: usize,
     dim: usize,
@@ -7012,6 +7121,8 @@ unsafe impl Sync for MoeStage {}
 fn free_moe_stage(stage: MoeStage) {
     device_free(stage.x, stage.x_bytes);
     device_free(stage.acc, stage.acc_bytes);
+    device_free(stage.acci, stage.acci_bytes);
+    device_free(stage.acci2, stage.acci_bytes);
     device_free(stage.meta, stage.meta_bytes);
 }
 
@@ -7653,6 +7764,11 @@ impl HipWorkspace {
     }
 
     /// Live side streams for pipelined expert SwiGLU (2..=4).
+    /// The expert SwiGLU streams that exist on this card.
+    pub fn swiglu_streams(&self) -> Vec<*mut std::ffi::c_void> {
+        self.swiglu_s.iter().copied().filter(|s| !s.is_null()).collect()
+    }
+
     pub fn swiglu_pipeline_slots(&self) -> usize {
         self.swiglu_s.iter().take_while(|s| !s.is_null()).count()
     }
@@ -8590,16 +8706,17 @@ impl HipWorkspace {
             )));
         }
         self.ensure_moe(n_tok, dim)?;
-        let (x, acc, bytes) = {
+        let (x, acc, acci, bytes) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
             let s = g.as_ref().ok_or_else(|| {
                 AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
             })?;
-            (s.x, s.acc, floats * 4)
+            (s.x, s.acc, s.acci, floats * 4)
         };
         memcpy(x, xs.as_ptr().cast(), bytes, MEMCPY_H2D)?;
         self.add_h2d(bytes);
         memset_on(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acci, 0, bytes * 2, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -8624,17 +8741,18 @@ impl HipWorkspace {
             )));
         }
         self.ensure_moe(n_tok, dim)?;
-        let (x, acc, bytes) = {
+        let (x, acc, acci, bytes) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
             let s = g.as_ref().ok_or_else(|| {
                 AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
             })?;
-            (s.x, s.acc, floats * 4)
+            (s.x, s.acc, s.acci, floats * 4)
         };
         if x as *const f32 != xs {
             self.copy_d2d_f32(x.cast(), xs, floats)?;
         }
         memset_on(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acci, 0, bytes * 2, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -8663,16 +8781,17 @@ impl HipWorkspace {
             )));
         }
         self.ensure_moe(n_tok, dim)?;
-        let (x, acc, bytes) = {
+        let (x, acc, acci, bytes) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
             let s = g.as_ref().ok_or_else(|| {
                 AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
             })?;
-            (s.x, s.acc, floats * 4)
+            (s.x, s.acc, s.acci, floats * 4)
         };
         memcpy_peer(x, self.device, xs.cast(), src_dev, bytes)?;
         self.bind()?;
         memset_on(acc, 0, bytes, std::ptr::null_mut())?;
+        memset_on(acci, 0, bytes * 2, std::ptr::null_mut())?;
         stream_synchronize()?;
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             s.active = true;
@@ -8753,6 +8872,33 @@ impl HipWorkspace {
         self.residual_add(acc.cast(), x.cast(), n as i32)
     }
 
+    /// Add `n_tok * dim` fixed-point sums computed on the host (the CPU experts) into the
+    /// stage's integer sum, so they are finalized together with the cards' (exact, order free).
+    pub fn moe_acci_add_from_host(&self, add: &[i64]) -> Result<(), AllpacaError> {
+        let (stage, n) = {
+            let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+            let s = g.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+            })?;
+            if !s.active {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "moe stage inactive".into(),
+                )));
+            }
+            (s.acci2, s.n_tok.saturating_mul(s.dim))
+        };
+        if add.len() < n || n > i32::MAX as usize {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "moe_acci_add_from_host size mismatch".into(),
+            )));
+        }
+        let bytes = n * 8;
+        self.bind()?;
+        memcpy(stage, add.as_ptr().cast(), bytes, MEMCPY_H2D)?;
+        self.add_h2d(bytes);
+        self.moe_acci_add_staged()
+    }
+
     /// Drop the moe stage without downloading `moe_acc`.
     pub fn moe_release(&self) {
         if let Some(s) = self.moe.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -8760,16 +8906,132 @@ impl HipWorkspace {
         }
     }
 
-    /// Join expert SwiGLU streams without downloading `moe_acc`.
+    /// Join expert SwiGLU streams without downloading `moe_acc`. Called after every batch
+    /// of experts, so it must NOT finalize: how the experts split into batches depends on
+    /// when their weights arrive, and each finalize is one float add into `moe_acc`.
     pub fn moe_join_compute(&self) -> Result<(), AllpacaError> {
         self.bind()?;
         self.join_swiglu_streams()?;
         stream_synchronize()
     }
 
+    /// Join, then add the fixed-point expert sums into `moe_acc` exactly once. Call this
+    /// only when every expert of the layer on this card has been enqueued.
+    pub fn moe_join_finalize(&self) -> Result<(), AllpacaError> {
+        self.bind()?;
+        self.join_swiglu_streams()?;
+        self.moe_finalize()?;
+        stream_synchronize()
+    }
+
+    /// Add the fixed-point expert sums into `moe_acc` and clear them (no-op without an
+    /// active stage, and idempotent: a second call adds nothing).
+    fn moe_finalize(&self) -> Result<(), AllpacaError> {
+        let (acc, acci, n) = {
+            let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_ref() {
+                Some(s) if s.active => (s.acc, s.acci, s.n_tok.saturating_mul(s.dim)),
+                _ => return Ok(()),
+            }
+        };
+        self.moe_finalize_ptrs(acc, acci, n)
+    }
+
+    fn moe_finalize_ptrs(&self, acc: *mut u8, acci: *mut u8, n: usize) -> Result<(), AllpacaError> {
+        if n == 0 || n > i32::MAX as usize {
+            return Ok(());
+        }
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_moe_acc_finalize(
+                    acc.cast(),
+                    acci.cast(),
+                    n as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "moe_acc_finalize")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (acc, acci);
+            Ok(())
+        }
+    }
+
+    /// Device pointer to the fixed-point expert sums (`n_tok * dim` int64).
+    pub fn moe_acci_device(&self) -> Result<*mut u8, AllpacaError> {
+        Ok(self.moe_acci_ptr()?.cast())
+    }
+
+    /// Landing buffer for the other card's fixed-point sums (`n_tok * dim` int64).
+    pub fn moe_acci_stage_device(&self) -> Result<*mut u8, AllpacaError> {
+        let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.as_ref().ok_or_else(|| {
+            AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+        })?;
+        if !s.active {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "moe stage inactive".into(),
+            )));
+        }
+        Ok(s.acci2)
+    }
+
+    /// `acci += acci2` after the other card's sums landed in `acci2` (exact, order free).
+    pub fn moe_acci_add_staged(&self) -> Result<(), AllpacaError> {
+        let (acci, acci2, n) = {
+            let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+            let s = g.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+            })?;
+            if !s.active {
+                return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "moe stage inactive".into(),
+                )));
+            }
+            (s.acci, s.acci2, s.n_tok.saturating_mul(s.dim))
+        };
+        if n == 0 || n > i32::MAX as usize {
+            return Ok(());
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            let rc = unsafe {
+                ffi::allpaca_moe_acci_add(
+                    acci.cast(),
+                    acci2.cast::<i64>(),
+                    n as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            status(rc, "moe_acci_add")
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (acci, acci2);
+            Ok(())
+        }
+    }
+
+    fn moe_acci_ptr(&self) -> Result<*mut i64, AllpacaError> {
+        let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
+        let s = g.as_ref().ok_or_else(|| {
+            AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
+        })?;
+        if !s.active {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "moe stage inactive".into(),
+            )));
+        }
+        Ok(s.acci.cast())
+    }
+
     /// Join expert streams and copy `moe_acc` `[n_tok, dim]` to the host.
     pub fn moe_finish(&self, out: &mut [f32]) -> Result<(), AllpacaError> {
-        let (acc, bytes, n_tok, dim) = {
+        let (acc, acci, bytes, n_tok, dim) = {
             let mut g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
             let s = g.as_mut().ok_or_else(|| {
                 AllpacaError::Degraded(DegradedError::FeatureDisabled("moe stage missing".into()))
@@ -8782,6 +9044,7 @@ impl HipWorkspace {
             s.active = false;
             (
                 s.acc,
+                s.acci,
                 s.n_tok.saturating_mul(s.dim).saturating_mul(4),
                 s.n_tok,
                 s.dim,
@@ -8794,6 +9057,7 @@ impl HipWorkspace {
         }
         self.bind()?;
         self.join_swiglu_streams()?;
+        self.moe_finalize_ptrs(acc, acci, n_tok.saturating_mul(dim))?;
         stream_synchronize()?;
         memcpy(out.as_mut_ptr().cast(), acc, bytes, MEMCPY_D2H)?;
         self.add_d2h(bytes);
@@ -8814,7 +9078,12 @@ impl HipWorkspace {
         self.bind()?;
         let mut g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
         if g.as_ref()
-            .is_some_and(|s| s.x_bytes >= need && s.acc_bytes >= need && s.meta_bytes >= meta_need)
+            .is_some_and(|s| {
+                s.x_bytes >= need
+                    && s.acc_bytes >= need
+                    && s.acci_bytes >= need * 2
+                    && s.meta_bytes >= meta_need
+            })
         {
             if let Some(s) = g.as_mut() {
                 s.n_tok = n_tok;
@@ -8831,11 +9100,30 @@ impl HipWorkspace {
                 return Err(e);
             }
         };
+        let acci = match device_malloc(need * 2, self.device) {
+            Ok(p) => p,
+            Err(e) => {
+                device_free(x, need);
+                device_free(acc, need);
+                return Err(e);
+            }
+        };
+        let acci2 = match device_malloc(need * 2, self.device) {
+            Ok(p) => p,
+            Err(e) => {
+                device_free(x, need);
+                device_free(acc, need);
+                device_free(acci, need * 2);
+                return Err(e);
+            }
+        };
         let meta = match device_malloc(meta_need, self.device) {
             Ok(p) => p,
             Err(e) => {
                 device_free(x, need);
                 device_free(acc, need);
+                device_free(acci, need * 2);
+                device_free(acci2, need * 2);
                 return Err(e);
             }
         };
@@ -8845,9 +9133,12 @@ impl HipWorkspace {
         *g = Some(MoeStage {
             x,
             acc,
+            acci,
+            acci2,
             meta,
             x_bytes: need,
             acc_bytes: need,
+            acci_bytes: need * 2,
             meta_bytes: meta_need,
             n_tok,
             dim,
@@ -9053,8 +9344,22 @@ impl HipWorkspace {
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            let rc = unsafe {
-                ffi::allpaca_scatter_add_scale_rows(src, idx, w, acc, m, dim, n_tok, stream)
+            // P21: sum the experts in an integer buffer so the order never matters;
+            // `ALLPACA_DSV4_FLOAT_ATOMICS=1` restores the old float atomics for A/B runs.
+            static FLOAT_ATOMICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let float_atomics = *FLOAT_ATOMICS
+                .get_or_init(|| std::env::var("ALLPACA_DSV4_FLOAT_ATOMICS").is_ok_and(|v| v == "1"));
+            let rc = if float_atomics {
+                unsafe {
+                    ffi::allpaca_scatter_add_scale_rows(src, idx, w, acc, m, dim, n_tok, stream)
+                }
+            } else {
+                let acci = self.moe_acci_ptr()?;
+                unsafe {
+                    ffi::allpaca_scatter_add_scale_rows_i64(
+                        src, idx, w, acci, m, dim, n_tok, stream,
+                    )
+                }
             };
             status(rc, "scatter_add_scale_rows")
         }
@@ -17252,6 +17557,101 @@ mod tests {
         }
     }
 
+    /// P21: the CPU "exact" MXFP4 expert path gives the same bits as the GPU kernels, at every
+    /// stage and for every row-count class (1 = wide kernel, 2..=8 and >8 = tiled kernels),
+    /// including a shape whose `k` is not a multiple of the 256-element tile.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn mxfp4_expert_cpu_exact_matches_gpu_bits() {
+        if device_count() == 0 {
+            return;
+        }
+        let limit = 10.0f32;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        let quant = |w: &[f32], rows: usize, k: usize| -> Vec<u8> {
+            let mut q = Vec::new();
+            for r in 0..rows {
+                q.extend(allpaca_cpu::quantize_mxfp4(&w[r * k..(r + 1) * k]));
+            }
+            q
+        };
+        set_device(0).expect("bind");
+        let hip = HipWorkspace::new(0, 64 * 1024 * 1024, 8).expect("hip");
+        hip.set_mxfp4_swiglu_limit(limit);
+        // (dim, ff, row counts): the DeepSeek-V4 size, and a small odd one (k = 96 = 3 blocks)
+        for (dim, ff, rows) in [
+            (4096usize, 2048usize, vec![1usize, 2, 3, 8, 9, 16, 17, 33]),
+            (96, 64, vec![1, 2, 5, 9, 20]),
+        ] {
+            let gate_q = quant(&rnd(ff * dim, 0.5), ff, dim);
+            let up_q = quant(&rnd(ff * dim, 0.5), ff, dim);
+            let down_q = quant(&rnd(dim * ff, 0.5), dim, ff);
+            let gb = device_malloc(gate_q.len(), 0).expect("gate");
+            let ub = device_malloc(up_q.len(), 0).expect("up");
+            let db = device_malloc(down_q.len(), 0).expect("down");
+            memcpy(gb, gate_q.as_ptr(), gate_q.len(), MEMCPY_H2D).expect("h2d gate");
+            memcpy(ub, up_q.as_ptr(), up_q.len(), MEMCPY_H2D).expect("h2d up");
+            memcpy(db, down_q.as_ptr(), down_q.len(), MEMCPY_H2D).expect("h2d down");
+            for m in rows {
+                let x = rnd(m * dim, 4.0);
+                let same = |what: &str, gpu: &[f32], cpu: &[f32]| {
+                    for (i, (a, b)) in gpu.iter().zip(cpu).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{what} dim={dim} ff={ff} m={m} idx={i}: gpu {a} cpu {b}"
+                        );
+                    }
+                };
+                let mut gpu_gemm = vec![0.0f32; m * ff];
+                super::gemm_nt_mxfp4(&x, &gate_q, &mut gpu_gemm, m as i32, ff as i32, dim as i32)
+                    .expect("gpu gemm");
+                same("gemm", &gpu_gemm, &allpaca_cpu::mxfp4_gemm_exact(&x, &gate_q, m, ff, dim));
+                let mut gpu_gu = vec![0.0f32; m * ff];
+                super::mxfp4_swiglu_gate_up(
+                    &x, &gate_q, &up_q, &mut gpu_gu, m as i32, ff as i32, dim as i32, limit,
+                )
+                .expect("gpu gate_up");
+                same(
+                    "gate_up",
+                    &gpu_gu,
+                    &allpaca_cpu::mxfp4_gate_up_exact(&x, &gate_q, &up_q, m, ff, dim, limit),
+                );
+                let mut gpu = vec![0.0f32; m * dim];
+                hip.mxfp4_swiglu_gemm(&x, gb, ub, db, &mut gpu, m as i32, dim as i32, ff as i32)
+                    .expect("gpu expert");
+                let exact = allpaca_cpu::mxfp4_swiglu_experts_exact(
+                    &[allpaca_cpu::Mxfp4Expert {
+                        gate: &gate_q,
+                        up: &up_q,
+                        down: &down_q,
+                        x: &x,
+                        m,
+                    }],
+                    dim,
+                    ff,
+                    limit,
+                    4,
+                )
+                .remove(0);
+                same("expert", &gpu, &exact);
+            }
+            device_free(gb, gate_q.len());
+            device_free(ub, up_q.len());
+            device_free(db, down_q.len());
+        }
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn mxfp4_swiglu_gemm_matches_three_gemms() {
@@ -17358,6 +17758,116 @@ mod tests {
             device_free(dev[i].0, packed[i].0.len());
             device_free(dev[i].1, packed[i].1.len());
             device_free(dev[i].2, packed[i].2.len());
+        }
+    }
+
+    /// P21: the fixed-point scatter must not depend on row order. Several rows land on the
+    /// same token; scattering them forwards and backwards has to give identical bits, close
+    /// to the float sum.
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    #[test]
+    fn scatter_add_scale_rows_i64_is_order_independent() {
+        if device_count() == 0 {
+            return;
+        }
+        let n_tok = 2usize;
+        let dim = 64usize;
+        let m = 7usize;
+        let mut src = vec![0.0f32; m * dim];
+        for (i, v) in src.iter_mut().enumerate() {
+            // values of very different size so a float sum really depends on its order
+            *v = ((i * 37 % 101) as f32 - 50.0) * if i % 3 == 0 { 1.0e3 } else { 1.0e-3 };
+        }
+        let idx_fwd = [0i32, 0, 0, 1, 0, 1, 0];
+        let w_fwd = [0.5f32, 0.25, 2.0, 1.5, 0.125, 0.75, 3.0];
+        let run = |order: &[usize]| -> Vec<f32> {
+            set_device(0).expect("bind");
+            let mut src_o = vec![0.0f32; m * dim];
+            let mut idx_o = vec![0i32; m];
+            let mut w_o = vec![0.0f32; m];
+            for (r, &o) in order.iter().enumerate() {
+                src_o[r * dim..(r + 1) * dim].copy_from_slice(&src[o * dim..(o + 1) * dim]);
+                idx_o[r] = idx_fwd[o];
+                w_o[r] = w_fwd[o];
+            }
+            let n = n_tok * dim;
+            let src_d = device_malloc(src_o.len() * 4, 0).expect("src");
+            let idx_d = device_malloc(idx_o.len() * 4, 0).expect("idx");
+            let w_d = device_malloc(w_o.len() * 4, 0).expect("w");
+            let acc_d = device_malloc(n * 4, 0).expect("acc");
+            let acci_d = device_malloc(n * 8, 0).expect("acci");
+            memcpy(src_d, src_o.as_ptr().cast(), src_o.len() * 4, MEMCPY_H2D).expect("src h2d");
+            memcpy(idx_d, idx_o.as_ptr().cast(), idx_o.len() * 4, MEMCPY_H2D).expect("idx h2d");
+            memcpy(w_d, w_o.as_ptr().cast(), w_o.len() * 4, MEMCPY_H2D).expect("w h2d");
+            super::memset_on(acc_d, 0, n * 4, std::ptr::null_mut()).expect("zero acc");
+            super::memset_on(acci_d, 0, n * 8, std::ptr::null_mut()).expect("zero acci");
+            stream_synchronize().expect("sync zero");
+            // one launch per row, so the adds really are separate and unordered
+            for r in 0..m {
+                let rc = unsafe {
+                    super::ffi::allpaca_scatter_add_scale_rows_i64(
+                        src_d.cast::<f32>().add(r * dim),
+                        idx_d.cast::<i32>().add(r),
+                        w_d.cast::<f32>().add(r),
+                        acci_d.cast(),
+                        1,
+                        dim as i32,
+                        n_tok as i32,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_eq!(rc, 0, "scatter i64 rc={rc}");
+            }
+            let rc = unsafe {
+                super::ffi::allpaca_moe_acc_finalize(
+                    acc_d.cast(),
+                    acci_d.cast(),
+                    n as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0, "finalize rc={rc}");
+            // a second finalize must add nothing
+            let rc = unsafe {
+                super::ffi::allpaca_moe_acc_finalize(
+                    acc_d.cast(),
+                    acci_d.cast(),
+                    n as i32,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0);
+            let mut got = vec![0.0f32; n];
+            memcpy(got.as_mut_ptr().cast(), acc_d, n * 4, MEMCPY_D2H).expect("d2h");
+            device_free(src_d, src_o.len() * 4);
+            device_free(idx_d, idx_o.len() * 4);
+            device_free(w_d, w_o.len() * 4);
+            device_free(acc_d, n * 4);
+            device_free(acci_d, n * 8);
+            got
+        };
+        let fwd: Vec<usize> = (0..m).collect();
+        let rev: Vec<usize> = (0..m).rev().collect();
+        let a = run(&fwd);
+        let b = run(&rev);
+        let a_bits: Vec<u32> = a.iter().map(|v| v.to_bits()).collect();
+        let b_bits: Vec<u32> = b.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(a_bits, b_bits, "row order changed the sum");
+        let mut expect = vec![0.0f64; n_tok * dim];
+        for r in 0..m {
+            let t = idx_fwd[r] as usize;
+            for j in 0..dim {
+                expect[t * dim + j] += (src[r * dim + j] * w_fwd[r]) as f64;
+            }
+        }
+        for i in 0..expect.len() {
+            let tol = 1.0e-4 * expect[i].abs().max(1.0);
+            assert!(
+                (a[i] as f64 - expect[i]).abs() <= tol,
+                "i64 scatter mismatch idx={i} hip={} cpu={}",
+                a[i],
+                expect[i]
+            );
         }
     }
 

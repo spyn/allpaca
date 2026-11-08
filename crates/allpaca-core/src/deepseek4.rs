@@ -2574,6 +2574,7 @@ fn dsv4_attn_and_route_rows(
     };
     let t_hc = Instant::now();
     let attn_mix = format!("blk.{blk}.hc_attn_fn.weight");
+    debug_stage("layer_in", layer_idx, &states.data);
     let (mut curs, posts, combs) = hc_pre_packed(
         &mut states.data,
         n_tok,
@@ -2587,6 +2588,10 @@ fn dsv4_attn_and_route_rows(
         Some(metrics),
         false,
     )?;
+    if let Some(g) = gpu.as_deref_mut() {
+        let _ = g.ensure_hc_curs_host(&mut curs);
+    }
+    debug_stage("attn_curs", layer_idx, &curs);
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2815,6 +2820,7 @@ fn dsv4_attn_and_route_rows(
         &host.ffn_norm
     };
     let t_hc = Instant::now();
+    debug_stage("attn_out", layer_idx, &attn_outs);
     let xs_dev = gpu.as_ref().and_then(|g| g.last_o_device());
     let _ = hc_post_batch(
         &attn_outs,
@@ -2830,7 +2836,7 @@ fn dsv4_attn_and_route_rows(
         },
         xs_dev,
     );
-    let (xs, fposts, fcombs) = {
+    let (mut xs, fposts, fcombs) = {
         let ffn_mix = format!("blk.{blk}.hc_ffn_fn.weight");
         hc_pre_packed(
             &mut states.data,
@@ -2849,6 +2855,10 @@ fn dsv4_attn_and_route_rows(
     metrics
         .dsv4_hc_ns
         .fetch_add(t_hc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if let Some(g) = gpu.as_deref_mut() {
+        let _ = g.ensure_hc_curs_host(&mut xs);
+    }
+    debug_stage("ffn_xs", layer_idx, &xs);
     let mut fcurs: Vec<Vec<f32>> = Vec::with_capacity(n_tok);
     for t in 0..n_tok {
         fcurs.push(xs[t * dim..(t + 1) * dim].to_vec());
@@ -2870,6 +2880,10 @@ fn dsv4_attn_and_route_rows(
     metrics
         .dsv4_router_ns
         .fetch_add(t_route.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    for r in &routes {
+        let flat: Vec<f32> = r.iter().flat_map(|(e, w)| [*e as f32, *w]).collect();
+        debug_stage("picks", layer_idx, &flat);
+    }
     let mut preps = Vec::with_capacity(n_tok);
     for (((fcur, fpost), fcomb), picks) in fcurs.into_iter().zip(fposts).zip(fcombs).zip(routes) {
         preps.push(Dsv4FfnPrep {
@@ -3227,16 +3241,16 @@ fn dsv4_apply_moe(
 /// Routed experts that are not in a GPU cache, computed on the CPU from the
 /// mapped MXFP4 file. `work` is `(expert, its m rows of dim, [(token, weight)])`;
 /// the result is the weighted sum per token, `n_tok * dim`.
-fn dsv4_cpu_experts(
+/// Each work item's expert output (`m * dim` floats, before the routing weight).
+fn dsv4_cpu_expert_ys(
     file: &GgufFile,
     blk: usize,
     cfg: &ModelConfig,
     work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
-    n_tok: usize,
     limit: f32,
     metrics: &Metrics,
     ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
-) -> Result<Vec<f32>, AllpacaError> {
+) -> Result<Vec<Vec<f32>>, AllpacaError> {
     let (dim, ff) = (cfg.dim, cfg.ff_dim.max(1));
     let t = Instant::now();
     // Through the RAM tier (cached, else read from the file in large direct
@@ -3302,16 +3316,61 @@ fn dsv4_cpu_experts(
     };
     // Half the logical cores: the rest drive the GPUs and the copies.
     let threads = std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1));
-    let ys = allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads);
-    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
-    for (y, (_, _, group)) in ys.iter().zip(work) {
-        scatter_expert_rows(&mut sum, y, group, dim);
-    }
+    // The exact path reproduces the GPU kernels' bits, so an expert gives the same result
+    // whether it ran here or on a card (P21). `ALLPACA_DSV4_CPU_FAST=1` uses the faster
+    // kernel that sums in its own order.
+    let ys = if std::env::var("ALLPACA_DSV4_CPU_FAST").is_ok_and(|v| v == "1") {
+        allpaca_cpu::mxfp4_swiglu_experts(&experts, dim, ff, limit, threads)
+    } else {
+        allpaca_cpu::mxfp4_swiglu_experts_exact(&experts, dim, ff, limit, threads)
+    };
     metrics.expert_lru_misses.fetch_add(work.len() as u64, Ordering::Relaxed);
     metrics.expert_cpu_runs.fetch_add(work.len() as u64, Ordering::Relaxed);
     metrics
         .dsv4_cpu_expert_ns
         .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(ys)
+}
+
+/// The experts' weighted outputs summed per token in float (the single-token paths).
+fn dsv4_cpu_experts(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    limit: f32,
+    metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
+) -> Result<Vec<f32>, AllpacaError> {
+    let ys = dsv4_cpu_expert_ys(file, blk, cfg, work, limit, metrics, ram)?;
+    let dim = cfg.dim;
+    let mut sum = vec![0.0f32; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows(&mut sum, y, group, dim);
+    }
+    Ok(sum)
+}
+
+/// The same sum as 2^-32 fixed-point integers, rounded exactly as the GPU `scatter_add` does
+/// per term, so adding it to the GPU's integer sum gives the bits an expert on a card would
+/// have given, wherever the expert ran (P21).
+fn dsv4_cpu_experts_fixed(
+    file: &GgufFile,
+    blk: usize,
+    cfg: &ModelConfig,
+    work: &[(usize, Vec<f32>, Vec<(usize, f32)>)],
+    n_tok: usize,
+    limit: f32,
+    metrics: &Metrics,
+    ram: Option<&Mutex<crate::dsv4_ram::ExpertRam>>,
+) -> Result<Vec<i64>, AllpacaError> {
+    let ys = dsv4_cpu_expert_ys(file, blk, cfg, work, limit, metrics, ram)?;
+    let dim = cfg.dim;
+    let mut sum = vec![0i64; n_tok.saturating_mul(dim)];
+    for (y, (_, _, group)) in ys.iter().zip(work) {
+        scatter_expert_rows_fixed(&mut sum, y, group, dim);
+    }
     Ok(sum)
 }
 
@@ -3325,6 +3384,32 @@ fn scatter_expert_rows(routed: &mut [f32], y: &[f32], group: &[(usize, f32)], di
         for j in 0..dim {
             routed[dst + j] += y[src + j] * w;
         }
+    }
+}
+
+/// `round_to_nearest_even(float(y * w) * 2^32)`, clamped, as the GPU fixed-point scatter does.
+fn fixed_q(v: f32) -> i64 {
+    let d = (f64::from(v) * 4_294_967_296.0).clamp(-4.0e18, 4.0e18);
+    d.round_ties_even() as i64
+}
+
+fn scatter_expert_rows_fixed(sum: &mut [i64], y: &[f32], group: &[(usize, f32)], dim: usize) {
+    for (i, &(t, w)) in group.iter().enumerate() {
+        let src = i.saturating_mul(dim);
+        let dst = t.saturating_mul(dim);
+        if src + dim > y.len() || dst + dim > sum.len() {
+            continue;
+        }
+        for j in 0..dim {
+            sum[dst + j] = sum[dst + j].wrapping_add(fixed_q(y[src + j] * w));
+        }
+    }
+}
+
+/// `routed += fixed / 2^32` (the host fallback when the device accumulator is not used).
+fn add_fixed_slice(routed: &mut [f32], fixed: &[i64]) {
+    for (dst, &q) in routed.iter_mut().zip(fixed) {
+        *dst += (q as f64 * 2.328_306_436_538_696_3e-10) as f32;
     }
 }
 
@@ -3400,6 +3485,7 @@ fn run_expert_job_pair(
     gpu_out: &mut Vec<(Vec<f32>, Vec<(usize, f32)>)>,
     cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>,
 ) -> bool {
+    crate::dsv4_gpu::dbg_sync(4, hip0.map(|h| &**h), hip1.map(|h| &**h));
     let take_fail = |failed: Vec<crate::dsv4_gpu::ExpertSwigluJob>,
                      cpu_work: &mut Vec<(usize, Vec<f32>, Vec<(usize, f32)>)>| {
         for job in failed {
@@ -3661,6 +3747,25 @@ fn dsv4_apply_moe_rows(
             _ => cpu_work.push((e, gx, group)),
         }
     }
+    if debug_stage_on(layer_idx) {
+        let ids = |v: &Vec<crate::dsv4_gpu::ExpertSwigluJob>| {
+            let mut e: Vec<usize> = v.iter().map(|j| j.expert).collect();
+            e.sort_unstable();
+            e
+        };
+        let mut cpu_ids: Vec<usize> = cpu_work.iter().map(|w| w.0).collect();
+        cpu_ids.sort_unstable();
+        eprintln!(
+            "moe_place layer {} gpu0_ready {:?} gpu0_wait {:?} gpu1_ready {:?} gpu1_wait {:?} cpu {:?} cpu_miss {}",
+            layer_idx,
+            ids(&jobs0_ready),
+            ids(&jobs0_wait),
+            ids(&jobs1_ready),
+            ids(&jobs1_wait),
+            cpu_ids,
+            cpu_miss
+        );
+    }
     if gpu.is_some() {
         if let Some(h) = hip0.as_ref() {
             match gpu.as_ref().and_then(|g| g.hc_curs_device()) {
@@ -3692,7 +3797,7 @@ fn dsv4_apply_moe_rows(
     } else {
         Vec::new()
     };
-    let mut cpu_sum: Option<Vec<f32>> = None;
+    let mut cpu_sum: Option<Vec<i64>> = None;
     let mut cpu_err: Option<AllpacaError> = None;
     let ff = cfg.ff_dim.max(1);
     let mut gpu_out: Vec<(Vec<f32>, Vec<(usize, f32)>)> = Vec::new();
@@ -3706,7 +3811,7 @@ fn dsv4_apply_moe_rows(
             Some(f) if !cpu_now.is_empty() => {
                 let work = &cpu_now;
                 let ram = gpu.as_ref().and_then(|g| g.expert_ram());
-                Some(s.spawn(move || dsv4_cpu_experts(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
+                Some(s.spawn(move || dsv4_cpu_experts_fixed(f, blk, cfg, work, n_tok, limit, metrics, ram.as_deref())))
             }
             _ => None,
         };
@@ -3894,6 +3999,8 @@ fn dsv4_apply_moe_rows(
     }
     if let Some(h0) = hip0.as_ref() {
         if h0.moe_active() {
+            // Join only: GPU1's fixed-point sums are folded in next and the float
+            // accumulator is finalized once after that.
             let _ = h0.moe_join_compute();
         }
     }
@@ -3908,6 +4015,20 @@ fn dsv4_apply_moe_rows(
             }
         }
     }
+    if let Some(h0) = hip0.as_ref() {
+        if h0.moe_active() {
+            // The CPU experts join the same fixed-point sum before the single finalize, so
+            // the result does not depend on which experts ran on the CPU.
+            if let Some(sum) = cpu_sum.as_ref() {
+                if h0.moe_acci_add_from_host(sum).is_ok() {
+                    cpu_sum = None;
+                }
+            }
+            let _ = h0.moe_join_finalize();
+            debug_moe_acc("moe_acc0_final", layer_idx, h0, n_tok, dim);
+        }
+    }
+    debug_stage("shexp_y", layer_idx, &shexp_y);
     let leftover = !gpu_out.is_empty() || !cpu_work.is_empty();
     let mut device_hc = false;
     let t_hc = Instant::now();
@@ -3922,14 +4043,8 @@ fn dsv4_apply_moe_rows(
                         folded = false;
                     }
                 }
-                if folded {
-                    if let Some(sum) = cpu_sum.as_ref() {
-                        if h0.moe_add_from_host(sum).is_ok() {
-                            cpu_sum = None;
-                        } else {
-                            folded = false;
-                        }
-                    }
+                if folded && cpu_sum.is_some() {
+                    folded = false;
                 }
                 if folded && !shexp_dev {
                     if h0.moe_add_from_host(&shexp_y).is_ok() {
@@ -3963,7 +4078,7 @@ fn dsv4_apply_moe_rows(
             add_acc_slice(&mut routed, tmp);
         }
         if let Some(sum) = cpu_sum.as_ref() {
-            add_acc_slice(&mut routed, sum);
+            add_fixed_slice(&mut routed, sum);
         }
         let _ = hip0.as_ref().map(|h| h.bind());
         for (y, group) in gpu_out {
@@ -4073,6 +4188,11 @@ fn dsv4_lm_head(
     }
     let mut used_gpu_head = false;
     let mut gpu = gpu;
+    if std::env::var("ALLPACA_DSV4_NO_CURS_FIX").is_err() {
+        if let Some(g) = gpu.as_deref_mut() {
+            g.invalidate_hc_curs();
+        }
+    }
     if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
         if g.gemv_bf16(
             f,
@@ -4338,6 +4458,93 @@ pub fn forward_dsv4_token(
 
 #[allow(clippy::too_many_arguments)]
 
+/// P21 debug: `ALLPACA_DSV4_STAGE_HASH=1` prints `stage_hash layer tag n fnv` for a few
+/// stages of layers 0 and 1, to find which stage first differs between two starts.
+fn debug_stage_on(layer_idx: usize) -> bool {
+    // `ALLPACA_DSV4_STAGE_HASH=N` hashes the stages of layers 0..=N (default off).
+    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| {
+        std::env::var("ALLPACA_DSV4_STAGE_HASH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    max.is_some_and(|m| layer_idx <= m)
+}
+
+fn debug_moe_acc(
+    tag: &str,
+    layer_idx: usize,
+    h: &std::sync::Arc<allpaca_hip::HipWorkspace>,
+    n_tok: usize,
+    dim: usize,
+) {
+    if !debug_stage_on(layer_idx) {
+        return;
+    }
+    if let Ok(p) = h.moe_acc_device() {
+        let mut v = vec![0.0f32; n_tok.saturating_mul(dim)];
+        if h.copy_d2h_f32(p as *const f32, &mut v).is_ok() {
+            debug_stage(tag, layer_idx, &v);
+        }
+    }
+}
+
+fn debug_stage(tag: &str, layer_idx: usize, data: &[f32]) {
+    if !debug_stage_on(layer_idx) {
+        return;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in data {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    eprintln!("stage_hash {} {} {} {:016x}", layer_idx, tag, data.len(), h);
+}
+
+/// P21 debug: `ALLPACA_DSV4_LAYER_HASH=1` downloads the packed hidden state after
+/// every layer of a chunk and prints `layer_hash pos layer n fnv max_abs nonfinite`
+/// to stderr, to find the first layer where two runs (or a corrupted step) differ.
+/// The download waits for the device, so it changes timing. Off by default.
+fn debug_layer_hash(
+    gpu: &mut Option<&mut crate::dsv4_gpu::Dsv4Gpu>,
+    states: &mut HcBatch,
+    start_pos: usize,
+    layer_idx: usize,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ALLPACA_DSV4_LAYER_HASH").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let Some(g) = gpu.as_mut() else { return };
+    let mut scratch = vec![0.0f32; states.data.len()];
+    if g.download_hc_packed(&mut scratch).is_err() {
+        return;
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut max_abs = 0.0f32;
+    let mut nonfinite = 0usize;
+    for v in &scratch {
+        for b in v.to_bits().to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        if v.is_finite() {
+            max_abs = max_abs.max(v.abs());
+        } else {
+            nonfinite += 1;
+        }
+    }
+    eprintln!(
+        "layer_hash {} {} {} {:016x} {:.4} {}",
+        start_pos,
+        layer_idx,
+        states.n_tok,
+        h,
+        max_abs,
+        nonfinite
+    );
+}
+
 pub fn forward_dsv4_tokens(
     model: &TinyModel,
     tokens: &[u32],
@@ -4425,6 +4632,7 @@ pub fn forward_dsv4_tokens(
             file,
             skip_shexp,
         )?;
+        debug_layer_hash(&mut gpu, &mut states, start_pos, layer_idx);
     }
     if write_logits {
         if states.n_tok > 0 {

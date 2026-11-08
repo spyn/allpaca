@@ -485,7 +485,13 @@ impl ExpertRam {
             return Ok(locs);
         }
         let reads = &reads;
-        let direct = match read_all(&mut self.readers, &self.paths, reads) {
+        let wait = std::time::Instant::now();
+        let read_result = read_all(&mut self.readers, &self.paths, reads);
+        metrics
+            .expert_fetch_wait_ns
+            .fetch_add(wait.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        metrics.expert_fetch_waits.fetch_add(1, Ordering::Relaxed);
+        let direct = match read_result {
             Ok(n) => n,
             Err(e) => {
                 {

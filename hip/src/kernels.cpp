@@ -118,11 +118,38 @@ static inline hipError_t counted_hip_memcpy(void *dst, const void *src, size_t b
     }
     return err;
 }
+/* Debug (P21): ALLPACA_SYNC_COPY is a bit mask of copy kinds that wait for their
+ * stream right after the call (1 host->device, 2 device->host, 4 device->device,
+ * 8 any other); add 16 to limit it to the null stream, 32 to side streams, 64 to copies of 1 MiB or more, 128 to smaller ones.
+ * 0 (unset) leaves every copy asynchronous. */
+static inline unsigned debug_sync_copy_mask() {
+    static const unsigned mask = []() -> unsigned {
+        const char *v = std::getenv("ALLPACA_SYNC_COPY");
+        return v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    return mask;
+}
 static inline hipError_t counted_hip_memcpy_async(void *dst, const void *src, size_t bytes,
                                                   hipMemcpyKind kind, hipStream_t stream) {
-    const hipError_t err = ::hipMemcpyAsync(dst, src, bytes, kind, stream);
+    hipError_t err = ::hipMemcpyAsync(dst, src, bytes, kind, stream);
     if (kind != hipMemcpyDeviceToHost) {
         note_device_write();
+    }
+    if (err == hipSuccess) {
+        const unsigned m = debug_sync_copy_mask();
+        if (m) {
+            const unsigned bit = kind == hipMemcpyHostToDevice     ? 1u
+                                 : kind == hipMemcpyDeviceToHost   ? 2u
+                                 : kind == hipMemcpyDeviceToDevice ? 4u
+                                                                    : 8u;
+            const bool stream_ok = ((m & 16u) == 0 || stream == nullptr) &&
+                                   ((m & 32u) == 0 || stream != nullptr);
+            const bool size_ok = ((m & 64u) == 0 || bytes >= (1u << 20)) &&
+                                 ((m & 128u) == 0 || bytes < (1u << 20));
+            if ((m & bit) && stream_ok && size_ok) {
+                err = ::hipStreamSynchronize(stream);
+            }
+        }
     }
     return err;
 }
@@ -7122,8 +7149,8 @@ __global__ void gemm_nt_mxfp4_tiled_m_kernel(const float *a, const uint8_t *b, f
 #pragma unroll 8
                     for (int r = 0; r < TILE_M; ++r) {
                         const float *ar = As + r * TILE_K + base;
-                        acc[r] += ar[j] * c0;
-                        acc[r] += ar[16 + j] * c1;
+                        acc[r] = fmaf(ar[j], c0, acc[r]);
+                        acc[r] = fmaf(ar[16 + j], c1, acc[r]);
                     }
                 }
             }
@@ -7166,13 +7193,15 @@ __device__ inline float mxfp4_block_dot(const uint8_t *blk, const float *x) {
         xs[4 * q + 2] = v.z;
         xs[4 * q + 3] = v.w;
     }
+    /* The fused multiply-adds are written out (nothing else here has a product feeding a sum), so the CPU path in
+     * allpaca-cpu `mxfp4_exact.rs` reproduces the bits with `mul_add` in the same places (P21). */
     float s = 0.f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const uint32_t b0 = static_cast<uint32_t>(q0 >> (8 * j)) & 0xFFu;
         const uint32_t b1 = static_cast<uint32_t>(q1 >> (8 * j)) & 0xFFu;
-        s += xs[j] * mxfp4_code(b0 & 15u) + xs[16 + j] * mxfp4_code(b0 >> 4);
-        s += xs[8 + j] * mxfp4_code(b1 & 15u) + xs[24 + j] * mxfp4_code(b1 >> 4);
+        s = s + fmaf(xs[j], mxfp4_code(b0 & 15u), xs[16 + j] * mxfp4_code(b0 >> 4));
+        s = s + fmaf(xs[8 + j], mxfp4_code(b1 & 15u), xs[24 + j] * mxfp4_code(b1 >> 4));
     }
     return s;
 }
@@ -7197,12 +7226,12 @@ __global__ void gemv_nt_mxfp4_wide_kernel(const float *a, const uint8_t *b, floa
         const uint8_t *brow = b + static_cast<size_t>(col) * static_cast<size_t>(nblocks) * 17;
         for (int ib = lane; ib < nblocks; ib += 32) {
             const uint8_t *blk = brow + static_cast<size_t>(ib) * 17;
-            acc += mxfp4_e8m0_half(blk[0]) * mxfp4_block_dot(blk, arow + ib * 32);
+            acc = fmaf(mxfp4_e8m0_half(blk[0]), mxfp4_block_dot(blk, arow + ib * 32), acc);
         }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor(acc, off, 32);
+        acc = acc + __shfl_xor(acc, off, 32);
     }
     if (col < n && lane == 0) {
         c[static_cast<size_t>(row) * static_cast<size_t>(n) + col] = acc;
@@ -7234,14 +7263,14 @@ __global__ void mxfp4_swiglu_gate_up_wide_kernel(const float *a, const uint8_t *
             const uint8_t *g = grow + static_cast<size_t>(ib) * 17;
             const uint8_t *u = urow + static_cast<size_t>(ib) * 17;
             const float *x = arow + ib * 32;
-            acc_g += mxfp4_e8m0_half(g[0]) * mxfp4_block_dot(g, x);
-            acc_u += mxfp4_e8m0_half(u[0]) * mxfp4_block_dot(u, x);
+            acc_g = fmaf(mxfp4_e8m0_half(g[0]), mxfp4_block_dot(g, x), acc_g);
+            acc_u = fmaf(mxfp4_e8m0_half(u[0]), mxfp4_block_dot(u, x), acc_u);
         }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc_g += __shfl_xor(acc_g, off, 32);
-        acc_u += __shfl_xor(acc_u, off, 32);
+        acc_g = acc_g + __shfl_xor(acc_g, off, 32);
+        acc_u = acc_u + __shfl_xor(acc_u, off, 32);
     }
     if (col < n && lane == 0) {
         const float x = acc_g;
@@ -7312,7 +7341,8 @@ extern "C" int allpaca_gemm_nt_mxfp4_untiled(const float *a, const uint8_t *b, f
     return launch_gemm_nt_mxfp4(a, b, c, m, n, k, as_stream(stream), 0);
 }
 
-__device__ inline float mxfp4_silu(float x) { return x / (1.0f + expf(-x)); }
+/* silu(g) * u with the shared det_expf and explicit roundings (bit-identical to the CPU path). */
+__device__ inline float mxfp4_silu_mul(float g, float u) { return det_silu_mul(g, u); }
 
 /* silu(gate) * up; with limit > 0 the gate is capped at limit first and up to +-limit
  * (DeepSeek-V4 swiglu_clamp_exp). */
@@ -7321,7 +7351,7 @@ __device__ inline float mxfp4_swiglu(float g, float u, float limit) {
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
     }
-    return mxfp4_silu(g) * u;
+    return mxfp4_silu_mul(g, u);
 }
 
 /* One A-tile load, two MXFP4 B rows, write silu(gate)*up. */
@@ -7441,10 +7471,10 @@ __global__ void mxfp4_swiglu_gate_up_tiled_m_kernel(const float *a, const uint8_
 #pragma unroll 8
                     for (int r = 0; r < TILE_M; ++r) {
                         const float *ar = As + r * TILE_K + base;
-                        acc_g[r] += ar[j] * g0;
-                        acc_g[r] += ar[16 + j] * g1;
-                        acc_u[r] += ar[j] * u0;
-                        acc_u[r] += ar[16 + j] * u1;
+                        acc_g[r] = fmaf(ar[j], g0, acc_g[r]);
+                        acc_g[r] = fmaf(ar[16 + j], g1, acc_g[r]);
+                        acc_u[r] = fmaf(ar[j], u0, acc_u[r]);
+                        acc_u[r] = fmaf(ar[16 + j], u1, acc_u[r]);
                     }
                 }
             }
@@ -8868,6 +8898,11 @@ extern "C" int allpaca_hip_blas_warmup(int32_t device) {
 
 extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t stream) {
     return hip_status(hipStreamSynchronize(as_stream(stream)));
+}
+
+/* Debug only (P21): wait for every stream on the current device. */
+extern "C" int allpaca_hip_device_synchronize(void) {
+    return hip_status(hipDeviceSynchronize());
 }
 
 extern "C" int allpaca_hip_stream_create(allpaca_stream_t *stream) {
@@ -10923,6 +10958,54 @@ __global__ void scatter_add_scale_rows_kernel(const float *src, const int32_t *i
                   w[row]);
 }
 
+/* P21: order-independent version of the kernel above. Each term is rounded to a
+ * 2^-32 fixed-point integer and added with a 64-bit integer atomic; integer addition is
+ * associative, so the sum does not depend on which expert or stream lands first. The
+ * result is turned back into float by `moe_acc_finalize_kernel`. */
+__global__ void scatter_add_scale_rows_i64_kernel(const float *src, const int32_t *idx,
+                                                  const float *w, long long *acc, int m, int dim,
+                                                  int n_tok) {
+    const int row = static_cast<int>(blockIdx.y);
+    const int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= m || j >= dim) {
+        return;
+    }
+    const int t = idx[row];
+    if (t < 0 || t >= n_tok) {
+        return;
+    }
+    double d = static_cast<double>(src[static_cast<size_t>(row) * static_cast<size_t>(dim) +
+                                       static_cast<size_t>(j)] *
+                                   w[row]) *
+               4294967296.0;
+    d = fmin(fmax(d, -4.0e18), 4.0e18);
+    const long long q = static_cast<long long>(__double2ll_rn(d));
+    atomicAdd(reinterpret_cast<unsigned long long *>(
+                  &acc[static_cast<size_t>(t) * static_cast<size_t>(dim) + static_cast<size_t>(j)]),
+              static_cast<unsigned long long>(q));
+}
+
+/* acc += fixed-point sum, then clear it so a second call adds nothing. */
+__global__ void moe_acc_finalize_kernel(float *acc, long long *acci, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) {
+        return;
+    }
+    const long long a = acci[i];
+    if (a != 0) {
+        acc[i] += static_cast<float>(static_cast<double>(a) * 2.3283064365386963e-10);
+        acci[i] = 0;
+    }
+}
+
+/* dst += src on the fixed-point expert sums, used to fold GPU1's into GPU0's exactly. */
+__global__ void moe_acci_add_kernel(long long *dst, const long long *src, int n) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        dst[i] += src[i];
+    }
+}
+
 /* curs[t, i] = sum_s packed[t, s, i] * pre[t, s] */
 __global__ void hc_mix_pre_kernel(const float *packed, const float *pre, float *curs, int n_tok,
                                   int hc, int dim) {
@@ -11426,6 +11509,49 @@ extern "C" int allpaca_scatter_add_scale_rows(const float *src, const int32_t *i
                        dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(m)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), src, idx, w, acc,
                        m, dim, n_tok);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_scatter_add_scale_rows_i64(const float *src, const int32_t *idx,
+                                                  const float *w, long long *acc, int32_t m,
+                                                  int32_t dim, int32_t n_tok,
+                                                  allpaca_stream_t stream) {
+    if (!src || !idx || !w || !acc || m <= 0 || dim <= 0 || n_tok <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (dim + threads - 1) / threads;
+    hipLaunchKernelGGL(scatter_add_scale_rows_i64_kernel,
+                       dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(m)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), src, idx, w, acc,
+                       m, dim, n_tok);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_moe_acci_add(long long *dst, const long long *src, int32_t n,
+                                    allpaca_stream_t stream) {
+    if (!dst || !src || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(moe_acci_add_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), dst, src, n);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_moe_acc_finalize(float *acc, long long *acci, int32_t n,
+                                        allpaca_stream_t stream) {
+    if (!acc || !acci || n <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hipLaunchKernelGGL(moe_acc_finalize_kernel, dim3(static_cast<unsigned>(blocks)),
+                       dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), acc, acci, n);
     return hip_status(hipGetLastError());
 }
 
@@ -12366,6 +12492,8 @@ extern "C" int allpaca_hip_stream_synchronize(allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
+extern "C" int allpaca_hip_device_synchronize(void) { return ALLPACA_ERR_NOT_IMPLEMENTED; }
+
 extern "C" int allpaca_hip_stream_create(allpaca_stream_t *) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
@@ -12804,6 +12932,20 @@ extern "C" int allpaca_vision_rope_rows(float *, const int32_t *, const int32_t 
 
 extern "C" int allpaca_scatter_add_scale_rows(const float *, const int32_t *, const float *, float *,
                                               int32_t, int32_t, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_scatter_add_scale_rows_i64(const float *, const int32_t *, const float *,
+                                                  long long *, int32_t, int32_t, int32_t,
+                                                  allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_moe_acc_finalize(float *, long long *, int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_moe_acci_add(long long *, const long long *, int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

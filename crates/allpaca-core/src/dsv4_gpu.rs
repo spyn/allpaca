@@ -544,6 +544,9 @@ impl Dsv4Gpu {
             heat_routes: gpu_heat_routes,
             heat_file,
             heat_profile,
+            // On by default. The CPU experts reproduce the GPU kernels' bits (P21), so output
+            // does not depend on which experts ran here. `ALLPACA_DSV4_CPU_MISS=0` sends every
+            // miss to a GPU instead (and turns off the host RAM expert tier).
             cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
                 && cpu_expert_kernel_fits(file, cfg),
             ram: None,
@@ -1479,6 +1482,7 @@ impl Dsv4Gpu {
         if plan.is_empty() {
             return (false, false);
         }
+        dbg_sync(16, Some(&self.hip), self.draft.as_deref());
         let hip = self.hip.clone();
         let draft = self.draft.clone();
         let nbytes0: u64 = plan.parts0.iter().map(|(_, s)| s.len() as u64).sum();
@@ -1561,6 +1565,7 @@ impl Dsv4Gpu {
             drop(ready);
         });
         let _ = hip.bind();
+        dbg_sync(1, Some(&self.hip), self.draft.as_deref());
         add_bytes(metrics, nbytes0.saturating_add(nbytes1));
         if let Some(m) = metrics {
             if plan.n0 > 0 {
@@ -1636,6 +1641,7 @@ impl Dsv4Gpu {
         metrics: Option<&Metrics>,
         keep_layer: usize,
     ) -> Result<ExpertCopyPlan<'a>, AllpacaError> {
+        dbg_sync(32, Some(&self.hip), self.draft.as_deref());
         self.reset_expert_h2d_host();
         if ids.is_empty() || self.has_prefill_layer(layer) {
             return Ok(ExpertCopyPlan::empty());
@@ -1668,6 +1674,7 @@ impl Dsv4Gpu {
             self.h2d1_inflight = false;
             let _ = self.hip.bind();
         }
+        dbg_sync(8, Some(&self.hip), self.draft.as_deref());
     }
 
     pub fn resident_expert(&self, layer: usize, expert: usize) -> Option<(*const u8, i32)> {
@@ -1712,20 +1719,23 @@ impl Dsv4Gpu {
         if !h0.moe_active() {
             return false;
         }
+        dbg_sync(2, Some(&self.hip), self.draft.as_deref());
+        // Fold the fixed-point sums, not the floats: float(S0) + float(S1) depends on how
+        // the experts were split between the cards, S0 + S1 in integers does not (P21).
         if h1.moe_join_compute().is_err() {
             return false;
         }
-        let (Ok(src), Ok(n)) = (h1.moe_acc_device(), h1.moe_floats()) else {
+        let (Ok(src), Ok(n)) = (h1.moe_acci_device(), h1.moe_floats()) else {
             return false;
         };
-        let (Ok(staging), Ok(acc)) = (h0.moe_staging_device(), h0.moe_acc_device()) else {
+        let Ok(staging) = h0.moe_acci_stage_device() else {
             return false;
         };
         if n == 0 || n > i32::MAX as usize {
             h1.moe_release();
             return true;
         }
-        let bytes = n.saturating_mul(4);
+        let bytes = n.saturating_mul(8);
         let pin = self.pin0.as_ref();
         let bounce = pin.filter(|p| !p.window && !p.a.is_null() && p.bytes > 0);
         if let Some(pin) = bounce {
@@ -1768,9 +1778,10 @@ impl Dsv4Gpu {
                 return false;
             }
         }
-        if h0.residual_add(acc, staging.cast(), n as i32).is_err() {
+        if h0.moe_acci_add_staged().is_err() {
             return false;
         }
+        dbg_sync(2, Some(&self.hip), self.draft.as_deref());
         h1.moe_release();
         true
     }
@@ -1787,24 +1798,22 @@ impl Dsv4Gpu {
                 ))
             })?;
             d.bind()?;
-            self.h2d1
-                .as_ref()
-                .ok_or_else(|| {
-                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                        "GPU1 H2D stream missing".into(),
-                    ))
-                })?
-                .wait_ready_compute(idx)
+            let h2d1 = self.h2d1.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "GPU1 H2D stream missing".into(),
+                ))
+            })?;
+            h2d1.wait_ready_compute(idx)?;
+            h2d1.wait_ready_on(idx, &d.swiglu_streams())
         } else {
             self.hip.bind()?;
-            self.h2d
-                .as_ref()
-                .ok_or_else(|| {
-                    AllpacaError::Degraded(DegradedError::FeatureDisabled(
-                        "GPU0 H2D stream missing".into(),
-                    ))
-                })?
-                .wait_ready_compute(idx)
+            let h2d = self.h2d.as_ref().ok_or_else(|| {
+                AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                    "GPU0 H2D stream missing".into(),
+                ))
+            })?;
+            h2d.wait_ready_compute(idx)?;
+            h2d.wait_ready_on(idx, &self.hip.swiglu_streams())
         }
     }
 
@@ -2916,6 +2925,16 @@ impl Dsv4Gpu {
                     "HC act buffer missing".into(),
                 ))
             })
+    }
+
+    /// Forget the device `curs` buffer (P21). `device_a_if_curs` matches a host input by
+    /// address and length only, so once the host `curs` vector is freed a new vector at the
+    /// same address would be mistaken for it and the GEMM would read stale device data.
+    pub fn invalidate_hc_curs(&mut self) {
+        self.hc_curs = 0;
+        self.hc_curs_n = 0;
+        self.hc_curs_host = 0;
+        self.hc_curs_synced = false;
     }
 
     pub fn invalidate_hc_device(&mut self) {
@@ -4480,6 +4499,35 @@ pub fn apply_keep_set(model: &TinyModel, ids: &[ExpertId]) -> Result<(), Allpaca
         gpu.warmup_experts(file.as_ref(), layer, &experts, &model.config, None)?;
     }
     Ok(())
+}
+
+/// P21 debug: `ALLPACA_DSV4_SYNC` is a bit mask of points where the DSV4 path
+/// waits for every stream on both cards (1 after each copy plan, 2 around the
+/// GPU1 -> GPU0 fold, 4 before each expert job pair, 8 after the H2D join,
+/// 16 before each copy plan runs, 32 before a hint prefetch is planned).
+/// Off (0) by default.
+pub(crate) fn dbg_sync(
+    bit: u32,
+    a: Option<&allpaca_hip::HipWorkspace>,
+    b: Option<&allpaca_hip::HipWorkspace>,
+) {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let bits = *BITS.get_or_init(|| {
+        std::env::var("ALLPACA_DSV4_SYNC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    if bits & bit == 0 {
+        return;
+    }
+    for w in [a, b].into_iter().flatten() {
+        let _ = w.bind();
+        let _ = allpaca_hip::device_synchronize();
+    }
+    if let Some(w) = a {
+        let _ = w.bind();
+    }
 }
 
 fn add_ns(metrics: Option<&Metrics>, field: impl Fn(&Metrics) -> &AtomicU64, t: Instant) {
