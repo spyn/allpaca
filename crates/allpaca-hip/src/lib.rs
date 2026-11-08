@@ -248,8 +248,11 @@ fn event_record_on(
 }
 
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+#[track_caller]
 fn event_synchronize(ev: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
-    let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+    let rc = sync_trace::timed("event_sync", || unsafe {
+        ffi::allpaca_hip_event_synchronize(ev)
+    });
     status(rc, "event_synchronize")
 }
 
@@ -2196,6 +2199,7 @@ pub fn host_unregister(ptr: *mut u8) {
     }
 }
 
+#[track_caller]
 pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(), AllpacaError> {
     memcpy_on(dst, src, bytes, kind, std::ptr::null_mut())
 }
@@ -2237,6 +2241,7 @@ fn debug_log_small_h2d(bytes: usize, kind: i32, stream: *mut std::ffi::c_void) {
 }
 
 /// Same as [`memcpy`], queued on `stream` (null is the default stream).
+#[track_caller]
 pub fn memcpy_on(
     dst: *mut u8,
     src: *const u8,
@@ -2247,7 +2252,14 @@ pub fn memcpy_on(
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
         debug_log_small_h2d(bytes, kind, stream);
-        let rc = unsafe { ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream) };
+        let label = match kind {
+            MEMCPY_D2H => "memcpy_d2h",
+            MEMCPY_H2D => "memcpy_h2d",
+            _ => "memcpy_other",
+        };
+        let rc = sync_trace::timed(label, || unsafe {
+            ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream)
+        });
         status(rc, "memcpy")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2371,12 +2383,95 @@ pub fn has_memcpy_batch() -> bool {
     }
 }
 
+/// P22: `ALLPACA_SYNC_TRACE=1` records, per (call kind, Rust call site), how often
+/// the host blocked on the GPU (stream/event/device sync and blocking copies) and
+/// for how long, and prints the cumulative table to stderr every 5 s while it
+/// changes. Off by default; the off cost is one relaxed load per call.
+pub mod sync_trace {
+    use std::collections::HashMap;
+    use std::panic::Location;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    type Table = Mutex<HashMap<(&'static str, &'static Location<'static>), (u64, u64)>>;
+    static TABLE: OnceLock<Table> = OnceLock::new();
+
+    fn on() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = std::env::var("ALLPACA_SYNC_TRACE").is_ok_and(|v| v == "1");
+                STATE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+                if v {
+                    std::thread::spawn(|| {
+                        let mut last = 0u64;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            dump(&mut last);
+                        }
+                    });
+                }
+                v
+            }
+        }
+    }
+
+    #[track_caller]
+    pub fn timed<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+        if !on() {
+            return f();
+        }
+        let loc = Location::caller();
+        let t = Instant::now();
+        let r = f();
+        let ns = t.elapsed().as_nanos() as u64;
+        let tab = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut m) = tab.lock() {
+            let e = m.entry((label, loc)).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        }
+        r
+    }
+
+    fn dump(last_total: &mut u64) {
+        let Some(tab) = TABLE.get() else { return };
+        let Ok(m) = tab.lock() else { return };
+        let total: u64 = m.values().map(|v| v.0).sum();
+        if total == *last_total {
+            return;
+        }
+        *last_total = total;
+        let mut rows: Vec<_> = m.iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+        eprintln!(
+            "SYNC_TRACE_BEGIN epoch={} total_calls={total}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        );
+        for ((label, loc), (n, ns)) in rows.iter().take(40) {
+            eprintln!(
+                "SYNC_TRACE {label} {}:{} n={n} ms={:.1}",
+                loc.file(),
+                loc.line(),
+                *ns as f64 / 1e6
+            );
+        }
+        eprintln!("SYNC_TRACE_END");
+    }
+}
+
 /// Debug (P21): wait for every stream on the current device. Used by the
 /// `ALLPACA_DSV4_SYNC` experiment only.
+#[track_caller]
 pub fn device_synchronize() -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_device_synchronize() };
+        let rc = sync_trace::timed("device_sync", || unsafe {
+            ffi::allpaca_hip_device_synchronize()
+        });
         status(rc, "device_synchronize")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2386,10 +2481,13 @@ pub fn device_synchronize() -> Result<(), AllpacaError> {
 }
 
 /// Wait for queued kernels and copies on the default stream.
+#[track_caller]
 pub fn stream_synchronize() -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(std::ptr::null_mut()) };
+        let rc = sync_trace::timed("stream_sync", || unsafe {
+            ffi::allpaca_hip_stream_synchronize(std::ptr::null_mut())
+        });
         status(rc, "stream_synchronize")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2404,10 +2502,13 @@ pub fn stream_synchronize() -> Result<(), AllpacaError> {
 ///
 /// # Safety
 /// `stream` must be null or a stream this process still owns.
+#[track_caller]
 pub unsafe fn stream_synchronize_on(stream: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(stream) };
+        let rc = sync_trace::timed("stream_sync_on", || unsafe {
+            ffi::allpaca_hip_stream_synchronize(stream)
+        });
         status(rc, "stream_synchronize_on")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2529,6 +2630,7 @@ impl H2dStream {
     }
 
     /// Block the host until every queued copy on this stream has landed.
+    #[track_caller]
     pub fn synchronize(&self) -> Result<(), AllpacaError> {
         unsafe { stream_synchronize_on(self.stream) }
     }
@@ -2555,6 +2657,7 @@ impl H2dStream {
     }
 
     /// Host-wait until bounce-buffer `slot` is safe to overwrite.
+    #[track_caller]
     pub fn synchronize_slot(&self, slot: usize) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -2563,7 +2666,9 @@ impl H2dStream {
                     "H2D bounce slot out of range".into(),
                 ))
             })?;
-            let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+            let rc = sync_trace::timed("h2d_slot_sync", || unsafe {
+                ffi::allpaca_hip_event_synchronize(ev)
+            });
             status(rc, "h2d_slot_sync")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2597,6 +2702,7 @@ impl H2dStream {
     }
 
     /// Host-wait until ready-ring `idx` can be recorded again.
+    #[track_caller]
     pub fn synchronize_ready(&self, idx: usize) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -2605,7 +2711,9 @@ impl H2dStream {
                     "H2D ready ring out of range".into(),
                 ))
             })?;
-            let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+            let rc = sync_trace::timed("h2d_ready_sync", || unsafe {
+                ffi::allpaca_hip_event_synchronize(ev)
+            });
             status(rc, "h2d_ready_sync")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -8197,6 +8305,7 @@ impl HipWorkspace {
     }
 
     /// Packed BF16 `b` on device; `a` is already a device `[m,k]` pointer (no A H2D).
+    #[track_caller]
     pub fn gemm_nt_bf16_from_device_a(
         &self,
         a: *const f32,
@@ -8353,6 +8462,7 @@ impl HipWorkspace {
         }
     }
 
+    #[track_caller]
     fn join_default_event(&self) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -8530,6 +8640,7 @@ impl HipWorkspace {
     /// Gather `row_idx` from device `xs` (see [`Self::moe_begin`]) and SwiGLU on `slot`.
     /// `row_idx` / `row_w` stay on the slot until [`Self::mxfp4_swiglu_accumulate_slot`].
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn mxfp4_swiglu_enqueue_from_rows(
         &self,
         slot: usize,
@@ -8846,6 +8957,7 @@ impl HipWorkspace {
     }
 
     /// `acc += add` after H2D into `moe_x` (callers must no longer need `xs`).
+    #[track_caller]
     pub fn moe_add_from_host(&self, add: &[f32]) -> Result<(), AllpacaError> {
         let (x, acc, n) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
@@ -8874,6 +8986,7 @@ impl HipWorkspace {
 
     /// Add `n_tok * dim` fixed-point sums computed on the host (the CPU experts) into the
     /// stage's integer sum, so they are finalized together with the cards' (exact, order free).
+    #[track_caller]
     pub fn moe_acci_add_from_host(&self, add: &[i64]) -> Result<(), AllpacaError> {
         let (stage, n) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
@@ -8909,6 +9022,7 @@ impl HipWorkspace {
     /// Join expert SwiGLU streams without downloading `moe_acc`. Called after every batch
     /// of experts, so it must NOT finalize: how the experts split into batches depends on
     /// when their weights arrive, and each finalize is one float add into `moe_acc`.
+    #[track_caller]
     pub fn moe_join_compute(&self) -> Result<(), AllpacaError> {
         self.bind()?;
         self.join_swiglu_streams()?;
@@ -8917,6 +9031,7 @@ impl HipWorkspace {
 
     /// Join, then add the fixed-point expert sums into `moe_acc` exactly once. Call this
     /// only when every expert of the layer on this card has been enqueued.
+    #[track_caller]
     pub fn moe_join_finalize(&self) -> Result<(), AllpacaError> {
         self.bind()?;
         self.join_swiglu_streams()?;
@@ -9193,6 +9308,7 @@ impl HipWorkspace {
         Ok(s.acc.cast())
     }
 
+    #[track_caller]
     fn join_swiglu_streams(&self) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -10636,6 +10752,7 @@ impl HipWorkspace {
         }
     }
 
+    #[track_caller]
     pub fn copy_d2h_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
         if dst.is_empty() {
             return Ok(());
@@ -10652,6 +10769,7 @@ impl HipWorkspace {
         Ok(())
     }
 
+    #[track_caller]
     pub fn copy_h2d_f32(&self, dst: *mut f32, src: &[f32]) -> Result<(), AllpacaError> {
         if src.is_empty() {
             return Ok(());
