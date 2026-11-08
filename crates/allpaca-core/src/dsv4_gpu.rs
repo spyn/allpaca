@@ -3284,8 +3284,17 @@ impl Dsv4Gpu {
                 dxs_scratch
             }
         };
-        hip.copy_h2d_f32(dpost, &posts[..post_n])?;
-        hip.copy_h2d_f32(dcomb, &combs[..comb_n])?;
+        if hc_coalesce_enabled() {
+            // P22: `dpost` and `dcomb` are adjacent in the aux block, so one blocking copy
+            // moves both. Same bytes, one wait for the queued GPU work instead of two.
+            let mut both = Vec::with_capacity(post_n + comb_n);
+            both.extend_from_slice(&posts[..post_n]);
+            both.extend_from_slice(&combs[..comb_n]);
+            hip.copy_h2d_f32(dpost, &both)?;
+        } else {
+            hip.copy_h2d_f32(dpost, &posts[..post_n])?;
+            hip.copy_h2d_f32(dcomb, &combs[..comb_n])?;
+        }
         hip.hc_post_device(
             dxs,
             src,
@@ -3324,6 +3333,12 @@ impl Dsv4Gpu {
         self.used.store(true, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// P22: `ALLPACA_DSV4_HC_COALESCE=1` sends `hc_post_packed`'s posts and combs in one copy.
+fn hc_coalesce_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ALLPACA_DSV4_HC_COALESCE").is_ok_and(|v| v == "1"))
 }
 
 impl Drop for Dsv4Gpu {
