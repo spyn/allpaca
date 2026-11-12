@@ -8671,6 +8671,8 @@ fn hip_new_gguf_types_match_cpu_greedy() {
         (T::IQ2_XS, allpaca_cpu::IQ2_XS_BLOCK_BYTES, 256),
         (T::IQ2_S, allpaca_cpu::IQ2_S_BLOCK_BYTES, 256),
         (T::IQ3_XXS, allpaca_cpu::IQ3_XXS_BLOCK_BYTES, 256),
+        (T::IQ3_S, allpaca_cpu::IQ3_S_BLOCK_BYTES, 256),
+        (T::IQ4_XS, allpaca_cpu::IQ4_XS_BLOCK_BYTES, 256),
         (T::IQ1_S, allpaca_cpu::IQ1_S_BLOCK_BYTES, 256),
         (T::IQ1_M, allpaca_cpu::IQ1_M_BLOCK_BYTES, 256),
         (T::RocmFpxQ6, allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES, 32),
