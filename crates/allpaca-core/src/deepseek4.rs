@@ -4004,15 +4004,13 @@ fn dsv4_apply_moe_rows(
             let _ = h0.moe_join_compute();
         }
     }
-    let mut gpu1_host: Option<Vec<f32>> = None;
-    if !gpu.as_ref().is_some_and(|g| g.fold_gpu1_moe_into_gpu0()) {
-        if let Some(h1) = hip1.as_ref() {
-            if h1.moe_active() {
-                let mut tmp = vec![0.0f32; n_tok.saturating_mul(dim)];
-                if h1.moe_finish(&mut tmp).is_ok() {
-                    gpu1_host = Some(tmp);
-                }
-            }
+    // A float fallback here would make the sum depend on where the experts ran (P21), so a
+    // failed fold is an error, not a quiet downgrade.
+    if let Some(g) = gpu.as_ref() {
+        if !g.fold_gpu1_moe_into_gpu0() {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+                "DSV4 GPU1 -> GPU0 fixed-point fold failed".into(),
+            )));
         }
     }
     if let Some(h0) = hip0.as_ref() {
@@ -4020,9 +4018,8 @@ fn dsv4_apply_moe_rows(
             // The CPU experts join the same fixed-point sum before the single finalize, so
             // the result does not depend on which experts ran on the CPU.
             if let Some(sum) = cpu_sum.as_ref() {
-                if h0.moe_acci_add_from_host(sum).is_ok() {
-                    cpu_sum = None;
-                }
+                h0.moe_acci_add_from_host(sum)?;
+                cpu_sum = None;
             }
             let _ = h0.moe_join_finalize();
             debug_moe_acc("moe_acc0_final", layer_idx, h0, n_tok, dim);
@@ -4036,14 +4033,7 @@ fn dsv4_apply_moe_rows(
         if let Some(h0) = hip0.as_ref() {
             if h0.moe_active() {
                 let mut folded = true;
-                if let Some(tmp) = gpu1_host.as_ref() {
-                    if h0.moe_add_from_host(tmp).is_ok() {
-                        gpu1_host = None;
-                    } else {
-                        folded = false;
-                    }
-                }
-                if folded && cpu_sum.is_some() {
+                if cpu_sum.is_some() {
                     folded = false;
                 }
                 if folded && !shexp_dev {
@@ -4074,9 +4064,6 @@ fn dsv4_apply_moe_rows(
     }
     if !device_hc {
         add_moe_acc(hip0.as_ref(), &mut routed, n_tok, dim);
-        if let Some(tmp) = gpu1_host.as_ref() {
-            add_acc_slice(&mut routed, tmp);
-        }
         if let Some(sum) = cpu_sum.as_ref() {
             add_fixed_slice(&mut routed, sum);
         }
@@ -4188,10 +4175,8 @@ fn dsv4_lm_head(
     }
     let mut used_gpu_head = false;
     let mut gpu = gpu;
-    if std::env::var("ALLPACA_DSV4_NO_CURS_FIX").is_err() {
-        if let Some(g) = gpu.as_deref_mut() {
-            g.invalidate_hc_curs();
-        }
+    if let Some(g) = gpu.as_deref_mut() {
+        g.invalidate_hc_curs();
     }
     if let (Some(g), Some(f)) = (gpu.as_mut(), file) {
         if g.gemv_bf16(
