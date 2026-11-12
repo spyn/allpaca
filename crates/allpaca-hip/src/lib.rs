@@ -2404,8 +2404,11 @@ pub mod sync_trace {
             2 => true,
             _ => {
                 let v = std::env::var("ALLPACA_SYNC_TRACE").is_ok_and(|v| v == "1");
-                STATE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-                if v {
+                // Only the thread that wins the swap starts the dumper.
+                let won = STATE
+                    .compare_exchange(0, if v { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok();
+                if v && won {
                     std::thread::spawn(|| {
                         let mut last = 0u64;
                         loop {
