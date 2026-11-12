@@ -13828,8 +13828,7 @@ mod lightning_moe_tests {
         }
     }
 
-    /// A low-bit type must never grow to F32 on the device (IQ3_S did: a
-    /// 61 GB expansion on Flint UD-Q3_K_XL).
+    /// Low-bit GEMM weights must stage as Q8_0, never as 4-byte floats.
     #[test]
     fn staged_device_bytes_never_expands_low_bit_types_to_f32() {
         use allpaca_gguf::GgmlType as T;
