@@ -322,10 +322,10 @@ fn sqrt_softplus(x: f32) -> f32 {
 
 fn sigmoid(v: f32) -> f32 {
     if v >= 0.0 {
-        let z = (-v).exp();
+        let z = allpaca_cpu::det_expf(-v);
         1.0 / (1.0 + z)
     } else {
-        let z = v.exp();
+        let z = allpaca_cpu::det_expf(v);
         z / (1.0 + z)
     }
 }
@@ -1157,7 +1157,7 @@ fn sinkhorn(comb: &mut [f32], hc: usize, iters: u32, eps: f32) {
         }
         let mut sum = 0.0f32;
         for dst in 0..hc {
-            let e = (comb[dst + src * hc] - max).exp();
+            let e = allpaca_cpu::det_expf(comb[dst + src * hc] - max);
             comb[dst + src * hc] = e;
             sum += e;
         }
@@ -1294,9 +1294,9 @@ fn attention_sinks(
                     max = s;
                 }
             }
-            let mut acc = (sink - max).exp();
+            let mut acc = allpaca_cpu::det_expf(sink - max);
             for s in &mut scores[..t_end] {
-                *s = (*s - max).exp();
+                *s = allpaca_cpu::det_expf(*s - max);
                 acc += *s;
             }
             let inv = 1.0 / acc.max(1e-9);
@@ -1918,7 +1918,7 @@ fn dsv4_expert_rows(
 /// `limit` before SiLU and the up projection clamped to plus or minus it.
 fn capped_swiglu(gate: f32, up: f32, limit: f32) -> f32 {
     let g = gate.min(limit);
-    g / (1.0 + (-g).exp()) * up.clamp(-limit, limit)
+    g / (1.0 + allpaca_cpu::det_expf(-g)) * up.clamp(-limit, limit)
 }
 
 struct Dsv4FfnPrep {
@@ -2371,6 +2371,7 @@ fn dsv4_mla_kv_rows(
         n_tok,
         Some(metrics),
     )?;
+    debug_stage("kv_gemm", blk, &kv);
     if !mla.kv_norm.is_empty() {
         for t in 0..n_tok {
             let row = &kv[t * head_dim..(t + 1) * head_dim];
@@ -2379,6 +2380,7 @@ fn dsv4_mla_kv_rows(
             kv[t * head_dim..(t + 1) * head_dim].copy_from_slice(&n);
         }
     }
+    debug_stage("kv_norm", blk, &kv);
     Ok(kv)
 }
 
@@ -2672,12 +2674,17 @@ fn dsv4_attn_and_route_rows(
             let pos = start_pos + t;
             let kv_row = &mut kv_lat[t * head_dim..(t + 1) * head_dim];
             dsv4_rope(cfg, spec, ratio, kv_row, pos, false)?;
+            debug_stage("kv_rope", layer_idx, kv_row);
             crate::dsv4_attn::fp8_quantize(kv_row, spec.rope_offset);
             let page_index = pos / page_tokens as usize;
             let slot = (pos % page_tokens as usize) as u32;
             let page_id = page_ids[layer_idx][page_index];
             kv.write_slot(page_id, slot, n_kv_heads, head_dim, kv_row, kv_row)?;
             kv.touch(page_id, 1.0);
+        }
+        debug_stage("kv_lat", layer_idx, &kv_lat);
+        if let (Some(p), Some(g)) = (dq, gpu.as_deref()) {
+            debug_stage_dev("q_dev", layer_idx, g, p, n_tok.saturating_mul(q_out));
         }
         let memory_keys = if masked {
             if let Some(g) = gpu.as_deref_mut() {
@@ -2719,6 +2726,7 @@ fn dsv4_attn_and_route_rows(
             )?,
         };
         let n_kv = k_all.len() / kv_dim.max(1);
+        debug_stage("k_all", layer_idx, &k_all);
         let mut attn_raws = Vec::new();
         let t_attn = Instant::now();
         let dattn = match (dq, gpu.as_deref_mut()) {
@@ -2742,6 +2750,9 @@ fn dsv4_attn_and_route_rows(
                 .ok(),
             _ => None,
         };
+        if let (Some(p), Some(g)) = (dattn, gpu.as_deref()) {
+            debug_stage_dev("attn_dev", layer_idx, g, p, n_tok.saturating_mul(q_out));
+        }
         if let (true, Some(keys)) = (host_attn, &memory_keys) {
             attn_raws = dsv4_memory_attention(
                 model, dsv4, layer_idx, ratio, keys, &q, start_pos, n_tok, seq, &mut gpu, hip,
@@ -2822,6 +2833,9 @@ fn dsv4_attn_and_route_rows(
     let t_hc = Instant::now();
     debug_stage("attn_out", layer_idx, &attn_outs);
     let xs_dev = gpu.as_ref().and_then(|g| g.last_o_device());
+    if let (Some(p), Some(g)) = (xs_dev, gpu.as_deref()) {
+        debug_stage_dev("o_dev", layer_idx, g, p, n_tok.saturating_mul(dim));
+    }
     let _ = hc_post_batch(
         &attn_outs,
         states,
@@ -4471,6 +4485,23 @@ fn debug_moe_acc(
         if h.copy_d2h_f32(p as *const f32, &mut v).is_ok() {
             debug_stage(tag, layer_idx, &v);
         }
+    }
+}
+
+/// [`debug_stage`] for a device buffer of `n` floats (downloaded first).
+fn debug_stage_dev(
+    tag: &str,
+    layer_idx: usize,
+    g: &crate::dsv4_gpu::Dsv4Gpu,
+    p: *const f32,
+    n: usize,
+) {
+    if !debug_stage_on(layer_idx) {
+        return;
+    }
+    let mut v = vec![0.0f32; n];
+    if g.copy_d2h_f32(p, &mut v).is_ok() {
+        debug_stage(tag, layer_idx, &v);
     }
 }
 

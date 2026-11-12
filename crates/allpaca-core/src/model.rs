@@ -2833,14 +2833,16 @@ pub(crate) fn measure_qstar_fixed_costs(expert_bytes: usize) -> (f64, f64) {
 const EXPERT_WEIGHT_NORM_EPS: f32 = 6.103515625e-5;
 
 fn sqrt_softplus_moe(x: f32) -> f32 {
+    // `det_expf` / `det_logf` instead of the platform libm, so the router picks the same
+    // experts on every OS (P21).
     let sp = if x > 20.0 {
         x
     } else if x < -20.0 {
-        x.exp()
+        allpaca_cpu::det_expf(x)
     } else if x > 0.0 {
-        x + (-x).exp().ln_1p()
+        x + allpaca_cpu::det_logf(1.0 + allpaca_cpu::det_expf(-x))
     } else {
-        x.exp().ln_1p()
+        allpaca_cpu::det_logf(1.0 + allpaca_cpu::det_expf(x))
     };
     sp.max(0.0).sqrt()
 }
