@@ -288,6 +288,11 @@ mod tests {
     }
 
     #[test]
+    fn iq4_xs_matches_llama_cpp_golden() {
+        assert_matches_llama("iq4_xs", crate::dequant_iq4_xs);
+    }
+
+    #[test]
     fn partial_blocks_and_short_buffers_are_refused() {
         let blocks = vec![0u8; IQ2_XXS_BLOCK_BYTES];
         let mut out = vec![0.0f32; IQ_BLOCK_ELEMS];

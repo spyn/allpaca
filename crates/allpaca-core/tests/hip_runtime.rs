@@ -8592,7 +8592,7 @@ fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlTyp
                         block[49 + 2 * k] = (block[49 + 2 * k] & 0x0f) | (nibble << 4);
                     }
                 }
-                T::IQ2_XXS | T::IQ2_XS | T::IQ2_S | T::IQ3_XXS | T::IQ1_S => {
+                T::IQ2_XXS | T::IQ2_XS | T::IQ2_S | T::IQ3_XXS | T::IQ3_S | T::IQ4_XS | T::IQ1_S => {
                     block[..2].copy_from_slice(&0x2000u16.to_le_bytes());
                 }
                 // UE4M3 scale bytes 0x20..0x27: (8 + m) * 2^-7.
@@ -8671,6 +8671,8 @@ fn hip_new_gguf_types_match_cpu_greedy() {
         (T::IQ2_XS, allpaca_cpu::IQ2_XS_BLOCK_BYTES, 256),
         (T::IQ2_S, allpaca_cpu::IQ2_S_BLOCK_BYTES, 256),
         (T::IQ3_XXS, allpaca_cpu::IQ3_XXS_BLOCK_BYTES, 256),
+        (T::IQ3_S, allpaca_cpu::IQ3_S_BLOCK_BYTES, 256),
+        (T::IQ4_XS, allpaca_cpu::IQ4_XS_BLOCK_BYTES, 256),
         (T::IQ1_S, allpaca_cpu::IQ1_S_BLOCK_BYTES, 256),
         (T::IQ1_M, allpaca_cpu::IQ1_M_BLOCK_BYTES, 256),
         (T::RocmFpxQ6, allpaca_cpu::ROCMFPX_Q6_BLOCK_BYTES, 32),
