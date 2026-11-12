@@ -4019,6 +4019,12 @@ struct KqBlock<18> {
     static constexpr int bytes = 98;
 };
 
+/* GGUF IQ2_S (type 22): f16 d, 32 grid-index bytes, 32 sign bytes, 8 high-bit bytes, 8 scale bytes. */
+template <>
+struct KqBlock<22> {
+    static constexpr int bytes = 82;
+};
+
 /* Four IQ4_XS nibbles (one per byte of `n`) to their int8 levels. */
 __device__ inline uint32_t kq_iq4nl_word(uint32_t n) {
     uint32_t v = 0;
@@ -4440,6 +4446,45 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                             dot = i8dot4(ap[j], q[j], dot);
                         }
                         acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 22) {
+                // weight = d * (0.5 + s) * 0.25 * (+-magnitude): per 32 weights
+                // two 4-bit scales (weights 0..15 and 16..31), 4 grid points of
+                // 8 magnitudes (8 index bits in qs, two more in qh) and a sign
+                // byte per 8 weights. Two dots and two fmas per row, low half
+                // first. Blocks are 2-byte aligned. Lane sl takes every
+                // LPC-th sub-block.
+                const float d = allpaca_f16le_to_f32(blk);
+                for (int t = sl; t < 8; t += LPC) {
+                    const uint32_t sc = blk[74 + t];
+                    const float w0 = d * (0.5f + static_cast<float>(sc & 0xfu)) * 0.25f;
+                    const float w1 = d * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
+                    const uint32_t qh = blk[66 + t];
+                    const uint32_t idx = kq_u32_from_u16(blk + 2 + t * 4);
+                    const uint32_t sg = kq_u32_from_u16(blk + 34 + t * 4);
+                    uint32_t q[8];
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        const uint64_t mag =
+                            k_iq2s_grid[((idx >> (8 * l)) & 0xffu) | ((qh << (8 - 2 * l)) & 0x300u)];
+                        const uint32_t s8 = (sg >> (8 * l)) & 0xffu;
+                        q[2 * l] = kq_negate_bytes(static_cast<uint32_t>(mag), s8 & 0xfu);
+                        q[2 * l + 1] = kq_negate_bytes(static_cast<uint32_t>(mag >> 32), s8 >> 4);
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const uint32_t *ap = reinterpret_cast<const uint32_t *>(arow[r] + bi * 32);
+                        int32_t lo = 0, hi = 0;
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            lo = i8dot4(ap[j], q[j], lo);
+                            hi = i8dot4(ap[j + 4], q[j + 4], hi);
+                        }
+                        const float ds = drow[r][bi];
+                        acc[r] = fmaf(w0 * ds, static_cast<float>(lo), acc[r]);
+                        acc[r] = fmaf(w1 * ds, static_cast<float>(hi), acc[r]);
                     }
                 }
             } else if constexpr (QT == 3) {
@@ -5352,6 +5397,22 @@ static int launch_gemm_nt_iq3_xxs(const float *a, const uint8_t *b, float *c, in
 extern "C" int allpaca_gemm_nt_iq3_xxs(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                                   int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_iq3_xxs(a, b, c, m, n, k, as_stream(stream));
+}
+
+/* IQ2_S has only the int8 kernel (its 82-byte blocks are 2-byte aligned). */
+static int launch_gemm_nt_iq2_s(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || !a || !b || !c ||
+        reinterpret_cast<uintptr_t>(b) % 2 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    return launch_kquant_i8<22>(a, b, c, m, n, k, stream);
+}
+
+extern "C" int allpaca_gemm_nt_iq2_s(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_iq2_s(a, b, c, m, n, k, as_stream(stream));
 }
 
 /* Lanes per column the int8 K-quant GEMV launches for type `qt` (3..6) and `n`
@@ -12439,6 +12500,7 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
     MOE_GU(23, 23)
     MOE_GU(21, 21)
     MOE_GU(18, 18)
+    MOE_GU(22, 22)
 #undef MOE_GU
     return false;
 }
@@ -12453,7 +12515,7 @@ static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
-    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48) MOE_D(23) MOE_D(21) MOE_D(18)
+    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48) MOE_D(23) MOE_D(21) MOE_D(18) MOE_D(22)
 #undef MOE_D
     return false;
 }
@@ -12492,7 +12554,7 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
         return ALLPACA_ERR_INVALID;
     }
     auto kq = [](int32_t qt) {
-        return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48 || qt == 23 || qt == 21 || qt == 18;
+        return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48 || qt == 23 || qt == 21 || qt == 18 || qt == 22;
     };
     if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
         return ALLPACA_ERR_INVALID;
@@ -12843,6 +12905,11 @@ extern "C" int allpaca_gemm_nt_iq3_s(const float *, const uint8_t *, float *, in
 }
 
 extern "C" int allpaca_gemm_nt_iq3_xxs(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                  int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_iq2_s(const float *, const uint8_t *, float *, int32_t, int32_t,
                                   int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
