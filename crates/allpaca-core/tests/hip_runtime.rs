@@ -2471,6 +2471,25 @@ fn iq4_xs_blocks_from_noise(noise: &[f32]) -> Vec<u8> {
     out
 }
 
+/// IQ3_S blocks from seeded noise: every bit pattern, `d` near 1e-3.
+#[cfg(feature = "hip")]
+fn iq3_s_blocks_from_noise(noise: &[f32]) -> Vec<u8> {
+    assert_eq!(noise.len() % allpaca_cpu::IQ3_S_BLOCK_ELEMS, 0);
+    let mut x = noise.first().map_or(1, |v| v.to_bits()) | 1;
+    let mut out = vec![0u8; noise.len() / allpaca_cpu::IQ3_S_BLOCK_ELEMS * allpaca_cpu::IQ3_S_BLOCK_BYTES];
+    for v in out.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *v = x as u8;
+    }
+    for blk in out.chunks_mut(allpaca_cpu::IQ3_S_BLOCK_BYTES) {
+        let d = 1e-3 + f32::from(blk[8]) * 1e-6;
+        blk[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+    }
+    out
+}
+
 /// Tiny Mixtral-style MoE whose routed experts are `ggml_type` blocks made
 /// by `quantize` from seeded noise; everything else F32.
 #[cfg(feature = "hip")]
@@ -2603,6 +2622,41 @@ fn hip_iq4xs_experts_fused_match_cpu() {
         let cpu_out = cpu.generate(prompt, greedy(6)).unwrap();
         let hip_out = hip.generate(prompt, greedy(6)).unwrap();
         eprintln!("iq4_xs moe {prompt:?}: cpu {:?} hip {:?}", cpu_out.token_ids, hip_out.token_ids);
+        assert!(!hip_out.token_ids.is_empty());
+        assert_eq!(hip_out.token_ids, cpu_out.token_ids, "prompt {prompt:?}");
+    }
+    assert!(hip.stats().gpu_forwards > 0, "must run on HIP: {:?}", hip.stats());
+    let _ = std::fs::remove_file(path);
+}
+
+/// IQ3_S routed experts (Q26) run from their native blocks through the
+/// fused expert-parallel kernels: same tokens as the CPU decode of the same
+/// blocks. 176 experts put the model past the host-F32 limit (128 MiB), so
+/// the HIP engine uploads the packed tensors; a smaller MoE is uploaded as
+/// F32 and never reaches the fused kernels.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_iq3s_experts_fused_match_cpu() {
+    let path = std::env::temp_dir().join(format!("allpaca_hip_iq3s_moe_fused-{}.gguf", std::process::id()));
+    write_tiny_quant_moe_gguf(&path, 256, 256, 176, 32, allpaca_gguf::GgmlType::IQ3_S, iq3_s_blocks_from_noise);
+    let with_model = |mut cfg: Config| {
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg
+    };
+    // The CPU reference decodes every weight to F32 whatever the size.
+    let mut cpu_cfg = with_model(cpu_only_synthetic());
+    cpu_cfg.weights.host_f32 = true;
+    let cpu = Engine::new(cpu_cfg).unwrap();
+    let hip = Engine::new(with_model(hip_auto_synthetic())).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    for prompt in ["hello", "hello hello hello hello hello hello"] {
+        let cpu_out = cpu.generate(prompt, greedy(6)).unwrap();
+        let hip_out = hip.generate(prompt, greedy(6)).unwrap();
+        eprintln!("iq3_s moe {prompt:?}: cpu {:?} hip {:?}", cpu_out.token_ids, hip_out.token_ids);
         assert!(!hip_out.token_ids.is_empty());
         assert_eq!(hip_out.token_ids, cpu_out.token_ids, "prompt {prompt:?}");
     }
@@ -8732,7 +8786,7 @@ fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlTyp
 }
 
 /// P13: every new GGUF type loads on the HIP path, runs its FFN on the GPU
-/// (IQ4_XS natively, the other IQ types as the Q8_0 re-pack, ROCmFPX 103 as
+/// (IQ4_XS, IQ3_S natively, the other IQ types as the Q8_0 re-pack, ROCmFPX 103 as
 /// lossless Q8_0, the other ROCmFPX types as lossless F16) and gives the CPU path's greedy tokens.
 #[cfg(feature = "hip")]
 #[test]

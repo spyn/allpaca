@@ -1,5 +1,4 @@
 #include "../include/allpaca_kernels.h"
-#include "iq_tables.h"
 #include <stdint.h>
 
 #if defined(_WIN32) && defined(ALLPACA_HAS_DIRECTSTORAGE)
@@ -17,6 +16,8 @@
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
+#define ALLPACA_IQ_TABLE __constant__ const
+#include "iq_tables.h"
 #include <cstdio>
 #include <cstring>
 #define ALLPACA_HAS_HIP 1
@@ -4006,6 +4007,12 @@ struct KqBlock<23> {
     static constexpr int bytes = 136;
 };
 
+/* GGUF IQ3_S (type 21): f16 d, 64 grid-index bytes, 8 ninth-bit bytes, 32 sign bytes, 4 scale bytes. */
+template <>
+struct KqBlock<21> {
+    static constexpr int bytes = 110;
+};
+
 /* Four IQ4_XS nibbles (one per byte of `n`) to their int8 levels. */
 __device__ inline uint32_t kq_iq4nl_word(uint32_t n) {
     uint32_t v = 0;
@@ -4229,6 +4236,12 @@ __device__ inline uint32_t allpaca_vsub4(uint32_t a, uint32_t b) {
     return low7 ^ flip;
 }
 
+/* Negates the bytes of `v` whose bit in the 4-bit `signs` is set. */
+__device__ inline uint32_t kq_negate_bytes(uint32_t v, uint32_t signs) {
+    const uint32_t m = ((signs * 0x00204081u) & 0x01010101u) * 0xffu;
+    return allpaca_vsub4(v ^ m, m);
+}
+
 /* One block of the int8 K-quant GEMV: columns from `bx`, rows `row0 .. +MR`. */
 template <int QT, int MR, int LPC, bool LF = ALLPACA_I8_LOADS_FIRST != 0>
 __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const uint8_t *b,
@@ -4345,6 +4358,38 @@ __device__ inline void kquant_i8_block(const int8_t *aq, const float *ad, const 
                         const uint32_t w = qp[j];
                         q[j] = kq_iq4nl_word(w & 0x0f0f0f0fu);
                         q[j + 4] = kq_iq4nl_word((w >> 4) & 0x0f0f0f0fu);
+                    }
+                    const int bi = ib * 8 + t;
+#pragma unroll
+                    for (int r = 0; r < MR; ++r) {
+                        const uint32_t *ap = reinterpret_cast<const uint32_t *>(arow[r] + bi * 32);
+                        int32_t dot = 0;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            dot = i8dot4(ap[j], q[j], dot);
+                        }
+                        acc[r] = fmaf(ws * drow[r][bi], static_cast<float>(dot), acc[r]);
+                    }
+                }
+            } else if constexpr (QT == 21) {
+                // weight = d * (1 + 2 s) * (+-magnitude): per 32 weights a 4-bit
+                // scale, 8 grid points of 4 magnitudes (8 index bits in qs, the
+                // ninth in qh) and a sign bit per weight. Blocks are 2-byte
+                // aligned. Lane sl takes every LPC-th 32-value sub-block.
+                const float d = allpaca_f16le_to_f32(blk);
+                for (int t = sl; t < 8; t += LPC) {
+                    const int sc = (static_cast<int>(blk[106 + (t >> 1)]) >> (4 * (t & 1))) & 0xf;
+                    const float ws = d * static_cast<float>(1 + 2 * sc);
+                    const uint32_t qh = blk[66 + t];
+                    const uint32_t i0 = kq_u32_from_u16(blk + 2 + t * 8);
+                    const uint32_t i1 = kq_u32_from_u16(blk + 6 + t * 8);
+                    const uint32_t sg = kq_u32_from_u16(blk + 74 + t * 4);
+                    uint32_t q[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t lo = ((j < 4 ? i0 : i1) >> (8 * (j & 3))) & 0xffu;
+                        const uint32_t mag = k_iq3s_grid[lo | ((qh << (8 - j)) & 256u)];
+                        q[j] = kq_negate_bytes(mag, (sg >> (4 * j)) & 0xfu);
                     }
                     const int bi = ib * 8 + t;
 #pragma unroll
@@ -5236,6 +5281,22 @@ static int launch_gemm_nt_iq4_xs(const float *a, const uint8_t *b, float *c, int
 extern "C" int allpaca_gemm_nt_iq4_xs(const float *a, const uint8_t *b, float *c, int32_t m,
                                       int32_t n, int32_t k, allpaca_stream_t stream) {
     return launch_gemm_nt_iq4_xs(a, b, c, m, n, k, as_stream(stream));
+}
+
+/* IQ3_S has only the int8 kernel (its 110-byte blocks are 2-byte aligned). */
+static int launch_gemm_nt_iq3_s(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                             int32_t k, hipStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || !a || !b || !c ||
+        reinterpret_cast<uintptr_t>(b) % 2 != 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    return launch_kquant_i8<21>(a, b, c, m, n, k, stream);
+}
+
+extern "C" int allpaca_gemm_nt_iq3_s(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                                  int32_t k, allpaca_stream_t stream) {
+    return launch_gemm_nt_iq3_s(a, b, c, m, n, k, as_stream(stream));
 }
 
 /* Lanes per column the int8 K-quant GEMV launches for type `qt` (3..6) and `n`
@@ -12321,6 +12382,7 @@ static bool moe_gate_up_types(int qg, int qu, dim3 grid, size_t lds, hipStream_t
     MOE_GU(8, 8)
     MOE_GU(48, 48)
     MOE_GU(23, 23)
+    MOE_GU(21, 21)
 #undef MOE_GU
     return false;
 }
@@ -12335,7 +12397,7 @@ static bool moe_down_types(int qd, dim3 grid, hipStream_t st, const int8_t *hq,
                            group_start, expert, down, ds, y, dim, ff);                            \
         return true;                                                                               \
     }
-    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48) MOE_D(23)
+    MOE_D(4) MOE_D(5) MOE_D(6) MOE_D(8) MOE_D(48) MOE_D(23) MOE_D(21)
 #undef MOE_D
     return false;
 }
@@ -12374,7 +12436,7 @@ extern "C" int allpaca_moe_ffn_kquant(const float *x, const int8_t *xq, const fl
         return ALLPACA_ERR_INVALID;
     }
     auto kq = [](int32_t qt) {
-        return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48 || qt == 23;
+        return qt == 4 || qt == 5 || qt == 6 || qt == 8 || qt == 48 || qt == 23 || qt == 21;
     };
     if (!kq(gate_qt) || !kq(up_qt) || !kq(down_qt)) {
         return ALLPACA_ERR_INVALID;
@@ -12716,6 +12778,11 @@ extern "C" int allpaca_gemm_nt_q3_k(const float *, const uint8_t *, float *, int
 
 extern "C" int allpaca_gemm_nt_iq4_xs(const float *, const uint8_t *, float *, int32_t, int32_t,
                                       int32_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gemm_nt_iq3_s(const float *, const uint8_t *, float *, int32_t, int32_t,
+                                  int32_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 
