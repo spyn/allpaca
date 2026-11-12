@@ -60,6 +60,11 @@ const FAMILIES: &[KernelFamily] = &[
         family: "gemm-q3_k",
     },
     KernelFamily {
+        ggml_type: 23,
+        weight: "iq4_xs",
+        family: "gemm-iq4_xs",
+    },
+    KernelFamily {
         ggml_type: 12,
         weight: "q4_k",
         family: "gemm-q4_k",

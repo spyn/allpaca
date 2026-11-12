@@ -236,6 +236,11 @@ int allpaca_gemm_nt_q6_k_untiled(const float *a, const uint8_t *b, float *c, int
 int allpaca_gemm_nt_q3_k(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);
 
+/* C[m,n] = A[m,k] * dequant(B_iq4_xs[n,k])^T. Native 136-byte IQ4_XS super-blocks,
+ * k % 256 == 0, `b` 4-byte aligned. */
+int allpaca_gemm_nt_iq4_xs(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
+                           int32_t k, allpaca_stream_t stream);
+
 /* C[m,n] = A[m,k] * dequant(B_q2_0[n,k])^T. Native 18-byte ggml Q2_0 blocks, k % 64 == 0. */
 int allpaca_gemm_nt_q2_0(const float *a, const uint8_t *b, float *c, int32_t m, int32_t n,
                          int32_t k, allpaca_stream_t stream);

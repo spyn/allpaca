@@ -44,6 +44,8 @@ pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// GGUF Q5_K super-block (f16 d + f16 dmin + 12 scales + 32 qh + 128 qs).
 pub const Q3_K_BLOCK_ELEMS: usize = 256;
 pub const Q3_K_BLOCK_BYTES: usize = 110;
+pub const IQ4_XS_BLOCK_ELEMS: usize = 256;
+pub const IQ4_XS_BLOCK_BYTES: usize = 136;
 pub const Q5_K_BLOCK_ELEMS: usize = 256;
 pub const Q5_K_BLOCK_BYTES: usize = 176;
 /// ROCmFP4 block (ggml_type_id=100): 16 packed nibble bytes + 2 UE4M3 scales.
@@ -696,6 +698,15 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn allpaca_gemm_nt_q3_k(
+            a: *const f32,
+            b: *const u8,
+            c: *mut f32,
+            m: i32,
+            n: i32,
+            k: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gemm_nt_iq4_xs(
             a: *const f32,
             b: *const u8,
             c: *mut f32,
@@ -3596,6 +3607,30 @@ pub fn gemm_nt_q3_k_device(
     }
 }
 
+/// Device-pointer NT GEMM with native GGUF IQ4_XS `b` (`C = A * dequant(B)^T`);
+/// `k` must be whole 256-value super-blocks and `b` 4-byte aligned.
+pub fn gemm_nt_iq4_xs_device(
+    a: *const f32,
+    b: *const u8,
+    c: *mut f32,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        let rc = unsafe { ffi::allpaca_gemm_nt_iq4_xs(a, b, c, m, n, k, std::ptr::null_mut()) };
+        status(rc, "gemm_nt_iq4_xs")
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_iq4_xs unavailable".into(),
+        )))
+    }
+}
+
 /// Device-pointer NT GEMM with native GGUF Q5_K `b` (`C = A * dequant(B)^T`).
 /// Grow-only pinned host buffer. hipHostMalloc memory is device-mapped, so
 /// kernels read and write it in place: small uploads skip a blocking
@@ -3955,8 +3990,8 @@ pub fn copy_f32_kernel(dst: *mut f32, src: *const f32, n: usize) -> Result<(), A
 pub struct MoeExperts {
     pub ptr: *const u8,
     /// ggml type id: 12 (Q4_K), 13 (Q5_K), 14 (Q6_K), 8 (Q8_0 in the
-    /// 36-byte staged layout, see [`stage_q8_0_blocks`]) or 200 (MoESQ
-    /// paired-4:8 FP4).
+    /// 36-byte staged layout, see [`stage_q8_0_blocks`]), 200 (MoESQ
+    /// paired-4:8 FP4) or 23 (IQ4_XS).
     pub ggml_type: u32,
     /// Bytes per expert.
     pub stride: u64,
@@ -3970,6 +4005,7 @@ impl MoeExperts {
             14 => Some(6),
             8 => Some(8),
             200 => Some(48),
+            23 => Some(23),
             _ => None,
         }
     }
@@ -3980,12 +4016,12 @@ impl MoeExperts {
     }
 
     /// The fused MoE kernels run this `[gate, up, down]` set: gate and up
-    /// share a launch, which exists for K-quant pairs, Q8_0 pairs and
-    /// paired-4:8 pairs.
+    /// share a launch, which exists for K-quant pairs, Q8_0 pairs,
+    /// paired-4:8 pairs and IQ4_XS pairs.
     pub fn fused_set_ok(set: &[Self; 3]) -> bool {
         // K-quants mix with each other; the other two only pair with themselves.
         let family = |e: &Self| match e.ggml_type {
-            8 | 200 => e.ggml_type,
+            8 | 200 | 23 => e.ggml_type,
             _ => 0,
         };
         set.iter().all(Self::fused_ok) && family(&set[0]) == family(&set[1])
@@ -5534,6 +5570,55 @@ pub fn gemm_nt_q3_k(
         let _ = (a, b, c, m, n, k);
         Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
             "HIP gemm_nt_q3_k unavailable".into(),
+        )))
+    }
+}
+
+/// Host-pointer IQ4_XS NT GEMM: copies native GGUF blocks, runs the fused kernel, copies back.
+pub fn gemm_nt_iq4_xs(
+    a: &[f32],
+    b: &[u8],
+    c: &mut [f32],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), AllpacaError> {
+    #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+    {
+        if m <= 0 || n <= 0 || k <= 0 {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid GEMM shape".into(),
+            )));
+        }
+        let a_n = (m as usize) * (k as usize);
+        let c_n = (m as usize) * (n as usize);
+        let nblocks = (k as usize).div_ceil(IQ4_XS_BLOCK_ELEMS);
+        let packed_bytes = (n as usize) * nblocks * IQ4_XS_BLOCK_BYTES;
+        if a.len() < a_n || b.len() < packed_bytes || c.len() < c_n {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "IQ4_XS GEMM buffer size mismatch".into(),
+            )));
+        }
+        let da = device_malloc(a_n * 4, 0)?;
+        let db = device_malloc(packed_bytes, 0)?;
+        let dc = device_malloc(c_n * 4, 0)?;
+        set_device(0)?;
+        let result = (|| {
+            memcpy(da, a.as_ptr().cast(), a_n * 4, MEMCPY_H2D)?;
+            memcpy(db, b.as_ptr(), packed_bytes, MEMCPY_H2D)?;
+            gemm_nt_iq4_xs_device(da.cast(), db, dc.cast(), m, n, k)?;
+            memcpy(c.as_mut_ptr().cast(), dc, c_n * 4, MEMCPY_D2H)
+        })();
+        device_free(da, a_n * 4);
+        device_free(db, packed_bytes);
+        device_free(dc, c_n * 4);
+        result
+    }
+    #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+    {
+        let _ = (a, b, c, m, n, k);
+        Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+            "HIP gemm_nt_iq4_xs unavailable".into(),
         )))
     }
 }
@@ -7660,6 +7745,18 @@ impl HipWorkspace {
         k: i32,
     ) -> Result<(), AllpacaError> {
         self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_q3_k_device(a, b, c, m, n, k))
+    }
+
+    pub fn gemm_nt_iq4_xs_dev(
+        &self,
+        a: *const f32,
+        b: *const u8,
+        c: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<(), AllpacaError> {
+        self.timed_gpu(DecodeOp::OtherGpu, || gemm_nt_iq4_xs_device(a, b, c, m, n, k))
     }
 
     pub fn gemm_nt_q2_0_dev(
@@ -15132,6 +15229,43 @@ mod tests {
             for w in w3 {
                 device_free(w, p3.len());
             }
+            // IQ4_XS, 136-byte super-blocks (Q25).
+            let p23: Vec<u8> = (0..n * k / 256 * IQ4_XS_BLOCK_BYTES)
+                .map(|i| match i % IQ4_XS_BLOCK_BYTES {
+                    0 => 0x00,
+                    1 => 0x1c,
+                    j => (i * 7 % 251 + j) as u8,
+                })
+                .collect();
+            let w23: Vec<*mut u8> = (0..copies_for(p23.len()))
+                .map(|_| {
+                    let w = device_malloc(p23.len(), dev).unwrap();
+                    memcpy(w, p23.as_ptr(), p23.len(), MEMCPY_H2D).unwrap();
+                    w
+                })
+                .collect();
+            for m in [1i32, 4, 8] {
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_iq4_xs_device(x.cast(), w23[i % w23.len()], y.cast(), m, n as i32, k as i32).unwrap();
+                    i += 1;
+                });
+                push("iq4_xs gemv", format!("n={n} k={k} m={m}"), p23.len(), us);
+            }
+            {
+                // Flint attn_q: 2048 -> 4096.
+                let (fn_, fk) = (4096usize, 2048usize);
+                let bytes = fn_ * fk / 256 * IQ4_XS_BLOCK_BYTES;
+                let mut i = 0usize;
+                let us = time_us(200, &mut || {
+                    gemm_nt_iq4_xs_device(x.cast(), w23[i % w23.len()], y.cast(), 1, fn_ as i32, fk as i32).unwrap();
+                    i += 1;
+                });
+                push("iq4_xs gemv", format!("n={fn_} k={fk} m=1"), bytes, us);
+            }
+            for w in w23 {
+                device_free(w, p23.len());
+            }
             device_free(x, 8 * k * 4);
             device_free(y, 8 * n * 4);
             // Decode attention, one query row, f32 KV (32 q heads, 8 kv heads, hd 128).
@@ -18385,6 +18519,26 @@ mod tests {
         b
     }
 
+    /// Pseudo-random IQ4_XS rows: every nibble and scale bit pattern is valid;
+    /// `d` is a small finite f16.
+    #[cfg(feature = "hip")]
+    fn fill_iq4xs_blocks(si: usize, n: usize, k: usize) -> Vec<u8> {
+        let nblocks = k / IQ4_XS_BLOCK_ELEMS;
+        let mut b = vec![0u8; n * nblocks * IQ4_XS_BLOCK_BYTES];
+        let mut x = 0x9e37_79b9u32 ^ si as u32;
+        for v in b.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *v = x as u8;
+        }
+        for blk in b.chunks_mut(IQ4_XS_BLOCK_BYTES) {
+            let d = 1e-3 + (blk[8] as f32) * 1e-5;
+            blk[0..2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        }
+        b
+    }
+
     /// ggml Q2_0 runs natively: the kernel must match CPU dequant + NT GEMM
     /// for every code, positive and negative block scales, and batch rows
     /// must equal single rows.
@@ -19340,6 +19494,74 @@ mod tests {
                 assert!(
                     gemm_close(hip[i], cpu[i]),
                     "gemm_nt_q3_k mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
+                    hip[i],
+                    cpu[i]
+                );
+            }
+        }
+    }
+
+    /// An IQ4_XS verify batch must give each row the bits it gets alone.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_iq4_xs_batch_rows_equal_single_rows() {
+        if device_count() == 0 {
+            return;
+        }
+        for (si, (m, n, k)) in [(2usize, 7usize, 512usize), (3, 9, 256), (4, 5, 768), (8, 13, 2048), (9, 7, 512), (11, 5, 768), (16, 5, 768), (12, 2048, 256)]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let (a, _, _) = fill_q5k_gemm_case(si + 7, m, n, k);
+            let b_q = fill_iq4xs_blocks(si + 7, n, k);
+            let mut batch = vec![0.0f32; m * n];
+            gemm_nt_iq4_xs(&a, &b_q, &mut batch, m as i32, n as i32, k as i32)
+                .expect("HIP gemm_nt_iq4_xs batch");
+            for r in 0..m {
+                let mut one = vec![0.0f32; n];
+                gemm_nt_iq4_xs(&a[r * k..(r + 1) * k], &b_q, &mut one, 1, n as i32, k as i32)
+                    .expect("HIP gemm_nt_iq4_xs single row");
+                for col in 0..n {
+                    assert_eq!(
+                        batch[r * n + col].to_bits(),
+                        one[col].to_bits(),
+                        "iq4_xs m={m} n={n} k={k} row {r} col {col}: batch {} vs alone {}",
+                        batch[r * n + col],
+                        one[col]
+                    );
+                }
+            }
+        }
+    }
+
+    /// IQ4_XS runs natively (Q25): the int8 GEMV must match CPU dequant x q8
+    /// activations, and batch rows must equal single rows.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn gemm_nt_iq4_xs_matches_cpu_dequant_gemm() {
+        if device_count() == 0 {
+            return;
+        }
+        let shapes = [(1, 4, 256), (1, 33, 512), (1, 7, 2048), (2, 3, 256), (3, 13, 512), (4, 9, 768), (8, 9, 256), (8, 5, 2048), (11, 5, 768)];
+        for (si, (m, n, k)) in shapes.iter().copied().enumerate() {
+            let (a, _, _) = fill_q5k_gemm_case(si, m, n, k);
+            let b_q = fill_iq4xs_blocks(si, n, k);
+            let mut b_deq = vec![0.0f32; n * k];
+            allpaca_cpu::dequant_iq4_xs(&b_q, n * k, &mut b_deq).unwrap();
+            let mut cpu = vec![0.0f32; m * n];
+            let mut hip = vec![0.0f32; m * n];
+            cpu_gemm_nt(&q8_activations(&a), &b_deq, &mut cpu, m, n, k);
+            let run = |a: &[f32], c: &mut [f32], rows: i32| {
+                gemm_nt_iq4_xs(a, &b_q, c, rows, n as i32, k as i32)
+                    .expect("HIP gemm_nt_iq4_xs must run when a device is present")
+            };
+            run(&a, &mut hip, m as i32);
+            assert_rows_match_single("iq4_xs", run, &a, &hip, m, n, k);
+            for i in 0..m * n {
+                assert!(
+                    gemm_close(hip[i], cpu[i]),
+                    "gemm_nt_iq4_xs mismatch shape {m}x{n}x{k} idx={i} hip={} cpu={}",
                     hip[i],
                     cpu[i]
                 );

@@ -2448,10 +2448,45 @@ fn write_tiny_moe_gguf(path: &std::path::Path) {
 /// and experts differ.
 #[cfg(feature = "hip")]
 fn write_tiny_p48_moe_gguf(path: &std::path::Path, dim: usize, ff: usize) {
-    use allpaca_gguf::{write_gguf_quant, GgmlType, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
+    write_tiny_quant_moe_gguf(path, dim, ff, 4, 4, allpaca_gguf::GgmlType::P48Fp4, allpaca_cpu::quantize_p48fp4);
+}
+
+/// IQ4_XS blocks from seeded noise: every nibble and sub-block scale pattern,
+/// `d` near 1e-4 so weights stay within about +-0.5.
+#[cfg(feature = "hip")]
+fn iq4_xs_blocks_from_noise(noise: &[f32]) -> Vec<u8> {
+    assert_eq!(noise.len() % allpaca_cpu::IQ4_XS_BLOCK_ELEMS, 0);
+    let mut x = noise.first().map_or(1, |v| v.to_bits()) | 1;
+    let mut out = vec![0u8; noise.len() / allpaca_cpu::IQ4_XS_BLOCK_ELEMS * allpaca_cpu::IQ4_XS_BLOCK_BYTES];
+    for v in out.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *v = x as u8;
+    }
+    for blk in out.chunks_mut(allpaca_cpu::IQ4_XS_BLOCK_BYTES) {
+        let d = 1e-4 + f32::from(blk[8]) * 1e-7;
+        blk[..2].copy_from_slice(&allpaca_cpu::f32_to_f16(d).to_le_bytes());
+    }
+    out
+}
+
+/// Tiny Mixtral-style MoE whose routed experts are `ggml_type` blocks made
+/// by `quantize` from seeded noise; everything else F32.
+#[cfg(feature = "hip")]
+fn write_tiny_quant_moe_gguf(
+    path: &std::path::Path,
+    dim: usize,
+    ff: usize,
+    n_exp: usize,
+    vocab: usize,
+    ggml_type: allpaca_gguf::GgmlType,
+    quantize: fn(&[f32]) -> Vec<u8>,
+) {
+    use allpaca_gguf::{write_gguf_quant, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
     use std::collections::HashMap;
 
-    let (vocab, n_exp) = (4usize, 4usize);
+    assert!(vocab >= 4);
     let mut meta = HashMap::new();
     meta.insert("general.architecture".into(), GgufValue::String("llama".into()));
     for (key, value) in [
@@ -2470,7 +2505,12 @@ fn write_tiny_p48_moe_gguf(path: &std::path::Path, dim: usize, ff: usize) {
     meta.insert(
         "tokenizer.ggml.tokens".into(),
         GgufValue::Array(
-            ["<unk>", "<s>", "</s>", "hello"].into_iter().map(|t| GgufValue::String(t.into())).collect(),
+            ["<unk>", "<s>", "</s>", "hello"]
+                .into_iter()
+                .map(String::from)
+                .chain((4..vocab).map(|i| format!("t{i}")))
+                .map(GgufValue::String)
+                .collect(),
         ),
     );
     meta.insert("tokenizer.ggml.bos_token_id".into(), GgufValue::Uint32(1));
@@ -2497,21 +2537,22 @@ fn write_tiny_p48_moe_gguf(path: &std::path::Path, dim: usize, ff: usize) {
         ("output_norm.weight", vec![dim as u64], vec![1.0; dim]),
         ("output.weight", vec![vocab as u64, dim as u64], noise(vocab * dim, 0.5)),
     ];
+    // GGUF dimension order: inputs first, the expert count last.
     let experts: Vec<(&str, Vec<u64>, Vec<u8>)> = vec![
         (
             "blk.0.ffn_gate_exps.weight",
-            vec![n_exp as u64, ff as u64, dim as u64],
-            allpaca_cpu::quantize_p48fp4(&noise(n_exp * ff * dim, 0.4)),
+            vec![dim as u64, ff as u64, n_exp as u64],
+            quantize(&noise(n_exp * ff * dim, 0.4)),
         ),
         (
             "blk.0.ffn_up_exps.weight",
-            vec![n_exp as u64, ff as u64, dim as u64],
-            allpaca_cpu::quantize_p48fp4(&noise(n_exp * ff * dim, 0.4)),
+            vec![dim as u64, ff as u64, n_exp as u64],
+            quantize(&noise(n_exp * ff * dim, 0.4)),
         ),
         (
             "blk.0.ffn_down_exps.weight",
-            vec![n_exp as u64, dim as u64, ff as u64],
-            allpaca_cpu::quantize_p48fp4(&noise(n_exp * dim * ff, 0.4)),
+            vec![ff as u64, dim as u64, n_exp as u64],
+            quantize(&noise(n_exp * dim * ff, 0.4)),
         ),
     ];
     let f32_views: Vec<GgufWriteTensor<'_>> = owned
@@ -2527,11 +2568,46 @@ fn write_tiny_p48_moe_gguf(path: &std::path::Path, dim: usize, ff: usize) {
         .map(|(name, dims, bytes)| GgufWriteQuantTensor {
             name: (*name).into(),
             dims: dims.clone(),
-            ggml_type: GgmlType::P48Fp4,
+            ggml_type,
             bytes,
         })
         .collect();
     write_gguf_quant(path, &meta, &f32_views, &quant_views).unwrap();
+}
+
+/// IQ4_XS routed experts (Q25) run from their native blocks through the
+/// fused expert-parallel kernels: same tokens as the CPU decode of the same
+/// blocks. 176 experts put the model past the host-F32 limit (128 MiB), so
+/// the HIP engine uploads the packed tensors; a smaller MoE is uploaded as
+/// F32 and never reaches the fused kernels.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_iq4xs_experts_fused_match_cpu() {
+    let path = std::env::temp_dir().join(format!("allpaca_hip_iq4xs_moe_fused-{}.gguf", std::process::id()));
+    write_tiny_quant_moe_gguf(&path, 256, 256, 176, 32, allpaca_gguf::GgmlType::IQ4_XS, iq4_xs_blocks_from_noise);
+    let with_model = |mut cfg: Config| {
+        cfg.model.synthetic = false;
+        cfg.model.path = Some(path.clone());
+        cfg
+    };
+    // The CPU reference decodes every weight to F32 whatever the size.
+    let mut cpu_cfg = with_model(cpu_only_synthetic());
+    cpu_cfg.weights.host_f32 = true;
+    let cpu = Engine::new(cpu_cfg).unwrap();
+    let hip = Engine::new(with_model(hip_auto_synthetic())).unwrap();
+    if hip_gpus(&hip).is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    for prompt in ["hello", "hello hello hello hello hello hello"] {
+        let cpu_out = cpu.generate(prompt, greedy(6)).unwrap();
+        let hip_out = hip.generate(prompt, greedy(6)).unwrap();
+        eprintln!("iq4_xs moe {prompt:?}: cpu {:?} hip {:?}", cpu_out.token_ids, hip_out.token_ids);
+        assert!(!hip_out.token_ids.is_empty());
+        assert_eq!(hip_out.token_ids, cpu_out.token_ids, "prompt {prompt:?}");
+    }
+    assert!(hip.stats().gpu_forwards > 0, "must run on HIP: {:?}", hip.stats());
+    let _ = std::fs::remove_file(path);
 }
 
 /// At widths in whole 256-value blocks the experts go through the fused
@@ -8656,8 +8732,8 @@ fn write_tiny_typed_llama_gguf(path: &std::path::Path, ty: allpaca_gguf::GgmlTyp
 }
 
 /// P13: every new GGUF type loads on the HIP path, runs its FFN on the GPU
-/// (IQ types as the Q8_0 re-pack, ROCmFPX 103 as lossless Q8_0, the other
-/// ROCmFPX types as lossless F16) and gives the CPU path's greedy tokens.
+/// (IQ4_XS natively, the other IQ types as the Q8_0 re-pack, ROCmFPX 103 as
+/// lossless Q8_0, the other ROCmFPX types as lossless F16) and gives the CPU path's greedy tokens.
 #[cfg(feature = "hip")]
 #[test]
 fn hip_new_gguf_types_match_cpu_greedy() {
