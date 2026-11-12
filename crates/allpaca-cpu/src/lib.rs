@@ -35,7 +35,7 @@ pub use p48fp4::{
 };
 pub use kernels::{
     det_expf, det_logf, det_powf, det_rsqrtf, det_silu_mul, det_sincosf, dot,
-    attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, bf16_to_f32,
+    attention, attention_softcap, attention_with_mask, attention_with_mask_softcap, attention_with_mask_softcap_sinks, bf16_to_f32,
     copy_async, dequant_iq4_nl, dequant_iq4_xs, dequant_mxfp4, dequant_q2_k, dequant_q3_k,
     dequant_q4_0, dequant_q4_1, dequant_q4_k, dequant_q5_0, dequant_q5_1, dequant_q5_k,
     dequant_q6_k, dequant_q8_0, dequant_q8_1, dequant_rocmfp4, dequant_rocmfp4_fast, dequant_tq1_0,
