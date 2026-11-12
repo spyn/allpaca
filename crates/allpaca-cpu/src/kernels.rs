@@ -509,7 +509,28 @@ pub fn rope_offset(
             "rope_offset n_rot must be even and fit in the head".into(),
         )));
     }
-    rope(&mut x[offset..end], pos, theta)
+    rope_det(&mut x[offset..end], pos, theta, true)
+}
+
+/// Partial RoPE with the GPU kernels' arithmetic (`rope_pair` / `det_rotate` in
+/// `kernels.cpp`): [`det_powf`] frequencies, [`det_sincosf`] and the same fused
+/// multiply-adds, so every platform's libm gives the same bits (P21, DSV4).
+fn rope_det(x: &mut [f32], pos: usize, theta: f32, forward: bool) -> Result<(), AllpacaError> {
+    if x.len() % 2 != 0 {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
+            "rope head_dim must be even".into(),
+        )));
+    }
+    let half = x.len() / 2;
+    for i in 0..half {
+        let freq = det_powf(theta, -(i as f32) / half as f32);
+        let (s, c) = det_sincosf(pos as f32 * freq);
+        let s = if forward { s } else { -s };
+        let (a, b) = (x[2 * i], x[2 * i + 1]);
+        x[2 * i] = a.mul_add(c, -(b * s));
+        x[2 * i + 1] = a.mul_add(s, b * c);
+    }
+    Ok(())
 }
 
 /// Inverse of [`rope_offset`]: same frequencies, negated sine (ggml `rope_ext_back`).
@@ -529,7 +550,7 @@ pub fn rope_offset_back(
             "rope_offset_back n_rot must be even and fit in the head".into(),
         )));
     }
-    rope_back(&mut x[offset..end], pos, theta)
+    rope_det(&mut x[offset..end], pos, theta, false)
 }
 
 fn rope_back(x: &mut [f32], pos: usize, theta: f32) -> Result<(), AllpacaError> {

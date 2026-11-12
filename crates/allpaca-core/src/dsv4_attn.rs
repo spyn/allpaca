@@ -31,7 +31,7 @@ impl RopeTable {
         let half = n_rot / 2;
         Self {
             freqs: (0..half)
-                .map(|i| 1.0 / base.powf(i as f32 / half as f32))
+                .map(|i| allpaca_cpu::det_powf(base, -(i as f32) / half as f32))
                 .collect(),
             base,
             yarn: None,
@@ -69,9 +69,11 @@ impl RopeTable {
         Self {
             freqs: (0..half)
                 .map(|i| {
-                    let extrap = 1.0 / base.powf(i as f32 / half as f32);
+                    // The device kernel's arithmetic (`rope_yarn_rows_kernel`), so the
+                    // table is the same on every OS (P21).
+                    let extrap = allpaca_cpu::det_powf(base, -(i as f32) / half as f32);
                     let ramp = 1.0 - ((i as f32 - low) / (high - low).max(0.001)).clamp(0.0, 1.0);
-                    extrap * (scale * (1.0 - ramp) + ramp)
+                    extrap * scale.mul_add(1.0 - ramp, ramp)
                 })
                 .collect(),
             base,
@@ -95,13 +97,14 @@ impl RopeTable {
         let start = row.len() - n;
         let tail = &mut row[start..];
         for (i, f) in self.freqs.iter().take(n / 2).enumerate() {
-            let (mut sin, cos) = (pos as f32 * f).sin_cos();
+            // `det_rotate` of the device kernels: same sin/cos, same fused multiply-adds.
+            let (mut sin, cos) = allpaca_cpu::det_sincosf(pos as f32 * f);
             if inverse {
                 sin = -sin;
             }
             let (a, b) = (tail[2 * i], tail[2 * i + 1]);
-            tail[2 * i] = a * cos - b * sin;
-            tail[2 * i + 1] = a * sin + b * cos;
+            tail[2 * i] = a.mul_add(cos, -(b * sin));
+            tail[2 * i + 1] = a.mul_add(sin, b * cos);
         }
     }
 }
@@ -398,7 +401,7 @@ impl Pool {
             let max = (0..rows).fold(f32::NEG_INFINITY, |m, r| m.max(self.score[at(r)]));
             let (mut sum, mut acc) = (0.0f32, 0.0f32);
             for r in 0..rows {
-                let w = (self.score[at(r)] - max).exp();
+                let w = allpaca_cpu::det_expf(self.score[at(r)] - max);
                 sum += w;
                 acc += w * self.kv[at(r)];
             }
@@ -710,9 +713,9 @@ pub fn attend(
             *s *= scale;
             max = max.max(*s);
         }
-        let mut sum = sink.map_or(0.0, |s| (s - max).exp());
+        let mut sum = sink.map_or(0.0, |s| allpaca_cpu::det_expf(s - max));
         for s in row.iter_mut() {
-            *s = (*s - max).exp();
+            *s = allpaca_cpu::det_expf(*s - max);
             sum += *s;
         }
         let inv = 1.0 / sum.max(1e-9);
@@ -910,8 +913,8 @@ mod tests {
                             let col = width - head + c;
                             items.push((score[t * width + col] + ape[r * width + col], kv[t * width + col]));
                         }
-                        let z: f32 = items.iter().map(|(s, _)| s.exp()).sum();
-                        items.iter().map(|(s, v)| s.exp() / z * v).sum()
+                        let z: f32 = items.iter().map(|(s, _)| allpaca_cpu::det_expf(*s)).sum();
+                        items.iter().map(|(s, v)| allpaca_cpu::det_expf(*s) / z * v).sum()
                     })
                     .collect()
             })

@@ -9344,22 +9344,12 @@ impl HipWorkspace {
         }
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
-            // P21: sum the experts in an integer buffer so the order never matters;
-            // `ALLPACA_DSV4_FLOAT_ATOMICS=1` restores the old float atomics for A/B runs.
-            static FLOAT_ATOMICS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let float_atomics = *FLOAT_ATOMICS
-                .get_or_init(|| std::env::var("ALLPACA_DSV4_FLOAT_ATOMICS").is_ok_and(|v| v == "1"));
-            let rc = if float_atomics {
-                unsafe {
-                    ffi::allpaca_scatter_add_scale_rows(src, idx, w, acc, m, dim, n_tok, stream)
-                }
-            } else {
-                let acci = self.moe_acci_ptr()?;
-                unsafe {
-                    ffi::allpaca_scatter_add_scale_rows_i64(
-                        src, idx, w, acci, m, dim, n_tok, stream,
-                    )
-                }
+            // P21: sum the experts in an integer buffer so the order never matters. The old
+            // float atomics are gone: they were order-dependent and GPU1's outputs never
+            // reached the fold.
+            let acci = self.moe_acci_ptr()?;
+            let rc = unsafe {
+                ffi::allpaca_scatter_add_scale_rows_i64(src, idx, w, acci, m, dim, n_tok, stream)
             };
             status(rc, "scatter_add_scale_rows")
         }
