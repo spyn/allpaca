@@ -5293,6 +5293,24 @@ impl TinyModel {
         }
     }
 
+    /// Tiny dense model whose queries are twice as wide as `dim` (4 heads of
+    /// 16 over dim 32, 2 KV heads), with per-head Q/K norms, as Flint has.
+    pub fn synthetic_wide_attn(seed: u64) -> Self {
+        let mut cfg = ModelConfig::tiny();
+        cfg.head_dim_explicit = 16;
+        let (dim, head_dim) = (cfg.dim, cfg.head_dim());
+        let q_dim = cfg.n_heads * head_dim;
+        let mut model = Self::synthetic(cfg, seed, "wide-attn");
+        let mut rng = Lcg::new(seed.wrapping_add(127));
+        for layer in &mut model.layers {
+            layer.wq = rng.vec(q_dim * dim);
+            layer.wo = rng.vec(dim * q_dim);
+            layer.q_norm = vec![1.0; head_dim];
+            layer.k_norm = vec![1.0; head_dim];
+        }
+        model
+    }
+
     /// Tiny dense model with per-head attention sink logits.
     pub fn synthetic_attn_sinks(seed: u64) -> Self {
         let mut model = Self::synthetic(ModelConfig::tiny(), seed, "attn-sinks");
@@ -8185,11 +8203,14 @@ impl TinyModel {
                 *v *= s;
             }
         }
+        // Queries and the attention output are n_heads * head_dim wide, which
+        // is `dim` for most models and wider for some (Flint: 4096 over 2048).
+        let q_dim = cfg.n_heads * head_dim;
         let mut scratch = vec![0.0f32; dim.max(cfg.moe_workspace()).max(kv_dim)];
-        let mut q = vec![0.0f32; dim];
+        let mut q = vec![0.0f32; q_dim];
         let mut k = vec![0.0f32; kv_dim];
         let mut v = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; dim];
+        let mut attn_out = vec![0.0f32; q_dim];
         let mut hidden = vec![0.0f32; dim];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -8395,6 +8416,9 @@ impl TinyModel {
                 continue;
             }
             self.calib.observe(cfg.gguf_blk(layer_idx), crate::calib::Site::AttnIn, &scratch[..dim]);
+            if q_dim != dim {
+                host_wide_attn_check(layer_idx, layer, q_dim, dim, cfg.headwise_attn_gate)?;
+            }
             gemm_nt_dispatch(
                 hip,
                 &scratch[..dim],
@@ -8402,7 +8426,7 @@ impl TinyModel {
                 resident.map(|r| r.wq(layer_idx)),
                 &mut q,
                 1,
-                dim,
+                q_dim,
                 dim,
             )?;
             self.apply_edge0_lora(layer_idx, "q_proj", &scratch[..dim], &mut q);
@@ -8540,7 +8564,7 @@ impl TinyModel {
                 &mut hidden,
                 1,
                 dim,
-                dim,
+                q_dim,
             )?;
             self.apply_edge0_lora(layer_idx, "o_proj", &attn_out, &mut hidden);
             if !layer.attn_post_norm.is_empty() {
@@ -11453,6 +11477,7 @@ impl TinyModel {
         let cfg = &self.config;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
+        host_square_attn_only(cfg, "forest verify")?;
         let kv_dim = cfg.n_kv_heads * head_dim;
         let vocab = cfg.vocab_size;
         let mut xs: Vec<Vec<f32>> = Vec::with_capacity(n_tree);
@@ -11669,6 +11694,7 @@ impl TinyModel {
         let cfg = &self.config;
         let dim = cfg.dim;
         let head_dim = cfg.head_dim();
+        host_square_attn_only(cfg, "host draft forward")?;
         let kv_dim = cfg.n_kv_heads * head_dim;
         cache.ensure_layers(cfg.n_layers);
         let mut x = if let Some(nextn) = self.mtp_nextn.as_ref() {
@@ -12926,6 +12952,49 @@ fn apply_headwise_attn_gate(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The host token forward with queries wider than `dim`: the layer's Q and
+/// output projections must have that width, and the head-wise attention
+/// gate (written for `dim`-wide heads) is not supported there.
+fn host_wide_attn_check(
+    layer_idx: usize,
+    layer: &LayerWeights,
+    q_dim: usize,
+    dim: usize,
+    headwise_gate: bool,
+) -> Result<(), AllpacaError> {
+    if !layer.wq.is_empty() && layer.wq.len() != q_dim * dim {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "layer {layer_idx}: attn_q has {} weights, the host forward needs {q_dim} x {dim} (n_heads * head_dim x dim)",
+            layer.wq.len()
+        ))));
+    }
+    if !layer.wo.is_empty() && layer.wo.len() != dim * q_dim {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "layer {layer_idx}: attn_output has {} weights, the host forward needs {dim} x {q_dim} (dim x n_heads * head_dim)",
+            layer.wo.len()
+        ))));
+    }
+    if headwise_gate && !layer.attn_out_gate.is_empty() {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "layer {layer_idx}: head-wise attention gate with queries {q_dim} wide over dim {dim} is not supported on the host forward"
+        ))));
+    }
+    Ok(())
+}
+
+/// Host paths that still size queries as `dim` refuse a model whose
+/// attention is wider, instead of reading the wrong weights.
+fn host_square_attn_only(cfg: &ModelConfig, what: &str) -> Result<(), AllpacaError> {
+    let q_dim = cfg.n_heads * cfg.head_dim();
+    if q_dim != cfg.dim {
+        return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+            "wide attention not supported on this path ({what}): n_heads * head_dim = {q_dim}, dim = {}",
+            cfg.dim
+        ))));
+    }
+    Ok(())
+}
+
 fn gemm_nt_dispatch(
     hip: Option<&HipWorkspace>,
     a: &[f32],
@@ -14680,3 +14749,118 @@ pub(crate) fn fwd_segment_mark(device: i32, what: &str) {
     });
 }
 
+
+#[cfg(test)]
+mod host_wide_attn_tests {
+    use super::*;
+
+    /// Logits after feeding `n_tokens` tokens through the CPU host forward.
+    fn host_logits(model: &TinyModel, n_tokens: usize) -> Result<Vec<f32>, AllpacaError> {
+        let cfg = &model.config;
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::new(8 << 20, 8 << 20, 1.0);
+        let pages = alloc_pages_for_seq_masked(&mut kv, cfg, 16, n_tokens + 1, None, &metrics)?;
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        for pos in 0..n_tokens {
+            let token = (1 + pos * 7) as u32 % cfg.vocab_size as u32;
+            model.forward_token(
+                token, pos, &pages, &mut kv, &metrics, &mut logits, None, None, false, None, None, None, None,
+            )?;
+        }
+        Ok(logits)
+    }
+
+    fn bits_hash(v: &[f32]) -> u64 {
+        v.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Models whose Q width equals `dim` must keep their bits: the hash was
+    /// taken on main `ac4978c`, before the host forward learned wide Q.
+    #[test]
+    fn host_forward_square_attention_bits_unchanged() {
+        let model = TinyModel::synthetic(ModelConfig::tiny(), 7, "sq");
+        let logits = host_logits(&model, 4).unwrap();
+        assert!(logits.iter().all(|v| v.is_finite()));
+        assert_eq!(bits_hash(&logits), 0xf302_7db4_0fe9_9373, "hash {:#018x}", bits_hash(&logits));
+    }
+
+    /// Flint-shaped attention (Q = n_heads * head_dim = 2 * dim) runs on the
+    /// host. Before the fix the per-head Q norm indexed past a `dim`-long Q.
+    #[test]
+    fn host_forward_handles_q_wider_than_dim() {
+        let model = TinyModel::synthetic_wide_attn(7);
+        assert_eq!(model.config.n_heads * model.config.head_dim(), 2 * model.config.dim);
+        let logits = host_logits(&model, 4).unwrap();
+        assert!(logits.iter().all(|v| v.is_finite()), "{logits:?}");
+        // The wide rows are read: zeroing Q's upper half changes the logits.
+        let mut cut = model.clone();
+        let (dim, q_dim) = (cut.config.dim, 2 * cut.config.dim);
+        for layer in &mut cut.layers {
+            layer.wq[dim * dim..q_dim * dim].fill(0.0);
+        }
+        let other = host_logits(&cut, 4).unwrap();
+        let max_diff = logits.iter().zip(&other).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff > 1e-4, "Q rows past dim must matter; max diff {max_diff}");
+    }
+
+    /// Projections that do not have the wide shape are refused by name.
+    #[test]
+    fn host_forward_refuses_wide_attention_with_square_projections() {
+        let mut model = TinyModel::synthetic_wide_attn(7);
+        let dim = model.config.dim;
+        model.layers[0].wq.truncate(dim * dim);
+        let err = host_logits(&model, 1).unwrap_err().to_string();
+        assert!(err.contains("attn_q") && err.contains("64 x 32"), "{err}");
+    }
+
+    /// The forest and host-draft paths still assume `dim`-wide queries and
+    /// say so instead of computing with the wrong shape.
+    #[test]
+    fn forest_and_draft_paths_refuse_wide_attention() {
+        let model = TinyModel::synthetic_wide_attn(7);
+        let mut cache = DenseKv::default();
+        let mut logits = vec![0.0f32; model.config.vocab_size];
+        let err = model.forward_dense_on(1, 0, &mut cache, &mut logits, None, None, None).unwrap_err().to_string();
+        assert!(err.contains("wide attention not supported"), "{err}");
+        assert!(host_square_attn_only(&model.config, "forest verify").is_err());
+        assert!(host_square_attn_only(&ModelConfig::tiny(), "forest verify").is_ok());
+    }
+
+    /// CPU and HIP must agree on the wide model.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn host_wide_attention_matches_hip() {
+        if allpaca_hip::device_count() == 0 {
+            eprintln!("skip host_wide_attention_matches_hip: no HIP device");
+            return;
+        }
+        let model = TinyModel::synthetic_wide_attn(7);
+        let cpu = host_logits(&model, 4).unwrap();
+        let resident = ResidentModel::upload(&model, 0).unwrap();
+        let hip = HipWorkspace::new(0, 1 << 20, 64).unwrap();
+        let cfg = &model.config;
+        let metrics = Metrics::default();
+        let mut kv = crate::kv_tier::KvTierManager::with_hip(8 << 20, 8 << 20, 1.0, Some(hip.device));
+        let pages = alloc_pages_for_seq_masked(&mut kv, cfg, 16, 5, None, &metrics).unwrap();
+        let mut gpu = vec![0.0f32; cfg.vocab_size];
+        for pos in 0..4 {
+            let token = (1 + pos * 7) as u32 % cfg.vocab_size as u32;
+            model
+                .forward_token_device(
+                    token, pos, &pages, &mut kv, &metrics, &mut gpu, &hip, &resident, false, None, None, None,
+                    None, None,
+                )
+                .unwrap();
+            // The device path starts an async logits readback; collect it.
+            hip.wait_logits_d2h(&mut gpu).unwrap();
+        }
+        assert!(gpu.iter().any(|v| *v != 0.0), "HIP logits were not read back");
+        let max_diff = cpu.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i);
+        eprintln!("wide attention: cpu vs hip max abs logit diff {max_diff:e}");
+        assert!(max_diff < 1e-3, "cpu vs hip max abs logit diff {max_diff}");
+        assert_eq!(argmax(&cpu), argmax(&gpu));
+    }
+}
