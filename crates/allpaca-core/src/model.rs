@@ -3974,6 +3974,7 @@ fn requant_q8_0_on_load(ty: allpaca_gguf::GgmlType) -> bool {
             | T::IQ2_XS
             | T::IQ2_S
             | T::IQ3_XXS
+            | T::IQ3_S
             | T::IQ1_S
             | T::IQ1_M
             // NVFP4 weights (with their `.scale` folded in by `tensor_f32`)
@@ -4115,6 +4116,31 @@ pub fn gguf_device_bytes_split(file: &GgufFile, cfg: &ModelConfig) -> (Vec<u64>,
         }
     }
     (layers, experts, globals)
+}
+
+/// Warn (once per ggml type per process) when a large tensor falls through to
+/// the silent F32 expansion: the device copy is 4 B/weight.
+fn warn_f32_expansion_once(info: &allpaca_gguf::TensorInfo) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const LIMIT: u64 = 64 << 20;
+    let f32_bytes = info.n_elements() * 4;
+    if f32_bytes <= LIMIT {
+        return;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let first = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_or(false, |mut s| s.insert(info.ggml_type_id));
+    if first {
+        tracing::warn!(
+            tensor = %info.name,
+            ggml_type = ?info.ggml_type,
+            f32_bytes,
+            "no HIP kernel or re-pack for this type; tensor expands to F32 on the device"
+        );
+    }
 }
 
 /// `gather` stages `token_embd` for row gathers (F32 expand for K-quants,
@@ -4389,6 +4415,7 @@ fn append_gguf_tensor_as<'a>(
             (UploadPart::Owned(staged), WeightKind::Q8_0)
         }
         _ => {
+            warn_f32_expansion_once(info);
             let f32s = file.tensor_f32(name)?;
             let mut bytes = Vec::with_capacity(f32s.len() * 4);
             for v in &f32s {
@@ -13799,6 +13826,44 @@ mod lightning_moe_tests {
             let q8 = info.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
             assert_eq!(staged_device_bytes(&info), q8, "{ty:?}");
         }
+    }
+
+    /// Low-bit GEMM weights must stage as Q8_0, never as 4-byte floats.
+    #[test]
+    fn staged_device_bytes_never_expands_low_bit_types_to_f32() {
+        use allpaca_gguf::GgmlType as T;
+        let types = [
+            (T::IQ1_S, 19),
+            (T::IQ1_M, 29),
+            (T::IQ2_XXS, 16),
+            (T::IQ2_XS, 17),
+            (T::IQ2_S, 22),
+            (T::IQ3_XXS, 18),
+            (T::IQ3_S, 21),
+            (T::IQ4_NL, 20),
+            (T::IQ4_XS, 23),
+            (T::Q2_K, 10),
+            (T::Q4_0, 2),
+            (T::Q4_1, 3),
+            (T::Q5_0, 6),
+            (T::Q5_1, 7),
+        ];
+        let mut failed = Vec::new();
+        for (ty, id) in types {
+            let info = allpaca_gguf::TensorInfo {
+                name: "blk.0.ffn_down_exps.weight".into(),
+                dims: vec![2048, 512, 4],
+                ggml_type: ty,
+                ggml_type_id: id,
+                offset: 0,
+                shard: 0,
+            };
+            let q8 = info.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
+            if staged_device_bytes(&info) != q8 {
+                failed.push(format!("{ty:?}"));
+            }
+        }
+        assert!(failed.is_empty(), "types not staged as Q8_0: {failed:?}");
     }
 
     /// ROCmFPX GEMM weights reach the device without changing a value: type

@@ -87,5 +87,6 @@ int main(void) {
     emit("iq3_s", sizeof(block_iq3_s), nblk, 1, (dequant_fn)dequantize_row_iq3_s);
     emit("iq1_s", sizeof(block_iq1_s), nblk, 1, (dequant_fn)dequantize_row_iq1_s);
     emit("iq1_m", sizeof(block_iq1_m), nblk, 0, (dequant_fn)dequantize_row_iq1_m);
+    emit("iq4_xs", sizeof(block_iq4_xs), nblk, 1, (dequant_fn)dequantize_row_iq4_xs);
     return 0;
 }
