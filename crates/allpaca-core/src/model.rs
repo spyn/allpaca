@@ -680,6 +680,8 @@ enum WeightKind {
     Nvfp4,
     /// GGUF IQ4_XS (type 23), native 136-byte super-blocks (int8 GEMV).
     Iq4Xs,
+    /// GGUF IQ3_S (type 21), native 110-byte super-blocks (int8 GEMV).
+    Iq3S,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1048,6 +1050,7 @@ fn stacked_moe_experts(
             WeightKind::Q8_0 => 8,
             WeightKind::P48Fp4 => 200,
             WeightKind::Iq4Xs => 23,
+            WeightKind::Iq3S => 21,
             _ => return None,
         };
         let stride = second.off.checked_sub(first.off)?;
@@ -2437,6 +2440,7 @@ impl ResidentModel {
             | WeightKind::RocmFp4Fast
             | WeightKind::Nvfp4
             | WeightKind::Iq4Xs
+            | WeightKind::Iq3S
             | WeightKind::P48Fp4 => Err(AllpacaError::Fatal(FatalError::ModelLoad(
                 "F16/Q4_0/Q3_K/Q4_K/Q5_K/Q6_K/TQ1_0/TQ2_0/ROCmFP4/IQ4_XS norm must be F32 at load".into(),
             ))),
@@ -2495,6 +2499,9 @@ impl ResidentModel {
             WeightKind::Iq4Xs => {
                 hip.gemm_nt_iq4_xs_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
             }
+            WeightKind::Iq3S => {
+                hip.gemm_nt_iq3_s_dev(a, self.weights.byte_ptr_at(w.off), c, m, n, k)
+            }
         }?;
         if w.scale != 1.0 {
             hip.scale_f32(c, m as usize * n as usize, w.scale)?;
@@ -2537,6 +2544,7 @@ impl ResidentModel {
             WeightKind::P48Fp4
             | WeightKind::Nvfp4
             | WeightKind::Iq4Xs
+            | WeightKind::Iq3S
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -2590,6 +2598,7 @@ impl ResidentModel {
             WeightKind::P48Fp4
             | WeightKind::Nvfp4
             | WeightKind::Iq4Xs
+            | WeightKind::Iq3S
             | WeightKind::Q4_0
             | WeightKind::Q3_K
             | WeightKind::Q4_K
@@ -3962,10 +3971,11 @@ fn nvfp4_native(info: &allpaca_gguf::TensorInfo) -> bool {
         && std::env::var("ALLPACA_NVFP4_Q8").map_or(true, |v| v != "1")
 }
 
-/// An IQ4_XS weight runs on the native int8 GEMV (136 bytes per 256 weights,
-/// where the Q8_0 re-pack is 288) when it is big and its rows are whole
-/// super-blocks. `ALLPACA_IQ_Q8=1` keeps the Q8_0 re-pack, for A/B.
-fn iq4_xs_native(info: &allpaca_gguf::TensorInfo) -> bool {
+/// An i-quant weight with a native int8 GEMV (IQ4_XS: 136 bytes per 256
+/// weights, where the Q8_0 re-pack is 288) runs on it when it is big and its
+/// rows are whole super-blocks. `ALLPACA_IQ_Q8=1` keeps the Q8_0 re-pack, for
+/// A/B.
+fn iq_native(info: &allpaca_gguf::TensorInfo) -> bool {
     let k = info.dims.first().copied().unwrap_or(0) as usize;
     info.n_elements() > 65_536
         && k != 0
@@ -4072,7 +4082,7 @@ fn staged_device_bytes(info: &allpaca_gguf::TensorInfo) -> u64 {
         }
         T::Nvfp4 if nvfp4_native(info) => n / 32 * allpaca_cpu::NVFP4_DEV_BLOCK_BYTES as u64,
         T::Q3_K if q3_k_native(info) => info.nbytes() as u64,
-        T::IQ4_XS if iq4_xs_native(info) => info.nbytes() as u64,
+        T::IQ4_XS | T::IQ3_S if iq_native(info) => info.nbytes() as u64,
         T::Q8_0 | T::RocmFpxQ8 => q8_staged,
         ty if rocmfpx_as_f16(ty) => n * 2,
         ty if requant_q8_0_on_load(ty) => q8_staged,
@@ -4382,8 +4392,11 @@ fn append_gguf_tensor_as<'a>(
         allpaca_gguf::GgmlType::Q3_K if !gather && q3_k_native(info) => {
             (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Q3_K)
         }
-        allpaca_gguf::GgmlType::IQ4_XS if !gather && iq4_xs_native(info) => {
+        allpaca_gguf::GgmlType::IQ4_XS if !gather && iq_native(info) => {
             (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Iq4Xs)
+        }
+        allpaca_gguf::GgmlType::IQ3_S if !gather && iq_native(info) => {
+            (UploadPart::Mapped(file.tensor_bytes(name)?), WeightKind::Iq3S)
         }
         allpaca_gguf::GgmlType::RocmFpxQ8 if !gather && n > 65_536 => {
             // Lossless: each block is a Q8_0 block with its UE4M3 scale as a half.
@@ -4591,6 +4604,15 @@ fn split_packed_experts(
                 ))));
             }
             (n_per / allpaca_cpu::IQ4_XS_BLOCK_ELEMS).saturating_mul(allpaca_cpu::IQ4_XS_BLOCK_BYTES)
+        }
+        WeightKind::Iq3S => {
+            if n_per % allpaca_cpu::IQ3_S_BLOCK_ELEMS != 0 {
+                return Err(AllpacaError::Fatal(FatalError::ModelLoad(format!(
+                    "{what} IQ3_S expert elems {n_per} not aligned to {}",
+                    allpaca_cpu::IQ3_S_BLOCK_ELEMS
+                ))));
+            }
+            (n_per / allpaca_cpu::IQ3_S_BLOCK_ELEMS).saturating_mul(allpaca_cpu::IQ3_S_BLOCK_BYTES)
         }
         WeightKind::Q3_K => {
             if n_per % allpaca_cpu::Q3_K_BLOCK_ELEMS != 0 {
@@ -13893,7 +13915,7 @@ mod lightning_moe_tests {
                 shard: 0,
             };
             let q8 = info.n_elements().div_ceil(32) * allpaca_hip::Q8_STAGED_BLOCK as u64;
-            let want = if ty == T::IQ4_XS && iq4_xs_native(&info) { info.nbytes() as u64 } else { q8 };
+            let want = if matches!(ty, T::IQ4_XS | T::IQ3_S) && iq_native(&info) { info.nbytes() as u64 } else { q8 };
             if staged_device_bytes(&info) != want {
                 failed.push(format!("{ty:?}"));
             }
