@@ -20,6 +20,7 @@ const DIRECT_STORAGE_VERSION: &str = "1.3.0";
 
 fn main() {
     println!("cargo:rerun-if-changed=../../hip/src/kernels.cpp");
+    println!("cargo:rerun-if-changed=../../hip/src/iq_tables.h");
     println!("cargo:rerun-if-changed=../../hip/include/allpaca_kernels.h");
     println!("cargo:rerun-if-changed=../../hip/CMakeLists.txt");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
