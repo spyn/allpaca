@@ -6,7 +6,8 @@ use crate::ssm::{
     mamba2_step, validate_weights as validate_mamba2_weights, Mamba2Dims, SsmLayerWeights,
 };
 use allpaca_cpu::{
-    attention, attention_softcap, attention_with_mask_softcap, gelu, matmul_nt, rmsnorm, rope,
+    attention, attention_softcap, attention_with_mask_softcap, attention_with_mask_softcap_sinks, gelu, matmul_nt,
+    rmsnorm, rope,
     rope_imrope_neox, silu,
 };
 use allpaca_gguf::{GgufCompatReport, GgufFile, HybridLayerInfo, HybridLayerKind};
@@ -8612,7 +8613,7 @@ impl TinyModel {
                 for t in 0..start {
                     mask[t] = false;
                 }
-                attention_with_mask_softcap(
+                attention_with_mask_softcap_sinks(
                     &q,
                     &k_all,
                     &v_all,
@@ -8624,6 +8625,7 @@ impl TinyModel {
                     head_dim,
                     &mask,
                     cfg.attn_logit_softcap,
+                    &layer.attn_sinks,
                 )?;
             } else {
                 attention_dispatch(
@@ -8639,6 +8641,7 @@ impl TinyModel {
                     head_dim,
                     true,
                     cfg.attn_logit_softcap,
+                    &layer.attn_sinks,
                 )?;
             }
             // Spark2_5 head-wise sigmoid attention gate (applied before wo).
@@ -11903,6 +11906,7 @@ impl TinyModel {
                 head_dim,
                 true,
                 cfg.attn_logit_softcap,
+                &layer.attn_sinks,
             )?;
             gemm_nt_dispatch(
                 hip,
@@ -13135,7 +13139,17 @@ fn attention_dispatch(
     head_dim: usize,
     causal: bool,
     softcap: f32,
+    sinks: &[f32],
 ) -> Result<(), AllpacaError> {
+    if !sinks.is_empty() {
+        // Host only: the HIP attention kernel takes no sinks.
+        let first_q = n_kv.saturating_sub(n_q);
+        let mask: Vec<bool> =
+            (0..n_q).flat_map(|qi| (0..n_kv).map(move |t| !causal || t <= qi + first_q)).collect();
+        return attention_with_mask_softcap_sinks(
+            q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, &mask, softcap, sinks,
+        );
+    }
     if softcap <= 0.0 {
         if let Some(hip) = hip {
             if hip
@@ -14902,6 +14916,26 @@ mod host_wide_attn_tests {
         let other = host_logits(&cut, 4).unwrap();
         let max_diff = logits.iter().zip(&other).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(max_diff > 1e-4, "Q rows past dim must matter; max diff {max_diff}");
+    }
+
+    /// Attention sinks reach the host forward (Q31): the same weights with
+    /// sinks give different logits, on full and on sliding-window attention.
+    #[test]
+    fn host_attn_sinks_change_logits() {
+        let with = TinyModel::synthetic_attn_sinks(79);
+        let plain = TinyModel::synthetic(ModelConfig::tiny(), 79, "no-sinks");
+        assert!(with.layers.iter().all(|l| l.attn_sinks.len() == with.config.n_heads));
+        let max_diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let (a, b) = (host_logits(&with, 4).unwrap(), host_logits(&plain, 4).unwrap());
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(max_diff(&a, &b) > 1e-4, "sinks must change logits; max diff {}", max_diff(&a, &b));
+        let swa = |mut m: TinyModel| {
+            m.config.sliding_window = 2;
+            m.config.swa_pattern = vec![true; m.config.n_layers];
+            host_logits(&m, 4).unwrap()
+        };
+        let (a, b) = (swa(with), swa(plain));
+        assert!(max_diff(&a, &b) > 1e-4, "sinks must change SWA logits; max diff {}", max_diff(&a, &b));
     }
 
     /// Projections that do not have the wide shape are refused by name.

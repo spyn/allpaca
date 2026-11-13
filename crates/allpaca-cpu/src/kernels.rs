@@ -374,7 +374,7 @@ pub fn attention_with_mask(
     )
 }
 
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn attention_with_mask_softcap(
     q: &[f32],
     k: &[f32],
@@ -388,6 +388,37 @@ pub fn attention_with_mask_softcap(
     mask: &[bool],
     softcap: f32,
 ) -> Result<(), AllpacaError> {
+    attention_with_mask_softcap_sinks(
+        q, k, v, out, n_q, n_kv, n_heads, n_kv_heads, head_dim, mask, softcap, &[],
+    )
+}
+
+/// [`attention_with_mask_softcap`] with one attention-sink logit per head
+/// (`attn_sinks.weight`: gpt-oss, Flint). A head's sink joins its softmax
+/// like one more key, unscaled and never masked, and adds no value, so it
+/// only takes weight away from the real keys. Order: scale, softcap, mask,
+/// then the softmax with the sink. Empty `sinks` is the plain kernel.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attention_with_mask_softcap_sinks(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_q: usize,
+    n_kv: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask: &[bool],
+    softcap: f32,
+    sinks: &[f32],
+) -> Result<(), AllpacaError> {
+    if !sinks.is_empty() && sinks.len() != n_heads {
+        return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+            "attention sinks: {} values for {n_heads} heads",
+            sinks.len()
+        ))));
+    }
     if n_heads == 0 || n_kv_heads == 0 || !n_heads.is_multiple_of(n_kv_heads) {
         return Err(AllpacaError::Fatal(FatalError::InvalidConfig(
             "invalid attention head configuration".into(),
@@ -425,7 +456,10 @@ pub fn attention_with_mask_softcap(
                 }
                 scores[t] = softcap_score(dot * scale, softcap);
             }
-            softmax_in_place(&mut scores);
+            match sinks.get(h) {
+                Some(&sink) => softmax_with_sink_in_place(&mut scores, sink),
+                None => softmax_in_place(&mut scores),
+            }
             let o_off = (qi * n_heads + h) * head_dim;
             for d in 0..head_dim {
                 out[o_off + d] = 0.0;
@@ -687,6 +721,26 @@ pub fn rope_imrope_neox_heads_at(
 
 pub fn softmax(x: &mut [f32]) {
     softmax_in_place(x);
+}
+
+/// Softmax over `x` and one extra logit `sink` whose weight is dropped: the
+/// maximum includes the sink and the sum adds `exp(sink - max)`, as
+/// `dsv4_attn::attend` and llama.cpp's soft_max with sinks do.
+fn softmax_with_sink_in_place(x: &mut [f32], sink: f32) {
+    let max = x.iter().fold(sink, |m, v| m.max(*v));
+    if !max.is_finite() {
+        // Every key masked and no usable sink: nothing to attend to.
+        x.fill(0.0);
+        return;
+    }
+    let mut sum = (sink - max).exp();
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    for v in x.iter_mut() {
+        *v /= sum;
+    }
 }
 
 fn softmax_in_place(x: &mut [f32]) {
@@ -2815,5 +2869,65 @@ mod tests {
         let short = vec![0u8; IQ4_XS_BLOCK_BYTES - 1];
         let mut out = vec![0.0f32; IQ4_XS_BLOCK_ELEMS];
         assert!(dequant_iq4_xs(&short, IQ4_XS_BLOCK_ELEMS, &mut out).is_err());
+    }
+}
+
+#[cfg(test)]
+mod attention_sink_tests {
+    use super::*;
+
+    /// One head of width 2, two keys. q = [1, 0], keys [2, 0] and [0, 0]:
+    /// scores are 2 / sqrt(2) and 0.
+    fn case() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        (vec![1.0, 0.0], vec![2.0, 0.0, 0.0, 0.0], vec![1.0, 10.0, 3.0, 30.0])
+    }
+
+    #[test]
+    fn sink_takes_weight_and_adds_no_value() {
+        let (q, k, v) = case();
+        let mut out = vec![0.0f32; 2];
+        let sink = 0.5f32;
+        attention_with_mask_softcap_sinks(&q, &k, &v, &mut out, 1, 2, 1, 1, 2, &[true, true], 0.0, &[sink]).unwrap();
+        // By hand: weights exp(s0), exp(0) over exp(s0) + exp(0) + exp(sink).
+        let s0 = 2.0f64 / 2.0f64.sqrt();
+        let z = s0.exp() + 1.0 + f64::from(sink).exp();
+        let (w0, w1) = (s0.exp() / z, 1.0 / z);
+        let want = [w0 * 1.0 + w1 * 3.0, w0 * 10.0 + w1 * 30.0];
+        for (got, want) in out.iter().zip(want) {
+            assert!((f64::from(*got) - want).abs() < 1e-5, "{out:?} vs {want:?}");
+        }
+        assert!(w0 + w1 < 1.0, "the sink keeps part of the weight");
+    }
+
+    #[test]
+    fn a_very_negative_sink_equals_no_sink_and_empty_sinks_are_the_plain_kernel() {
+        let (q, k, v) = case();
+        let mut plain = vec![0.0f32; 2];
+        attention_with_mask_softcap(&q, &k, &v, &mut plain, 1, 2, 1, 1, 2, &[true, true], 0.0).unwrap();
+        let mut none = vec![0.0f32; 2];
+        attention_with_mask_softcap_sinks(&q, &k, &v, &mut none, 1, 2, 1, 1, 2, &[true, true], 0.0, &[]).unwrap();
+        assert_eq!(plain.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), none.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        let mut far = vec![0.0f32; 2];
+        attention_with_mask_softcap_sinks(&q, &k, &v, &mut far, 1, 2, 1, 1, 2, &[true, true], 0.0, &[-1e30]).unwrap();
+        for (a, b) in plain.iter().zip(&far) {
+            assert!((a - b).abs() < 1e-7 * a.abs().max(1.0), "{plain:?} vs {far:?}");
+        }
+    }
+
+    #[test]
+    fn masked_keys_stay_out_and_the_sink_is_never_masked() {
+        let (q, k, v) = case();
+        let mut out = vec![0.0f32; 2];
+        attention_with_mask_softcap_sinks(&q, &k, &v, &mut out, 1, 2, 1, 1, 2, &[false, true], 0.0, &[0.0]).unwrap();
+        // Key 1 (score 0) and the sink (0) share the weight: half of v1.
+        assert!((out[0] - 1.5).abs() < 1e-6 && (out[1] - 15.0).abs() < 1e-5, "{out:?}");
+    }
+
+    #[test]
+    fn a_wrong_number_of_sinks_is_an_error() {
+        let (q, k, v) = case();
+        let mut out = vec![0.0f32; 2];
+        let err = attention_with_mask_softcap_sinks(&q, &k, &v, &mut out, 1, 2, 1, 1, 2, &[true, true], 0.0, &[0.0, 0.0]);
+        assert!(err.is_err());
     }
 }
