@@ -2257,6 +2257,13 @@ pub fn memcpy_on(
             MEMCPY_H2D => "memcpy_h2d",
             _ => "memcpy_other",
         };
+        if sync_trace::pre_wait() && (kind == MEMCPY_D2H || kind == MEMCPY_H2D) {
+            // Drain the stream first, under its own label at the caller's
+            // line: what is left on the copy's own label is the copy.
+            let pre = if kind == MEMCPY_D2H { "pre_wait:memcpy_d2h" } else { "pre_wait:memcpy_h2d" };
+            let rc = sync_trace::timed(pre, || unsafe { ffi::allpaca_hip_stream_synchronize(stream) });
+            status(rc, "memcpy pre-wait sync")?;
+        }
         let rc = sync_trace::timed(label, || unsafe {
             ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream)
         });
@@ -2395,6 +2402,14 @@ pub mod sync_trace {
     use std::time::Instant;
 
     static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    /// `ALLPACA_SYNC_TRACE=2`: also time a stream sync before each traced
+    /// copy, to split its wait into queued GPU work and the copy itself.
+    static PRE_WAIT: AtomicU8 = AtomicU8::new(0);
+
+    /// Mode 2 is on (board Q34). It changes timing, never numerics.
+    pub fn pre_wait() -> bool {
+        on() && PRE_WAIT.load(Ordering::Relaxed) == 1
+    }
     type Table = Mutex<HashMap<(&'static str, &'static Location<'static>), (u64, u64)>>;
     static TABLE: OnceLock<Table> = OnceLock::new();
 
@@ -2403,7 +2418,9 @@ pub mod sync_trace {
             1 => false,
             2 => true,
             _ => {
-                let v = std::env::var("ALLPACA_SYNC_TRACE").is_ok_and(|v| v == "1");
+                let mode = std::env::var("ALLPACA_SYNC_TRACE").unwrap_or_default();
+                let v = mode == "1" || mode == "2";
+                PRE_WAIT.store(u8::from(mode == "2"), Ordering::Relaxed);
                 // Only the thread that wins the swap starts the dumper.
                 let won = STATE
                     .compare_exchange(0, if v { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed)
@@ -2454,7 +2471,7 @@ pub mod sync_trace {
             "SYNC_TRACE_BEGIN epoch={} total_calls={total}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
         );
-        for ((label, loc), (n, ns)) in rows.iter().take(40) {
+        for ((label, loc), (n, ns)) in rows.iter().take(96) {
             eprintln!(
                 "SYNC_TRACE {label} {}:{} n={n} ms={:.1}",
                 loc.file(),
@@ -22766,5 +22783,101 @@ mod tests {
                 cpu[i]
             );
         }
+    }
+}
+
+/// Board Q34: what a tiny host-to-device copy costs the host when GPU work
+/// is already queued on its stream, from pageable and from pinned memory.
+///
+/// `cargo test --release -p allpaca-hip --features hip --lib bench_small_copy_wait -- --ignored --nocapture`
+/// (`BENCH_DEVICE` picks the card; default 1 when there are two.)
+#[cfg(all(test, feature = "hip", allpaca_hip_runtime))]
+mod small_copy_wait_bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_small_copy_wait() {
+        if device_count() == 0 {
+            eprintln!("skip bench_small_copy_wait: no HIP device");
+            return;
+        }
+        let dev: i32 = std::env::var("BENCH_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if device_count() > 1 { 1 } else { 0 });
+        set_device(dev).unwrap();
+        let (n, k) = (5120usize, 5120usize);
+        // MXFP4 weights (the DSV4 expert kernel): 17 bytes per 32 weights.
+        let packed: Vec<u8> = (0..n * k / 32 * MXFP4_BLOCK_BYTES)
+            .map(|i| if i % MXFP4_BLOCK_BYTES == 0 { 120 } else { (i * 7 % 251) as u8 })
+            .collect();
+        let w = device_malloc(packed.len(), dev).unwrap();
+        memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+        let xv: Vec<f32> = (0..k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+        let x = device_malloc(k * 4, dev).unwrap();
+        memcpy(x, xv.as_ptr().cast(), k * 4, MEMCPY_H2D).unwrap();
+        let y = device_malloc(n * 4, dev).unwrap();
+        let small = device_malloc(64, dev).unwrap();
+        let pageable = vec![1u8; 8];
+        let pinned = host_malloc(64).unwrap();
+        unsafe { std::ptr::write_bytes(pinned, 1, 8) };
+        let mut side: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert_eq!(unsafe { ffi::allpaca_hip_stream_create(&mut side) }, 0, "stream create");
+        let sync = |stream: *mut std::ffi::c_void| unsafe { stream_synchronize_on(stream).unwrap() };
+        let queue = |count: usize, stream: *mut std::ffi::c_void| {
+            for _ in 0..count {
+                gemm_nt_mxfp4_device_on(x.cast(), w, y.cast(), 1, n as i32, k as i32, stream).unwrap();
+            }
+        };
+        const QUEUED: usize = 10;
+        const REPS: usize = 100;
+        eprintln!("bench_small_copy_wait device {dev}: 8-byte H2D, {REPS} repeats, medians in us");
+        for (stream_name, stream) in [("default stream", std::ptr::null_mut()), ("side stream", side)] {
+            // The queued work alone: launch, then wait.
+            let mut work = Vec::new();
+            for _ in 0..REPS {
+                sync(stream);
+                let t = Instant::now();
+                queue(QUEUED, stream);
+                sync(stream);
+                work.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            eprintln!("{stream_name}: {QUEUED} MXFP4 5120x5120 GEMVs, launch + wait: {:.0} us", median(work));
+            for queued in [0usize, QUEUED] {
+                for (src_name, src) in [("pageable Vec", pageable.as_ptr()), ("pinned (hipHostMalloc)", pinned.cast_const())] {
+                    let (mut call, mut drain) = (Vec::new(), Vec::new());
+                    for _ in 0..REPS {
+                        sync(stream);
+                        queue(queued, stream);
+                        let t = Instant::now();
+                        memcpy_on(small, src, 8, MEMCPY_H2D, stream).unwrap();
+                        call.push(t.elapsed().as_secs_f64() * 1e6);
+                        let t = Instant::now();
+                        sync(stream);
+                        drain.push(t.elapsed().as_secs_f64() * 1e6);
+                    }
+                    eprintln!(
+                        "{stream_name}, {} queued, source {src_name}: copy call {:.1} us, sync after it {:.1} us",
+                        if queued == 0 { "nothing".to_string() } else { format!("{queued} GEMVs") },
+                        median(call),
+                        median(drain)
+                    );
+                }
+            }
+        }
+        sync(side);
+        unsafe { ffi::allpaca_hip_stream_destroy(side) };
+        host_free(pinned);
+        device_free(small, 64);
+        device_free(y, n * 4);
+        device_free(x, k * 4);
+        device_free(w, packed.len());
     }
 }
