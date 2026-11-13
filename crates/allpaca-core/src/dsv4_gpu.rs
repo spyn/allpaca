@@ -41,6 +41,30 @@ const HEAT_DECAY: f32 = 0.8;
 /// much more often: a copy costs several milliseconds, a miss on the CPU
 /// well under one.
 const HEAT_MARGIN: f32 = 2.0;
+
+/// Whether a missed expert with decayed route count `heat` takes a slot
+/// from the coldest resident expert (`floor`, `None` when nothing can be
+/// evicted): its count must be at least `margin` above the floor.
+fn admit_over_coldest(heat: f32, floor: Option<f32>, margin: f32) -> bool {
+    match floor {
+        None => false,
+        Some(floor) => !(heat < floor + margin),
+    }
+}
+
+/// The admission margin from `ALLPACA_DSV4_HEAT_MARGIN` (a debug knob for
+/// tuning, board Q46): a finite value >= 0 or `inf` (never displace).
+/// Anything else is reported and the built-in margin kept. Output does not
+/// depend on it: an expert gives the same bits wherever it runs (P21).
+fn heat_margin_from(value: Option<&str>) -> (f32, Option<String>) {
+    let Some(text) = value else {
+        return (HEAT_MARGIN, None);
+    };
+    match text.trim().parse::<f32>() {
+        Ok(m) if m >= 0.0 && !m.is_nan() => (m, None),
+        _ => (HEAT_MARGIN, Some(format!("ALLPACA_DSV4_HEAT_MARGIN={text:?} is not a number >= 0 or inf; using {HEAT_MARGIN}"))),
+    }
+}
 const ACT_SLOT_FLOATS: usize = 131072;
 const ACT_SLOTS: usize = 3;
 /// Bounce / mmap-window size. Two in-flight windows × two GPUs must fit
@@ -369,6 +393,9 @@ pub struct Dsv4Gpu {
     /// takes a slot only when it is routed clearly more often than the
     /// coldest resident one. Off: every miss is copied in (plain LRU).
     cpu_miss: bool,
+    /// How far above the coldest resident expert a miss must be routed to
+    /// take its slot ([`HEAT_MARGIN`] unless `ALLPACA_DSV4_HEAT_MARGIN`).
+    heat_margin: f32,
     /// Host RAM tier the CPU experts read through.
     ram: Option<Arc<std::sync::Mutex<crate::dsv4_ram::ExpertRam>>>,
     /// Mapped expert slices handed to a GPU copy, released once it landed.
@@ -549,6 +576,14 @@ impl Dsv4Gpu {
             // miss to a GPU instead (and turns off the host RAM expert tier).
             cpu_miss: std::env::var("ALLPACA_DSV4_CPU_MISS").map_or(true, |v| v != "0")
                 && cpu_expert_kernel_fits(file, cfg),
+            heat_margin: {
+                let (margin, problem) = heat_margin_from(std::env::var("ALLPACA_DSV4_HEAT_MARGIN").ok().as_deref());
+                if let Some(problem) = problem {
+                    tracing::warn!("{problem}");
+                }
+                tracing::info!(margin, "DeepSeek-V4 GPU admission margin");
+                margin
+            },
             ram: None,
             mapped_used: Vec::new(),
             ram_pinned: Vec::new(),
@@ -741,11 +776,11 @@ impl Dsv4Gpu {
         };
         let (c0, c1) = (coldest(&self.slots), coldest(&self.gpu1_slots));
         let floor = match (c0, c1) {
-            (Some(a), Some(b)) => a.1.max(b.1),
-            (Some(a), None) | (None, Some(a)) => a.1,
-            (None, None) => return false,
+            (Some(a), Some(b)) => Some(a.1.max(b.1)),
+            (Some(a), None) | (None, Some(a)) => Some(a.1),
+            (None, None) => None,
         };
-        if heat.get(&(layer, expert)).copied().unwrap_or(0.0) < floor + HEAT_MARGIN {
+        if !admit_over_coldest(heat.get(&(layer, expert)).copied().unwrap_or(0.0), floor, self.heat_margin) {
             return false;
         }
         if let Some((i, _)) = c0 {
@@ -3377,6 +3412,7 @@ impl Dsv4Gpu {
             heat_file: None,
             heat_profile: None,
             cpu_miss: false,
+            heat_margin: HEAT_MARGIN,
             ram: None,
             mapped_used: Vec::new(),
             ram_pinned: Vec::new(),
@@ -5846,5 +5882,47 @@ mod tests {
         assert!(rebuilt.resident_expert(0, 2).is_some());
         drop(rebuilt);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod admit_margin_tests {
+    use super::*;
+
+    /// At the built-in margin the rule is the comparison `admits` used to
+    /// make inline: stay on the CPU while `heat < floor + HEAT_MARGIN`.
+    #[test]
+    fn default_margin_matches_the_old_inline_rule() {
+        let values = [0.0f32, 0.5, 1.0, 1.999, 2.0, 2.001, 3.5, 10.0, 1e6];
+        for &heat in &values {
+            for &floor in &values {
+                let old = !(heat < floor + HEAT_MARGIN);
+                assert_eq!(admit_over_coldest(heat, Some(floor), HEAT_MARGIN), old, "heat {heat} floor {floor}");
+            }
+            assert!(!admit_over_coldest(heat, None, HEAT_MARGIN), "nothing to evict: heat {heat}");
+        }
+    }
+
+    #[test]
+    fn margin_zero_admits_a_tie_and_infinity_never_admits() {
+        assert!(admit_over_coldest(3.0, Some(3.0), 0.0));
+        assert!(!admit_over_coldest(2.9, Some(3.0), 0.0));
+        for heat in [0.0f32, 1.0, 1e9, f32::MAX] {
+            assert!(!admit_over_coldest(heat, Some(0.0), f32::INFINITY), "heat {heat}");
+        }
+    }
+
+    #[test]
+    fn the_env_value_parses_or_falls_back_with_a_warning() {
+        assert_eq!(heat_margin_from(None), (HEAT_MARGIN, None));
+        assert_eq!(heat_margin_from(Some("0")).0, 0.0);
+        assert_eq!(heat_margin_from(Some(" 0.5 ")).0, 0.5);
+        assert_eq!(heat_margin_from(Some("8")).0, 8.0);
+        assert_eq!(heat_margin_from(Some("inf")).0, f32::INFINITY);
+        for bad in ["-1", "nan", "two", ""] {
+            let (margin, problem) = heat_margin_from(Some(bad));
+            assert_eq!(margin, HEAT_MARGIN, "{bad:?}");
+            assert!(problem.is_some(), "{bad:?}");
+        }
     }
 }
