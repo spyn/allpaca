@@ -256,8 +256,11 @@ fn event_record_on(
 }
 
 #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+#[track_caller]
 fn event_synchronize(ev: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
-    let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+    let rc = sync_trace::timed("event_sync", || unsafe {
+        ffi::allpaca_hip_event_synchronize(ev)
+    });
     status(rc, "event_synchronize")
 }
 
@@ -2240,6 +2243,7 @@ pub fn host_unregister(ptr: *mut u8) {
     }
 }
 
+#[track_caller]
 pub fn memcpy(dst: *mut u8, src: *const u8, bytes: usize, kind: i32) -> Result<(), AllpacaError> {
     memcpy_on(dst, src, bytes, kind, std::ptr::null_mut())
 }
@@ -2281,6 +2285,7 @@ fn debug_log_small_h2d(bytes: usize, kind: i32, stream: *mut std::ffi::c_void) {
 }
 
 /// Same as [`memcpy`], queued on `stream` (null is the default stream).
+#[track_caller]
 pub fn memcpy_on(
     dst: *mut u8,
     src: *const u8,
@@ -2291,7 +2296,21 @@ pub fn memcpy_on(
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
         debug_log_small_h2d(bytes, kind, stream);
-        let rc = unsafe { ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream) };
+        let label = match kind {
+            MEMCPY_D2H => "memcpy_d2h",
+            MEMCPY_H2D => "memcpy_h2d",
+            _ => "memcpy_other",
+        };
+        if sync_trace::pre_wait() && (kind == MEMCPY_D2H || kind == MEMCPY_H2D) {
+            // Drain the stream first, under its own label at the caller's
+            // line: what is left on the copy's own label is the copy.
+            let pre = if kind == MEMCPY_D2H { "pre_wait:memcpy_d2h" } else { "pre_wait:memcpy_h2d" };
+            let rc = sync_trace::timed(pre, || unsafe { ffi::allpaca_hip_stream_synchronize(stream) });
+            status(rc, "memcpy pre-wait sync")?;
+        }
+        let rc = sync_trace::timed(label, || unsafe {
+            ffi::allpaca_hip_memcpy(dst.cast(), src.cast(), bytes, kind, stream)
+        });
         status(rc, "memcpy")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2415,12 +2434,108 @@ pub fn has_memcpy_batch() -> bool {
     }
 }
 
+/// P22: `ALLPACA_SYNC_TRACE=1` records, per (call kind, Rust call site), how often
+/// the host blocked on the GPU (stream/event/device sync and blocking copies) and
+/// for how long, and prints the cumulative table to stderr every 5 s while it
+/// changes. Off by default; the off cost is one relaxed load per call.
+pub mod sync_trace {
+    use std::collections::HashMap;
+    use std::panic::Location;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on
+    /// `ALLPACA_SYNC_TRACE=2`: also time a stream sync before each traced
+    /// copy, to split its wait into queued GPU work and the copy itself.
+    static PRE_WAIT: AtomicU8 = AtomicU8::new(0);
+
+    /// Mode 2 is on (board Q34). It changes timing, never numerics.
+    pub fn pre_wait() -> bool {
+        on() && PRE_WAIT.load(Ordering::Relaxed) == 1
+    }
+    type Table = Mutex<HashMap<(&'static str, &'static Location<'static>), (u64, u64)>>;
+    static TABLE: OnceLock<Table> = OnceLock::new();
+
+    fn on() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let mode = std::env::var("ALLPACA_SYNC_TRACE").unwrap_or_default();
+                let v = mode == "1" || mode == "2";
+                PRE_WAIT.store(u8::from(mode == "2"), Ordering::Relaxed);
+                // Only the thread that wins the swap starts the dumper.
+                let won = STATE
+                    .compare_exchange(0, if v { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok();
+                if v && won {
+                    std::thread::spawn(|| {
+                        let mut last = 0u64;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            dump(&mut last);
+                        }
+                    });
+                }
+                v
+            }
+        }
+    }
+
+    #[track_caller]
+    pub fn timed<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+        if !on() {
+            return f();
+        }
+        let loc = Location::caller();
+        let t = Instant::now();
+        let r = f();
+        let ns = t.elapsed().as_nanos() as u64;
+        let tab = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut m) = tab.lock() {
+            let e = m.entry((label, loc)).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
+        }
+        r
+    }
+
+    fn dump(last_total: &mut u64) {
+        let Some(tab) = TABLE.get() else { return };
+        let Ok(m) = tab.lock() else { return };
+        let total: u64 = m.values().map(|v| v.0).sum();
+        if total == *last_total {
+            return;
+        }
+        *last_total = total;
+        let mut rows: Vec<_> = m.iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.1));
+        eprintln!(
+            "SYNC_TRACE_BEGIN epoch={} total_calls={total}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+        );
+        for ((label, loc), (n, ns)) in rows.iter().take(96) {
+            eprintln!(
+                "SYNC_TRACE {label} {}:{} n={n} ms={:.1}",
+                loc.file(),
+                loc.line(),
+                *ns as f64 / 1e6
+            );
+        }
+        eprintln!("SYNC_TRACE_END");
+    }
+}
+
 /// Debug (P21): wait for every stream on the current device. Used by the
 /// `ALLPACA_DSV4_SYNC` experiment only.
+#[track_caller]
 pub fn device_synchronize() -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_device_synchronize() };
+        let rc = sync_trace::timed("device_sync", || unsafe {
+            ffi::allpaca_hip_device_synchronize()
+        });
         status(rc, "device_synchronize")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2430,10 +2545,13 @@ pub fn device_synchronize() -> Result<(), AllpacaError> {
 }
 
 /// Wait for queued kernels and copies on the default stream.
+#[track_caller]
 pub fn stream_synchronize() -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(std::ptr::null_mut()) };
+        let rc = sync_trace::timed("stream_sync", || unsafe {
+            ffi::allpaca_hip_stream_synchronize(std::ptr::null_mut())
+        });
         status(rc, "stream_synchronize")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2448,10 +2566,13 @@ pub fn stream_synchronize() -> Result<(), AllpacaError> {
 ///
 /// # Safety
 /// `stream` must be null or a stream this process still owns.
+#[track_caller]
 pub unsafe fn stream_synchronize_on(stream: *mut std::ffi::c_void) -> Result<(), AllpacaError> {
     #[cfg(all(feature = "hip", allpaca_hip_runtime))]
     {
-        let rc = unsafe { ffi::allpaca_hip_stream_synchronize(stream) };
+        let rc = sync_trace::timed("stream_sync_on", || unsafe {
+            ffi::allpaca_hip_stream_synchronize(stream)
+        });
         status(rc, "stream_synchronize_on")
     }
     #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2573,6 +2694,7 @@ impl H2dStream {
     }
 
     /// Block the host until every queued copy on this stream has landed.
+    #[track_caller]
     pub fn synchronize(&self) -> Result<(), AllpacaError> {
         unsafe { stream_synchronize_on(self.stream) }
     }
@@ -2599,6 +2721,7 @@ impl H2dStream {
     }
 
     /// Host-wait until bounce-buffer `slot` is safe to overwrite.
+    #[track_caller]
     pub fn synchronize_slot(&self, slot: usize) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -2607,7 +2730,9 @@ impl H2dStream {
                     "H2D bounce slot out of range".into(),
                 ))
             })?;
-            let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+            let rc = sync_trace::timed("h2d_slot_sync", || unsafe {
+                ffi::allpaca_hip_event_synchronize(ev)
+            });
             status(rc, "h2d_slot_sync")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -2641,6 +2766,7 @@ impl H2dStream {
     }
 
     /// Host-wait until ready-ring `idx` can be recorded again.
+    #[track_caller]
     pub fn synchronize_ready(&self, idx: usize) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -2649,7 +2775,9 @@ impl H2dStream {
                     "H2D ready ring out of range".into(),
                 ))
             })?;
-            let rc = unsafe { ffi::allpaca_hip_event_synchronize(ev) };
+            let rc = sync_trace::timed("h2d_ready_sync", || unsafe {
+                ffi::allpaca_hip_event_synchronize(ev)
+            });
             status(rc, "h2d_ready_sync")
         }
         #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
@@ -8585,6 +8713,7 @@ impl HipWorkspace {
     }
 
     /// Packed BF16 `b` on device; `a` is already a device `[m,k]` pointer (no A H2D).
+    #[track_caller]
     pub fn gemm_nt_bf16_from_device_a(
         &self,
         a: *const f32,
@@ -8741,6 +8870,7 @@ impl HipWorkspace {
         }
     }
 
+    #[track_caller]
     fn join_default_event(&self) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -8918,6 +9048,7 @@ impl HipWorkspace {
     /// Gather `row_idx` from device `xs` (see [`Self::moe_begin`]) and SwiGLU on `slot`.
     /// `row_idx` / `row_w` stay on the slot until [`Self::mxfp4_swiglu_accumulate_slot`].
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn mxfp4_swiglu_enqueue_from_rows(
         &self,
         slot: usize,
@@ -9234,6 +9365,7 @@ impl HipWorkspace {
     }
 
     /// `acc += add` after H2D into `moe_x` (callers must no longer need `xs`).
+    #[track_caller]
     pub fn moe_add_from_host(&self, add: &[f32]) -> Result<(), AllpacaError> {
         let (x, acc, n) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
@@ -9262,6 +9394,7 @@ impl HipWorkspace {
 
     /// Add `n_tok * dim` fixed-point sums computed on the host (the CPU experts) into the
     /// stage's integer sum, so they are finalized together with the cards' (exact, order free).
+    #[track_caller]
     pub fn moe_acci_add_from_host(&self, add: &[i64]) -> Result<(), AllpacaError> {
         let (stage, n) = {
             let g = self.moe.lock().unwrap_or_else(|e| e.into_inner());
@@ -9297,6 +9430,7 @@ impl HipWorkspace {
     /// Join expert SwiGLU streams without downloading `moe_acc`. Called after every batch
     /// of experts, so it must NOT finalize: how the experts split into batches depends on
     /// when their weights arrive, and each finalize is one float add into `moe_acc`.
+    #[track_caller]
     pub fn moe_join_compute(&self) -> Result<(), AllpacaError> {
         self.bind()?;
         self.join_swiglu_streams()?;
@@ -9305,6 +9439,7 @@ impl HipWorkspace {
 
     /// Join, then add the fixed-point expert sums into `moe_acc` exactly once. Call this
     /// only when every expert of the layer on this card has been enqueued.
+    #[track_caller]
     pub fn moe_join_finalize(&self) -> Result<(), AllpacaError> {
         self.bind()?;
         self.join_swiglu_streams()?;
@@ -9581,6 +9716,7 @@ impl HipWorkspace {
         Ok(s.acc.cast())
     }
 
+    #[track_caller]
     fn join_swiglu_streams(&self) -> Result<(), AllpacaError> {
         #[cfg(all(feature = "hip", allpaca_hip_runtime))]
         {
@@ -11014,6 +11150,7 @@ impl HipWorkspace {
         }
     }
 
+    #[track_caller]
     pub fn copy_d2h_f32(&self, src: *const f32, dst: &mut [f32]) -> Result<(), AllpacaError> {
         if dst.is_empty() {
             return Ok(());
@@ -11030,6 +11167,7 @@ impl HipWorkspace {
         Ok(())
     }
 
+    #[track_caller]
     pub fn copy_h2d_f32(&self, dst: *mut f32, src: &[f32]) -> Result<(), AllpacaError> {
         if src.is_empty() {
             return Ok(());
@@ -23523,5 +23661,101 @@ mod tests {
                 cpu[i]
             );
         }
+    }
+}
+
+/// Board Q34: what a tiny host-to-device copy costs the host when GPU work
+/// is already queued on its stream, from pageable and from pinned memory.
+///
+/// `cargo test --release -p allpaca-hip --features hip --lib bench_small_copy_wait -- --ignored --nocapture`
+/// (`BENCH_DEVICE` picks the card; default 1 when there are two.)
+#[cfg(all(test, feature = "hip", allpaca_hip_runtime))]
+mod small_copy_wait_bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_small_copy_wait() {
+        if device_count() == 0 {
+            eprintln!("skip bench_small_copy_wait: no HIP device");
+            return;
+        }
+        let dev: i32 = std::env::var("BENCH_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if device_count() > 1 { 1 } else { 0 });
+        set_device(dev).unwrap();
+        let (n, k) = (5120usize, 5120usize);
+        // MXFP4 weights (the DSV4 expert kernel): 17 bytes per 32 weights.
+        let packed: Vec<u8> = (0..n * k / 32 * MXFP4_BLOCK_BYTES)
+            .map(|i| if i % MXFP4_BLOCK_BYTES == 0 { 120 } else { (i * 7 % 251) as u8 })
+            .collect();
+        let w = device_malloc(packed.len(), dev).unwrap();
+        memcpy(w, packed.as_ptr(), packed.len(), MEMCPY_H2D).unwrap();
+        let xv: Vec<f32> = (0..k).map(|i| ((i * 13 % 97) as f32 - 48.0) * 0.01).collect();
+        let x = device_malloc(k * 4, dev).unwrap();
+        memcpy(x, xv.as_ptr().cast(), k * 4, MEMCPY_H2D).unwrap();
+        let y = device_malloc(n * 4, dev).unwrap();
+        let small = device_malloc(64, dev).unwrap();
+        let pageable = vec![1u8; 8];
+        let pinned = host_malloc(64).unwrap();
+        unsafe { std::ptr::write_bytes(pinned, 1, 8) };
+        let mut side: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert_eq!(unsafe { ffi::allpaca_hip_stream_create(&mut side) }, 0, "stream create");
+        let sync = |stream: *mut std::ffi::c_void| unsafe { stream_synchronize_on(stream).unwrap() };
+        let queue = |count: usize, stream: *mut std::ffi::c_void| {
+            for _ in 0..count {
+                gemm_nt_mxfp4_device_on(x.cast(), w, y.cast(), 1, n as i32, k as i32, stream).unwrap();
+            }
+        };
+        const QUEUED: usize = 10;
+        const REPS: usize = 100;
+        eprintln!("bench_small_copy_wait device {dev}: 8-byte H2D, {REPS} repeats, medians in us");
+        for (stream_name, stream) in [("default stream", std::ptr::null_mut()), ("side stream", side)] {
+            // The queued work alone: launch, then wait.
+            let mut work = Vec::new();
+            for _ in 0..REPS {
+                sync(stream);
+                let t = Instant::now();
+                queue(QUEUED, stream);
+                sync(stream);
+                work.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            eprintln!("{stream_name}: {QUEUED} MXFP4 5120x5120 GEMVs, launch + wait: {:.0} us", median(work));
+            for queued in [0usize, QUEUED] {
+                for (src_name, src) in [("pageable Vec", pageable.as_ptr()), ("pinned (hipHostMalloc)", pinned.cast_const())] {
+                    let (mut call, mut drain) = (Vec::new(), Vec::new());
+                    for _ in 0..REPS {
+                        sync(stream);
+                        queue(queued, stream);
+                        let t = Instant::now();
+                        memcpy_on(small, src, 8, MEMCPY_H2D, stream).unwrap();
+                        call.push(t.elapsed().as_secs_f64() * 1e6);
+                        let t = Instant::now();
+                        sync(stream);
+                        drain.push(t.elapsed().as_secs_f64() * 1e6);
+                    }
+                    eprintln!(
+                        "{stream_name}, {} queued, source {src_name}: copy call {:.1} us, sync after it {:.1} us",
+                        if queued == 0 { "nothing".to_string() } else { format!("{queued} GEMVs") },
+                        median(call),
+                        median(drain)
+                    );
+                }
+            }
+        }
+        sync(side);
+        unsafe { ffi::allpaca_hip_stream_destroy(side) };
+        host_free(pinned);
+        device_free(small, 64);
+        device_free(y, n * 4);
+        device_free(x, k * 4);
+        device_free(w, packed.len());
     }
 }
