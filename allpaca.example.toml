@@ -175,6 +175,45 @@ route_tail_skip_rank = 7
 # experts get no cache heat, so an expert that only ever ranks in the tail is
 # never cached. Check the quality on your own prompts before relying on it.
 
+# Latent sparse attention (LSA, arXiv 2610.42147, flat search): once a row of
+# a full-attention layer sees more than 4 + lsa_top_k + 512 keys, it reads
+# only the first 4 keys, the last 512 and the `lsa_top_k` keys an index picks
+# for it, instead of all of them. The index groups each layer's cached keys
+# into buckets (Ward's method, in blocks of 512 keys) in a 64-dim space given
+# by `lsa_map`; a query scores the bucket centroids and reads the keys of the
+# best ones. Shorter contexts are untouched. Lossy.
+#
+# What a row reads depends only on its position and its own sequence, so
+# within a run speculative output still equals plain output and concurrent
+# requests equal solo ones; `/stats` counts the rows in `lsa_sparse_rows`.
+#
+# Needs: a model whose heads rotate only a prefix of their dims (Qwen3.5 /
+# Qwen3.8: 64 of 256), its index maps as safetensors (`<layer>.W_Q_idx` and
+# `<layer>.W_K_idx`, [position-free key dims, index dims] each; the paper's
+# release `d-lsa-weights-v1` has Qwen3.8-27B's as a .pt file), and the whole
+# model on local HIP GPUs with every KV page in VRAM (no cpu_only, no RPC
+# workers; raise `[kv] vram_bytes` for long contexts). It does not shrink the
+# KV cache: it adds about 40 bytes per key and layer in host memory.
+# lsa = false
+# lsa_top_k = 4096
+# lsa_map = "maps/qwen38_27b.safetensors"
+#
+# Measured, Qwen3.8-27B UD-Q5_K_XL, lsa_top_k 4096, one KV page per layer
+# (`[kv] page_tokens` at least the context), no speculation, one run each,
+# against full attention on the same prompt (War and Peace plus a question):
+#   prompt     machine   prefill s (full -> LSA)   decode ms/token (full -> LSA)
+#   ~15k       xeres     162  -> 157               77.2  -> 77-79
+#   ~30k       xeres     418  -> 335               81-86 -> 79-82
+#   ~30k       shodan    578  -> 497               123.1 -> 115.4
+#   ~122k      shodan    4350 -> 2052              183.7 -> 119.7
+# Quality on those prompts: a sentence hidden at 10%, 50% and 90% of a ~30k
+# prompt, and at 50% of a ~122k one, was quoted back by both; over the 27 to
+# 81 steps where both runs had produced the same text, the KL of LSA's
+# next-token distribution against full attention's was 0.005-0.007 nats per
+# token at ~30k and 0.015 at ~122k, and the top token agreed on all but the
+# step where the texts part. That is one book and one kind of question:
+# check your own prompts. Below ~15k tokens it gains nothing.
+
 # Overlay pipeline-mode defaults. Uncomment only the flags you want to force.
 # [features]
 # asymmetric_drafting = true
