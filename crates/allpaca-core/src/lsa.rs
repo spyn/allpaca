@@ -467,8 +467,9 @@ impl LsaIndex {
     }
 
     /// The keys the query at `position` reads, ascending, or `None` while
-    /// it reads them all. `index_query` is its unit index query. Keys up to
-    /// `position` must have been pushed.
+    /// it reads them all. `index_query` is its unit index query. Every block
+    /// that closed before the query's own must have been pushed; the keys
+    /// of its own block come from the window.
     pub fn select(&self, position: usize, index_query: &[f32]) -> Result<Option<Vec<u32>>, AllpacaError> {
         self.select_budget(position, index_query, self.shape.top_k, self.shape.top_p)
     }
@@ -489,7 +490,9 @@ impl LsaIndex {
             return Ok(None);
         }
         let visible = self.visible_buckets(position);
-        if index_query.len() != self.dim || position >= self.tokens {
+        // Every block closed before the query's own must be indexed; the
+        // keys of its own block come from the window.
+        if index_query.len() != self.dim || visible < position / shape.cluster_block * shape.block_buckets() {
             return Err(lsa_err(format!(
                 "lsa: query at {position} of {} dims over {} keys of index width {}",
                 index_query.len(),
@@ -541,6 +544,188 @@ impl LsaIndex {
         keys.extend(window_start as u32..=position as u32);
         keys
     }
+}
+
+/// A model's LSA setup (`experimental.lsa`): the design's sizes, where the
+/// position-free dims sit, and a map per full-attention layer.
+#[derive(Debug, Clone)]
+pub struct LsaModel {
+    pub shape: LsaShape,
+    pub geo: LsaGeometry,
+    /// By layer; `None` for a layer that keeps no KV or is not indexed.
+    maps: Vec<Option<LsaMap>>,
+}
+
+impl LsaModel {
+    /// Read the maps of `layers` (the full-attention layers to index) from
+    /// the safetensors file at `path`.
+    pub fn load(
+        path: &Path,
+        top_k: usize,
+        geo: LsaGeometry,
+        layers: &[usize],
+        n_layers: usize,
+    ) -> Result<Self, AllpacaError> {
+        geo.check()?;
+        if top_k < 4 || top_k % 4 != 0 {
+            return Err(lsa_err(format!("lsa: top_k {top_k} must be a multiple of 4, at least 4")));
+        }
+        let shape = LsaShape::paper(top_k);
+        shape.check()?;
+        let mut maps = vec![None; n_layers];
+        for &layer in layers {
+            maps[layer] = Some(LsaMap::load(path, layer, geo.key_dim())?);
+        }
+        Ok(Self { shape, geo, maps })
+    }
+
+    /// [`Self::load`] from maps already in memory, by layer.
+    pub fn from_maps(shape: LsaShape, geo: LsaGeometry, maps: Vec<Option<LsaMap>>) -> Result<Self, AllpacaError> {
+        geo.check()?;
+        shape.check()?;
+        if let Some(bad) = maps.iter().flatten().find(|m| m.key_dim != geo.key_dim()) {
+            return Err(lsa_err(format!(
+                "lsa: a map reads {} dims and the key input has {}",
+                bad.key_dim,
+                geo.key_dim()
+            )));
+        }
+        Ok(Self { shape, geo, maps })
+    }
+
+    /// The map of `layer`, when it is indexed.
+    pub fn map(&self, layer: usize) -> Option<&LsaMap> {
+        self.maps.get(layer).and_then(Option::as_ref)
+    }
+
+    /// Layers with a map.
+    pub fn layers(&self) -> Vec<usize> {
+        (0..self.maps.len()).filter(|l| self.maps[*l].is_some()).collect()
+    }
+
+    /// Unit index keys of cached key rows (`n_kv_heads * head_dim` floats
+    /// each), `index_dim` floats a row.
+    pub fn index_keys(&self, map: &LsaMap, k_rows: &[f32]) -> Vec<f32> {
+        let kv_dim = self.geo.n_kv_heads * self.geo.head_dim;
+        let mut out = vec![0.0f32; k_rows.len() / kv_dim * map.index_dim];
+        let mut input = Vec::new();
+        for (row, dst) in k_rows.chunks(kv_dim).zip(out.chunks_mut(map.index_dim)) {
+            self.geo.key_input(row, &mut input);
+            map.index_key(&input, dst);
+        }
+        out
+    }
+
+    /// The unit index query of one query row (`n_heads * head_dim` floats).
+    pub fn index_query(&self, map: &LsaMap, q_row: &[f32]) -> Vec<f32> {
+        let mut input = Vec::new();
+        let mut out = vec![0.0f32; map.index_dim];
+        self.geo.query_input(q_row, &mut input);
+        map.index_query(&input, &mut out);
+        out
+    }
+}
+
+/// The keys each of `n_rows` consecutive rows of one sequence reads in
+/// `layer`, or `None` for a row that reads them all (and for every row of a
+/// layer without a map).
+///
+/// `pages` are the layer's KV pages, which already hold the rows' keys; the
+/// first row sits at `start_pos`. The layer's index lives in `kv` under its
+/// first page and holds whole cluster blocks only: a rewind drops the blocks
+/// that reach `start_pos`, and the blocks that closed before the last row's
+/// own are read back from the pages and clustered here (a row never scores
+/// its own block, the window covers it). `fetch_q(row, out)` reads the
+/// queries of the rows from `row` on, `q_stride` floats a row, into `out`
+/// (once, for the rows that are sparse). Nothing is fetched while every row still reads all its keys, so
+/// a short context costs nothing, and a decode step reads keys back only
+/// when it starts a block.
+///
+/// What a row reads depends only on its position and on the sequence's own
+/// keys and queries, never on how many rows share the call: decode, prefill,
+/// speculative verify and batched ticks select the same keys for a row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_rows(
+    lsa: &LsaModel,
+    layer: usize,
+    kv: &mut crate::kv_tier::KvTierManager,
+    pages: &[u64],
+    start_pos: usize,
+    n_rows: usize,
+    q_stride: usize,
+    fetch_q: &dyn Fn(usize, &mut [f32]) -> Result<(), AllpacaError>,
+) -> Result<Vec<Option<Vec<u32>>>, AllpacaError> {
+    let (Some(map), Some(&first_page)) = (lsa.map(layer), pages.first()) else {
+        return Ok(vec![None; n_rows]);
+    };
+    let end = start_pos + n_rows;
+    if n_rows == 0 || end <= lsa.shape.max_keys() {
+        return Ok(vec![None; n_rows]);
+    }
+    let geo = &lsa.geo;
+    let mut index = match kv.lsa_take(first_page) {
+        Some(index) => index,
+        None => LsaIndex::new(lsa.shape, map.index_dim)?,
+    };
+    let result = (|| {
+        let block = lsa.shape.cluster_block;
+        // Whole blocks only: one that reaches `start_pos` may hold keys of
+        // rows a rewind dropped.
+        index.truncate(start_pos / block * block);
+        let closed = (end - 1) / block * block;
+        if index.tokens() < closed {
+            let from = index.tokens();
+            let rows = kv.lsa_read_keys(pages, from, closed - from, geo.n_kv_heads, geo.head_dim)?;
+            index.push(&lsa.index_keys(map, &rows))?;
+        }
+        // Positions ascend, so the sparse rows are the last ones.
+        let dense = (0..n_rows).take_while(|row| !index.is_sparse(start_pos + row)).count();
+        let q_dim = geo.n_heads * geo.head_dim;
+        if q_stride < q_dim {
+            return Err(lsa_err(format!("lsa: query rows {q_stride} floats apart hold {q_dim}")));
+        }
+        let mut q_rows = vec![0.0f32; (n_rows - dense) * q_stride];
+        fetch_q(dense, &mut q_rows)?;
+        // Rows select independently of each other, so they may run side by
+        // side: a row's keys do not depend on how the rows are split.
+        let select = |row: usize| {
+            let q = &q_rows[(row - dense) * q_stride..(row - dense) * q_stride + q_dim];
+            index.select(start_pos + row, &lsa.index_query(map, q))
+        };
+        let sparse = n_rows - dense;
+        let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).min(sparse / 4).max(1);
+        let mut picked: Vec<Option<Vec<u32>>> = vec![None; n_rows];
+        if threads == 1 {
+            for (row, slot) in picked.iter_mut().enumerate().skip(dense) {
+                *slot = select(row)?;
+            }
+        } else {
+            let per = sparse.div_ceil(threads);
+            let results: Vec<Result<(), AllpacaError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = picked[dense..]
+                    .chunks_mut(per)
+                    .enumerate()
+                    .map(|(chunk, slots)| {
+                        let select = &select;
+                        scope.spawn(move || {
+                            for (i, slot) in slots.iter_mut().enumerate() {
+                                *slot = select(dense + chunk * per + i)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err(lsa_err("lsa: a selection thread panicked".into()))))
+                    .collect()
+            });
+            results.into_iter().collect::<Result<(), AllpacaError>>()?;
+        }
+        Ok(picked)
+    })();
+    kv.lsa_put(first_page, index);
+    result
 }
 
 #[cfg(test)]
@@ -745,10 +930,14 @@ mod tests {
     }
 
     #[test]
-    fn a_query_past_the_pushed_keys_is_refused() {
+    fn a_query_whose_earlier_blocks_are_not_indexed_is_refused() {
         let axes: Vec<usize> = (0..16).map(|i| i % 4).collect();
         let index = index_of(&axes);
-        let err = index.select(20, &[1.0, 0.0, 0.0, 0.0]).expect_err("keys 16..=20 are missing");
+        // The query at 20 sits in the third block: the two before it are
+        // indexed and its own keys come from the window.
+        let keys = index.select(20, &[0.0, 1.0, 0.0, 0.0]).unwrap().expect("sparse");
+        assert_eq!(keys, [0, 1, 5, 9, 13, 14, 15, 16, 17, 18, 19, 20]);
+        let err = index.select(24, &[1.0, 0.0, 0.0, 0.0]).expect_err("block 16..24 is missing");
         assert!(err.to_string().contains("over 16 keys"), "{err}");
     }
 }

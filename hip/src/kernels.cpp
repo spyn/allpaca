@@ -2332,6 +2332,129 @@ __global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_split_gqa_kerne
     }
 }
 
+/* Rows that each read their own list of keys out of a paged KV (latent
+ * sparse attention). One block per (row, group of query heads sharing a
+ * key/value head), a warp per query head. Row `y` reads the keys
+ * lists[y * list_stride + t] for t < counts[y], in that order: key position p
+ * sits in page p / page_rows at slot p % page_rows, its key rows at the
+ * page's address and its value rows v_off floats past it. Per row, the key
+ * tiles, their order and the chunk folds are those of the Q-tiled kernel over
+ * the listed keys, so the row equals the one attention_split_gqa_kernel and
+ * its merges give for the same keys gathered side by side. */
+template <int DPT, bool VEC4>
+__global__ void __launch_bounds__(32 * ATTN_GQA_HEADS) attention_indexed_kernel(
+    const float *q, const uint64_t *pages, const int32_t *lists, const int32_t *counts, float *out, int n_heads,
+    int n_kv_heads, int head_dim, int q_stride, int out_stride, int list_stride, int page_rows, size_t v_off,
+    int tile) {
+    extern __shared__ float attn_lds[];
+    float *k_lds = attn_lds;
+    float *v_lds = attn_lds + static_cast<size_t>(tile) * head_dim;
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int per_block = static_cast<int>(blockDim.x) / 32;
+    const int per_kv = n_heads / n_kv_heads;
+    const int groups = (per_kv + per_block - 1) / per_block;
+    const int kv_h = static_cast<int>(blockIdx.x) / groups;
+    const int h0 = kv_h * per_kv + (static_cast<int>(blockIdx.x) % groups) * per_block;
+    const int h_end = min(kv_h * per_kv + per_kv, h0 + per_block);
+    const int h = h0 + warp;
+    const bool active = h < h_end;
+    const size_t row = blockIdx.y;
+    const float scale = det_rsqrtf(static_cast<float>(head_dim));
+    const float *qh = q + row * static_cast<size_t>(q_stride) + static_cast<size_t>(active ? h : h0) * head_dim;
+    float *oh = out + row * static_cast<size_t>(out_stride) + static_cast<size_t>(active ? h : h0) * head_dim;
+    const int32_t *list = lists + row * static_cast<size_t>(list_stride);
+    const int t_end = counts[row];
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * static_cast<size_t>(head_dim);
+    const size_t head_off = static_cast<size_t>(kv_h) * head_dim;
+    constexpr bool vec4 = VEC4;
+    const int nvec = vec4 ? head_dim / 4 : head_dim;
+    AttnRow<DPT> r;
+    attn_row_init(r, qh, lane, head_dim, nvec, vec4, static_cast<const float *>(nullptr), 0);
+    AttnFoldRegs<DPT> rg;
+    AttnFoldStack<DPT> st;
+    attn_tree_init(rg, st);
+    int next_fold = ATTN_CHUNK;
+    for (int t0 = 0; t0 < t_end; t0 += tile) {
+        __syncthreads();
+        if (vec4) {
+            const int row4 = head_dim / 4;
+            const int n4 = tile * row4;
+            for (int e = static_cast<int>(threadIdx.x); e < n4; e += static_cast<int>(blockDim.x)) {
+                const int t = t0 + e / row4;
+                float4 kk = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                float4 vv = kk;
+                if (t < t_end) {
+                    const int p = list[t];
+                    const float *src =
+                        reinterpret_cast<const float *>(static_cast<uintptr_t>(pages[p / page_rows])) +
+                        static_cast<size_t>(p % page_rows) * kv_stride + head_off + static_cast<size_t>(e % row4) * 4;
+                    kk = *reinterpret_cast<const float4 *>(src);
+                    vv = *reinterpret_cast<const float4 *>(src + v_off);
+                }
+                reinterpret_cast<float4 *>(k_lds)[e] = kk;
+                reinterpret_cast<float4 *>(v_lds)[e] = vv;
+            }
+        } else {
+            const int n = tile * head_dim;
+            for (int e = static_cast<int>(threadIdx.x); e < n; e += static_cast<int>(blockDim.x)) {
+                const int t = t0 + e / head_dim;
+                float kk = 0.0f;
+                float vv = 0.0f;
+                if (t < t_end) {
+                    const int p = list[t];
+                    const float *src =
+                        reinterpret_cast<const float *>(static_cast<uintptr_t>(pages[p / page_rows])) +
+                        static_cast<size_t>(p % page_rows) * kv_stride + head_off + static_cast<size_t>(e % head_dim);
+                    kk = src[0];
+                    vv = src[v_off];
+                }
+                k_lds[e] = kk;
+                v_lds[e] = vv;
+            }
+        }
+        __syncthreads();
+        const int stop = min(t_end, t0 + tile);
+        for (int s = t0; s < stop; s += ATTN_KT) {
+            if (s == next_fold) {
+                next_fold += ATTN_CHUNK;
+                attn_tree_push<DPT>(rg, st, r);
+                attn_row_reset(r);
+            }
+            const int t = s + lane / 2;
+            const bool valid = t < t_end;
+            const size_t at = static_cast<size_t>(s - t0) * head_dim;
+            attn_tile_step(r, k_lds + at, v_lds + at, valid, lane, head_dim, nvec, vec4, scale);
+        }
+    }
+    if (active) {
+        if (!attn_tree_empty(rg, st)) {
+            attn_tree_push<DPT>(rg, st, r);
+            attn_tree_finish<DPT>(rg, st, r);
+        }
+        attn_row_store(r, oh, lane, head_dim, nvec, vec4);
+    }
+}
+
+template <int DPT>
+static void launch_attention_indexed(const float *q, const uint64_t *pages, const int32_t *lists,
+                                     const int32_t *counts, float *out, int n_rows, int n_heads, int n_kv_heads,
+                                     int head_dim, int q_stride, int out_stride, int list_stride, int page_rows,
+                                     size_t v_off, hipStream_t stream) {
+    /* The tile and the float4 rule of launch_attention_tiled. */
+    const int tile = max(ATTN_KT, 2048 / head_dim / ATTN_KT * ATTN_KT);
+    const size_t lds = 2 * static_cast<size_t>(tile) * head_dim * sizeof(float);
+    const int per_kv = n_heads / n_kv_heads;
+    const int per_block = min(per_kv, ATTN_GQA_HEADS);
+    const int groups = (per_kv + per_block - 1) / per_block;
+    const bool vec4 = (head_dim % 4) == 0 && (q_stride % 4) == 0 && (out_stride % 4) == 0 &&
+                      (reinterpret_cast<uintptr_t>(q) % 16u) == 0;
+    const dim3 grid(static_cast<unsigned>(n_kv_heads * groups), static_cast<unsigned>(n_rows));
+    hipLaunchKernelGGL((vec4 ? attention_indexed_kernel<DPT, true> : attention_indexed_kernel<DPT, false>), grid,
+                       dim3(32 * per_block), lds, stream, q, pages, lists, counts, out, n_heads, n_kv_heads, head_dim,
+                       q_stride, out_stride, list_stride, page_rows, v_off, tile);
+}
+
 /* Partials attention_merge_kernel folds itself, in one warp. Below that the
  * fold tree's lowest levels run as attention_merge_pair_kernel launches, one
  * per level: a launch costs more than a few folds, so short rows (up to 16
@@ -9454,6 +9577,38 @@ extern "C" int allpaca_attention_sinks(const float *q, const float *k, const flo
     return hip_status(hipGetLastError());
 }
 
+extern "C" int allpaca_attention_indexed(const float *q, const uint64_t *pages, const int32_t *lists,
+                                         const int32_t *counts, float *out, int32_t n_rows, int32_t n_heads,
+                                         int32_t n_kv_heads, int32_t head_dim, int32_t q_stride,
+                                         int32_t out_stride, int32_t list_stride, int32_t page_rows, uint64_t v_off,
+                                         allpaca_stream_t stream) {
+    if (!q || !pages || !lists || !counts || !out || n_rows <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || (n_heads % n_kv_heads) != 0 || q_stride < n_heads * head_dim ||
+        out_stride < n_heads * head_dim || list_stride <= 0 || page_rows <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    const hipStream_t st = as_stream(stream);
+    switch (attn_dpt_bucket(head_dim)) {
+    case 4:
+        launch_attention_indexed<4>(q, pages, lists, counts, out, n_rows, n_heads, n_kv_heads, head_dim, q_stride,
+                                    out_stride, list_stride, page_rows, static_cast<size_t>(v_off), st);
+        break;
+    case 8:
+        launch_attention_indexed<8>(q, pages, lists, counts, out, n_rows, n_heads, n_kv_heads, head_dim, q_stride,
+                                    out_stride, list_stride, page_rows, static_cast<size_t>(v_off), st);
+        break;
+    case 16:
+        launch_attention_indexed<16>(q, pages, lists, counts, out, n_rows, n_heads, n_kv_heads, head_dim, q_stride,
+                                     out_stride, list_stride, page_rows, static_cast<size_t>(v_off), st);
+        break;
+    default:
+        /* Head dims past the tiled kernels: the caller gathers each row. */
+        return ALLPACA_ERR_INVALID;
+    }
+    return hip_status(hipGetLastError());
+}
+
 extern "C" int allpaca_attention_masked(const float *q, const float *k, const float *v, float *out,
                                         int32_t n_q, int32_t n_kv, int32_t n_heads,
                                         int32_t n_kv_heads, int32_t head_dim, const uint8_t *mask,
@@ -9920,6 +10075,23 @@ __global__ void gather_rows_kernel(float *dst, const float *src, const int32_t *
     }
     const size_t row = static_cast<size_t>(rows[idx / row_len]);
     dst[idx] = src[row * static_cast<size_t>(row_len) + static_cast<size_t>(idx % row_len)];
+}
+
+/* Key and value rows of a paged KV: row r sits in page r / page_rows at slot
+ * r % page_rows; a page's key rows start at its base address and its value
+ * rows `v_off` floats past it. Blocks [0, n) copy the key rows, [n, 2n) the
+ * value rows. */
+__global__ void gather_paged_kv_kernel(float *dst_k, float *dst_v, const uint64_t *pages, const int32_t *rows,
+                                       int n, int row_len, int page_rows, size_t v_off) {
+    const bool value = static_cast<int>(blockIdx.x) >= n;
+    const size_t i = value ? blockIdx.x - static_cast<unsigned>(n) : blockIdx.x;
+    const int row = rows[i];
+    const float *src = reinterpret_cast<const float *>(static_cast<uintptr_t>(pages[row / page_rows])) +
+                       (value ? v_off : 0) + static_cast<size_t>(row % page_rows) * static_cast<size_t>(row_len);
+    float *out = (value ? dst_v : dst_k) + i * static_cast<size_t>(row_len);
+    for (int e = static_cast<int>(threadIdx.x); e < row_len; e += static_cast<int>(blockDim.x)) {
+        out[e] = src[e];
+    }
 }
 
 __global__ void sigmoid_mul_kernel(float *x, const float *gate, int n) {
@@ -10789,6 +10961,18 @@ extern "C" int allpaca_gather_rows(float *dst, const float *src, const int32_t *
     hipLaunchKernelGGL(gather_rows_kernel, dim3(static_cast<unsigned>(blocks)),
                        dim3(static_cast<unsigned>(threads)), 0, as_stream(stream), dst, src, rows, n,
                        row_len);
+    return hip_status(hipGetLastError());
+}
+
+extern "C" int allpaca_gather_paged_kv(float *dst_k, float *dst_v, const uint64_t *pages, const int32_t *rows,
+                                       int32_t n, int32_t row_len, int32_t page_rows, uint64_t v_off,
+                                       allpaca_stream_t stream) {
+    if (!dst_k || !dst_v || !pages || !rows || n <= 0 || n > INT32_MAX / 2 || row_len <= 0 || page_rows <= 0) {
+        return ALLPACA_ERR_INVALID;
+    }
+    clear_last_error();
+    hipLaunchKernelGGL(gather_paged_kv_kernel, dim3(static_cast<unsigned>(2 * n)), dim3(256), 0, as_stream(stream),
+                       dst_k, dst_v, pages, rows, n, row_len, page_rows, static_cast<size_t>(v_off));
     return hip_status(hipGetLastError());
 }
 
@@ -13123,6 +13307,17 @@ extern "C" int allpaca_sigmoid_mul(float *, const float *, int32_t, allpaca_stre
 
 extern "C" int allpaca_gather_rows(float *, const float *, const int32_t *, int32_t, int32_t,
                                    allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_gather_paged_kv(float *, float *, const uint64_t *, const int32_t *, int32_t, int32_t,
+                                       int32_t, uint64_t, allpaca_stream_t) {
+    return ALLPACA_ERR_NOT_IMPLEMENTED;
+}
+
+extern "C" int allpaca_attention_indexed(const float *, const uint64_t *, const int32_t *, const int32_t *, float *,
+                                         int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                         uint64_t, allpaca_stream_t) {
     return ALLPACA_ERR_NOT_IMPLEMENTED;
 }
 

@@ -73,6 +73,9 @@ pub struct Metrics {
     pub tree_path_invalid: AtomicU64,
     pub tree_gpu_verifies: AtomicU64,
     pub linear_packed_verifies: AtomicU64,
+    /// Attention rows (one per layer and token) that read a selection of
+    /// their keys under `experimental.lsa`.
+    pub lsa_sparse_rows: AtomicU64,
     pub draft_ahead_hits: AtomicU64,
     /// MTP process forwards that wrote draft KV without the vocab-wide lm_head.
     pub draft_logits_skipped: AtomicU64,
@@ -296,6 +299,7 @@ impl Metrics {
                 && self.tree_path_invalid.load(Ordering::Relaxed) == 0,
             tree_gpu_verifies: self.tree_gpu_verifies.load(Ordering::Relaxed),
             linear_packed_verifies: self.linear_packed_verifies.load(Ordering::Relaxed),
+            lsa_sparse_rows: self.lsa_sparse_rows.load(Ordering::Relaxed),
             draft_ahead_hits: self.draft_ahead_hits.load(Ordering::Relaxed),
             draft_logits_skipped: self.draft_logits_skipped.load(Ordering::Relaxed),
             draft_tokens_drafted: self.draft_tokens_drafted.load(Ordering::Relaxed),

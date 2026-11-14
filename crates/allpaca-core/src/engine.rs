@@ -1596,6 +1596,7 @@ impl Engine {
         inner.ring.resize_vocab(target.config.vocab_size);
         self.apply_weight_working_set(&mut target)?;
         self.apply_route_tail(&mut target);
+        self.apply_lsa(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1627,6 +1628,7 @@ impl Engine {
         inner.ring.resize_vocab(vocab);
         self.apply_weight_working_set(&mut target)?;
         self.apply_route_tail(&mut target);
+        self.apply_lsa(&mut target)?;
         self.apply_expert_lru(&mut target)?;
         self.attach_rpc(&mut target, None)?;
         inner.target = Some(Arc::new(target));
@@ -1766,6 +1768,66 @@ impl Engine {
             return Ok(());
         }
         model.working_set = Some(WeightWorkingSet::detach_unpinned(&mut model.layers, plan)?);
+        Ok(())
+    }
+
+    /// `experimental.lsa`: read the model's index maps and switch its
+    /// full-attention layers to latent sparse attention. The option is
+    /// refused where the selection could not be kept the same for every
+    /// path a row can take: off the local HIP forward (CPU, CUDA, Vulkan,
+    /// RPC workers), without a partial rotation, or without a map.
+    fn apply_lsa(&self, model: &mut TinyModel) -> Result<(), AllpacaError> {
+        let x = &self.config.experimental;
+        if !x.lsa {
+            return Ok(());
+        }
+        let refuse = |why: String| {
+            Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "experimental.lsa: {why}"
+            ))))
+        };
+        let Some(path) = x.lsa_map.as_deref() else {
+            return refuse("set experimental.lsa_map to the model's index maps (safetensors)".into());
+        };
+        if self.config.engine.cpu_only || !self.config.rpc.endpoints.is_empty() {
+            return refuse("runs on the local HIP forward only (no cpu_only, no rpc.endpoints)".into());
+        }
+        let cfg = &model.config;
+        let head_dim = cfg.head_dim();
+        let layers: Vec<usize> = crate::model::kv_layer_mask(model)
+            .iter()
+            .enumerate()
+            .filter(|(layer, keeps)| **keeps && !(cfg.layer_is_swa(*layer) && cfg.sliding_window > 0))
+            .map(|(layer, _)| layer)
+            .collect();
+        let rotated: Vec<usize> = layers
+            .iter()
+            .map(|layer| cfg.neox_rot_dims(*layer, head_dim).unwrap_or(head_dim))
+            .collect();
+        let Some(&n_rot) = rotated.first() else {
+            return refuse("the model has no full-attention layer to index".into());
+        };
+        if cfg.rope_none || rotated.iter().any(|r| *r != n_rot) || n_rot >= head_dim {
+            return refuse(format!(
+                "needs heads with the same rotated prefix and position-free dims past it \
+                 ({n_rot} of {head_dim} dims rotate)"
+            ));
+        }
+        let geo = crate::lsa::LsaGeometry {
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim,
+            n_rot,
+        };
+        let lsa = crate::lsa::LsaModel::load(path, x.lsa_top_k as usize, geo, &layers, cfg.n_layers)?;
+        tracing::warn!(
+            map = %path.display(),
+            layers = layers.len(),
+            top_k = lsa.shape.top_k,
+            reads_at_most = lsa.shape.max_keys(),
+            "experimental.lsa: full-attention layers read a selection of their keys past the budget"
+        );
+        model.lsa = Some(Arc::new(lsa));
         Ok(())
     }
 
@@ -2017,6 +2079,7 @@ impl Engine {
         model.name = loaded.tier.name().into();
         self.apply_weight_working_set(&mut model)?;
         self.apply_route_tail(&mut model);
+        self.apply_lsa(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer =
@@ -2048,6 +2111,7 @@ impl Engine {
         let mut model = TinyModel::from_safetensors(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_route_tail(&mut model);
+        self.apply_lsa(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2079,6 +2143,7 @@ impl Engine {
         let mut model = TinyModel::from_onnx(&file, &hf)?;
         self.apply_weight_working_set(&mut model)?;
         self.apply_route_tail(&mut model);
+        self.apply_lsa(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         self.attach_rpc(&mut model, None)?;
         let tokenizer = EngineTokenizer::from_sidecar(vocab)?;
@@ -2124,6 +2189,7 @@ impl Engine {
         let skip_hip = model.dsv4.is_some() || model.q4x.is_some() || model.g4.is_some();
         self.apply_weight_working_set(&mut model)?;
         self.apply_route_tail(&mut model);
+        self.apply_lsa(&mut model)?;
         self.apply_expert_lru(&mut model)?;
         let mut draft_file = None;
         let mut draft_reuses_target_gguf = false;
@@ -6238,10 +6304,16 @@ fn prompt_cache_settings(
     } else {
         "off".into()
     };
+    // Latent sparse attention changes every key cached past its budget.
+    let lsa = if x.lsa {
+        format!("k{}:{:?}", x.lsa_top_k, x.lsa_map)
+    } else {
+        "off".into()
+    };
     let (e, w, m) = (&config.engine, &config.weights, &config.model);
     Some(format!(
         "build={build}|workers={workers:?}|codec={:?}\
-         |experimental=row_variant:{},chunked_gdn:{},route_tail_skip:{tail_skip}\
+         |experimental=row_variant:{},chunked_gdn:{},route_tail_skip:{tail_skip},lsa:{lsa}\
          |device={:?},cpu_only:{},backend:{},vram_budget_mib:{:?}\
          |tensor_split={:?}|expert_homes={:?}|host_f32={},miss_policy={:?}\
          |edge0_no_lora={},edge0_no_prerouter={}|draft={:?}|plan={plan}",

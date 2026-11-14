@@ -113,6 +113,10 @@ pub struct KvTierManager {
     clock: u64,
     hot_fraction: f32,
     vram_capacity: usize,
+    /// Latent sparse attention index of a sequence's layer, keyed by the
+    /// layer's first page (`experimental.lsa`). Derived from the cached
+    /// keys: dropped with the page, rebuilt from the pages when missing.
+    lsa: HashMap<PageId, crate::lsa::LsaIndex>,
 }
 
 impl KvTierManager {
@@ -165,7 +169,146 @@ impl KvTierManager {
             clock: 1,
             hot_fraction,
             vram_capacity: (vram_bytes / 4).max(1),
+            lsa: HashMap::new(),
         }
+    }
+
+    /// Take the LSA index kept under `first_page` (a sequence layer's first
+    /// page), if any. Hand it back with [`Self::lsa_put`].
+    pub(crate) fn lsa_take(&mut self, first_page: PageId) -> Option<crate::lsa::LsaIndex> {
+        self.lsa.remove(&first_page)
+    }
+
+    pub(crate) fn lsa_put(&mut self, first_page: PageId, index: crate::lsa::LsaIndex) {
+        if self.pages.contains_key(&first_page) {
+            self.lsa.insert(first_page, index);
+        }
+    }
+
+    /// LSA indexes held (one per sequence layer that went sparse).
+    pub fn lsa_indexes(&self) -> usize {
+        self.lsa.len()
+    }
+
+    /// Key rows `first..first + n` of a sequence layer (`pages` in order),
+    /// read back to the host.
+    pub(crate) fn lsa_read_keys(
+        &self,
+        pages: &[PageId],
+        first: usize,
+        n: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>, AllpacaError> {
+        let mut out = Vec::with_capacity(n * n_kv_heads * head_dim);
+        let mut page_start = 0usize;
+        for id in pages {
+            let cap = self.pages.get(id).map_or(0, |p| p.capacity_tokens as usize);
+            let (lo, hi) = (first.max(page_start), (first + n).min(page_start + cap));
+            if lo < hi {
+                let (k, _) = self.read_kv_slot_range(
+                    *id,
+                    (lo - page_start) as u32,
+                    (hi - lo) as u32,
+                    n_kv_heads,
+                    head_dim,
+                    &self.activation_d2h_bytes,
+                )?;
+                out.extend_from_slice(&k);
+            }
+            page_start += cap;
+        }
+        if out.len() != n * n_kv_heads * head_dim {
+            return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                "lsa: keys {first}..{} are not all cached ({} floats read)",
+                first + n,
+                out.len()
+            ))));
+        }
+        Ok(out)
+    }
+
+    /// The device address of each page's key rows and the rows a page
+    /// holds, for a layer's `pages`. Every page must be resident on the HIP
+    /// device: a page in host memory is refused, because which pages are
+    /// there depends on memory pressure and what a row reads must not.
+    fn lsa_page_table(&self, pages: &[PageId]) -> Result<(Vec<u64>, usize), AllpacaError> {
+        let mut table = Vec::with_capacity(pages.len());
+        let mut page_rows = 0usize;
+        for id in pages {
+            let page = self.pages.get(id).ok_or_else(|| {
+                AllpacaError::Fatal(FatalError::OutOfMemory(format!("unknown KV page {id}")))
+            })?;
+            let cap = page.capacity_tokens as usize;
+            if page_rows == 0 {
+                page_rows = cap;
+            }
+            let alloc = self.hip_pages.get(id).filter(|_| {
+                page.location.kind == DeviceBufferKind::Hip && cap == page_rows && cap > 0
+            });
+            let Some(alloc) = alloc else {
+                return Err(AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                    "experimental.lsa needs every KV page of a layer on its GPU, and page {id} is {:?} (raise kv.vram_bytes, or lower the context)",
+                    page.location.kind
+                ))));
+            };
+            // SAFETY: the page's key rows start `offset` floats into its buffer.
+            table.push(unsafe { alloc.ptr.add(page.location.offset * 4) } as u64);
+        }
+        Ok((table, page_rows))
+    }
+
+    /// Gathers the key and value rows `keys` (positions in the sequence) of
+    /// a layer's `pages` into `dst_k` / `dst_v` on the card, in the order
+    /// given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lsa_gather_device(
+        &self,
+        hip: &allpaca_hip::HipWorkspace,
+        pages: &[PageId],
+        n_kv_heads: usize,
+        head_dim: usize,
+        keys: &[u32],
+        dst_k: *mut f32,
+        dst_v: *mut f32,
+    ) -> Result<(), AllpacaError> {
+        let kv_width = n_kv_heads * head_dim;
+        let (table, page_rows) = self.lsa_page_table(pages)?;
+        hip.gather_paged_kv(dst_k, dst_v, &table, page_rows * kv_width, keys, kv_width, page_rows)
+    }
+
+    /// Attention of the query rows at `q` (`q_stride` floats apart) that
+    /// each read their own keys `lists[row]` of a layer's `pages`, into
+    /// `out` (`out_stride` apart). A row's bits are those of
+    /// [`Self::lsa_gather_device`] and one attention over what it gathered.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lsa_attend_rows_device(
+        &self,
+        hip: &allpaca_hip::HipWorkspace,
+        pages: &[PageId],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        lists: &[&[u32]],
+        q: *const f32,
+        q_stride: usize,
+        out: *mut f32,
+        out_stride: usize,
+    ) -> Result<(), AllpacaError> {
+        let (table, page_rows) = self.lsa_page_table(pages)?;
+        hip.attention_indexed_device(
+            q,
+            q_stride,
+            out,
+            out_stride,
+            &table,
+            page_rows * n_kv_heads * head_dim,
+            page_rows,
+            lists,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )
     }
 
     /// Place later KV pages for `layer` on that HIP device.
@@ -384,6 +527,7 @@ impl KvTierManager {
             }
         }
         self.pages.remove(&id);
+        self.lsa.remove(&id);
         self.refresh_metrics(metrics);
     }
 

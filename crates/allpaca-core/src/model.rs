@@ -4926,6 +4926,9 @@ pub struct TinyModel {
     pub shexp_early: bool,
     /// Strata route-tail skip. Off by default; set from Engine config at load.
     pub(crate) route_tail: crate::route_tail::Policy,
+    /// Latent sparse attention (`experimental.lsa`). `None` unless the Engine
+    /// config turns it on at load.
+    pub(crate) lsa: Option<Arc<crate::lsa::LsaModel>>,
 }
 
 /// `ALLPACA_SHEXP_EARLY=1` queues a MoE layer's shared expert ahead of its
@@ -5141,6 +5144,7 @@ impl TinyModel {
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
             route_tail: Default::default(),
+            lsa: None,
         }
     }
 
@@ -7726,6 +7730,7 @@ impl TinyModel {
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
             route_tail: Default::default(),
+            lsa: None,
         };
         attach_dsv4(&mut model, file)?;
         Ok(model)
@@ -7892,6 +7897,7 @@ impl TinyModel {
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
             route_tail: Default::default(),
+            lsa: None,
         }
     }
 
@@ -8033,6 +8039,7 @@ impl TinyModel {
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
             route_tail: Default::default(),
+            lsa: None,
         })
     }
 
@@ -8153,6 +8160,7 @@ impl TinyModel {
             hosted_moe_compat: false,
             shexp_early: shexp_early_from_env(),
             route_tail: Default::default(),
+            lsa: None,
         })
     }
 
@@ -9932,6 +9940,46 @@ impl TinyModel {
         Ok(true)
     }
 
+    /// Under `experimental.lsa`: the keys each of `n_rows` rows of one
+    /// sequence reads in `layer_idx` (see [`crate::lsa::select_rows`]), or
+    /// `None` when the layer attends as usual (LSA off, a sliding-window
+    /// layer). `q` holds the rows' queries on the card, `q_stride` floats
+    /// apart; their keys are already in `pages`.
+    #[allow(clippy::too_many_arguments)]
+    fn lsa_rows(
+        &self,
+        layer_idx: usize,
+        kv: &mut KvTierManager,
+        pages: &[u64],
+        start_pos: usize,
+        n_rows: usize,
+        hip: &HipWorkspace,
+        q: *const f32,
+        q_stride: usize,
+        metrics: &Metrics,
+    ) -> Result<Option<Vec<Option<Vec<u32>>>>, AllpacaError> {
+        let Some(lsa) = self.lsa.as_deref() else {
+            return Ok(None);
+        };
+        if self.config.layer_is_swa(layer_idx) && self.config.sliding_window > 0 {
+            return Ok(None);
+        }
+        let rows = crate::lsa::select_rows(
+            lsa,
+            layer_idx,
+            kv,
+            pages,
+            start_pos,
+            n_rows,
+            q_stride,
+            // SAFETY: the caller's query buffer holds `n_rows` rows.
+            &|row, out| hip.copy_d2h_f32(unsafe { q.add(row * q_stride) }, out),
+        )?;
+        let sparse = rows.iter().flatten().count() as u64;
+        metrics.lsa_sparse_rows.fetch_add(sparse, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(rows))
+    }
+
     /// Sequential target decode with device-resident hidden state and KV.
     #[allow(clippy::too_many_arguments)]
     fn fuse_next_attn_norm(&self, layer_idx: usize, device: i32) -> bool {
@@ -10394,15 +10442,36 @@ impl TinyModel {
                 kv.write_slot_from_device(page_id, slot, n_kv_heads, head_dim, buf.k, buf.v, None)?;
                 kv.touch(page_id, 1.0);
 
-                let (packed_k, packed_v, n_kv) = kv.kv_device_views(
-                    &page_ids[layer_idx],
-                    n_kv_heads,
-                    head_dim,
-                    buf.packed_k,
-                    buf.packed_v,
-                    buf.max_kv,
-                )?;
-                if let Some(dump) = crate::lsa_dump::active() {
+                // experimental.lsa: past its budget the row reads the keys
+                // its index picks, gathered in position order. The kernels
+                // give a row the same bits for the same key sequence, so
+                // this row equals the one a prefill or verify batch computes.
+                let lsa_keys = self
+                    .lsa_rows(layer_idx, kv, &page_ids[layer_idx], pos, 1, hip, buf.q, attn_dim, metrics)?
+                    .and_then(|mut rows| rows.pop().flatten());
+                let (packed_k, packed_v, n_kv) = match lsa_keys.as_deref() {
+                    Some(keys) => {
+                        kv.lsa_gather_device(
+                            hip,
+                            &page_ids[layer_idx],
+                            n_kv_heads,
+                            head_dim,
+                            keys,
+                            buf.packed_k,
+                            buf.packed_v,
+                        )?;
+                        (buf.packed_k as *const f32, buf.packed_v as *const f32, keys.len())
+                    }
+                    None => kv.kv_device_views(
+                        &page_ids[layer_idx],
+                        n_kv_heads,
+                        head_dim,
+                        buf.packed_k,
+                        buf.packed_v,
+                        buf.max_kv,
+                    )?,
+                };
+                if let Some(dump) = crate::lsa_dump::active().filter(|_| lsa_keys.is_none()) {
                     dump.capture(
                         layer_idx,
                         pos,
@@ -11209,7 +11278,7 @@ impl TinyModel {
 
                 for (si, seg) in segs.iter().enumerate() {
                     let r0 = seg_row0[si];
-                    let (start_pos, n_tok, m) = (seg.start_pos, seg.n_rows, seg.n_rows as i32);
+                    let (start_pos, n_tok) = (seg.start_pos, seg.n_rows);
                     kv.write_slots_from_device(
                         &seg.page_ids[layer_idx],
                         start_pos,
@@ -11222,6 +11291,55 @@ impl TinyModel {
                         None,
                     )?;
 
+                    // experimental.lsa: the rows past the budget (a suffix,
+                    // positions ascend) each attend over their own keys, read
+                    // through the page table in one launch, with the bits a
+                    // decode step gets from the same keys gathered; the rows
+                    // before it take the batched attention below over the
+                    // keys up to them.
+                    let lsa_rows = self.lsa_rows(
+                        layer_idx,
+                        kv,
+                        &seg.page_ids[layer_idx],
+                        start_pos,
+                        n_tok,
+                        hip,
+                        buf.q_row(r0, q_stride),
+                        q_stride,
+                        metrics,
+                    )?;
+                    let dense = lsa_rows
+                        .as_ref()
+                        .map_or(n_tok, |rows| rows.iter().take_while(|r| r.is_none()).count());
+                    if dense < n_tok {
+                        let lists = lsa_rows
+                            .iter()
+                            .flatten()
+                            .skip(dense)
+                            .map(|keys| keys.as_deref())
+                            .collect::<Option<Vec<&[u32]>>>()
+                            .ok_or_else(|| {
+                                AllpacaError::Fatal(FatalError::InvalidConfig(format!(
+                                    "lsa: a row from {} on reads all its keys after one that does not",
+                                    start_pos + dense
+                                )))
+                            })?;
+                        kv.lsa_attend_rows_device(
+                            hip,
+                            &seg.page_ids[layer_idx],
+                            al.n_heads,
+                            al.n_kv_heads,
+                            al.head_dim,
+                            &lists,
+                            buf.q_row(r0 + dense, q_stride),
+                            q_stride,
+                            buf.attn_row(r0 + dense, al.attn_dim),
+                            al.attn_dim,
+                        )?;
+                    }
+                    if dense == 0 {
+                        continue;
+                    }
                     let (packed_k, packed_v, n_kv) = kv.kv_device_views(
                         &seg.page_ids[layer_idx],
                         al.n_kv_heads,
@@ -11230,7 +11348,10 @@ impl TinyModel {
                         buf.packed_v,
                         buf.max_kv,
                     )?;
-                    if let Some(dump) = crate::lsa_dump::active() {
+                    // The dense rows are the first `dense`: their keys end
+                    // where the sparse rows' begin.
+                    let (m, n_kv) = (dense as i32, n_kv - (n_tok - dense));
+                    if let Some(dump) = crate::lsa_dump::active().filter(|_| lsa_rows.is_none()) {
                         dump.capture(
                             layer_idx,
                             start_pos,

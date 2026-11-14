@@ -1166,6 +1166,34 @@ mod ffi {
             row_len: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn allpaca_attention_indexed(
+            q: *const f32,
+            pages: *const u64,
+            lists: *const i32,
+            counts: *const i32,
+            out: *mut f32,
+            n_rows: i32,
+            n_heads: i32,
+            n_kv_heads: i32,
+            head_dim: i32,
+            q_stride: i32,
+            out_stride: i32,
+            list_stride: i32,
+            page_rows: i32,
+            v_off: u64,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn allpaca_gather_paged_kv(
+            dst_k: *mut f32,
+            dst_v: *mut f32,
+            pages: *const u64,
+            rows: *const i32,
+            n: i32,
+            row_len: i32,
+            page_rows: i32,
+            v_off: u64,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn allpaca_qsa_pool(
             raw: *const f32,
             gain: *const f32,
@@ -7605,6 +7633,8 @@ pub struct HipWorkspace {
     pinned: Mutex<PinnedLogits>,
     decode: Mutex<Option<DecodeAlloc>>,
     dequant: Mutex<Option<DequantAlloc>>,
+    /// Page table and row numbers of the last [`Self::gather_paged_kv`].
+    gather_meta: Mutex<Option<DequantAlloc>>,
     gdn: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     gdn_snap: Mutex<std::collections::HashMap<(u64, usize), GdnLayerResident>>,
     /// Requests whose `gdn_snap` slots hold a live clone. Dropping a clone only
@@ -7660,6 +7690,7 @@ impl HipWorkspace {
             }),
             decode: Mutex::new(None),
             dequant: Mutex::new(None),
+            gather_meta: Mutex::new(None),
             gdn: Mutex::new(std::collections::HashMap::new()),
             gdn_snap: Mutex::new(std::collections::HashMap::new()),
             gdn_clone_live: Mutex::new(std::collections::HashSet::new()),
@@ -14126,6 +14157,193 @@ impl HipWorkspace {
         }
     }
 
+    /// Attention of `lists.len()` query rows that each read their own list
+    /// of key positions out of a paged KV (see [`Self::gather_paged_kv`] for
+    /// `pages`, `v_off` and `page_rows`). Row `y` is the query at
+    /// `q + y * q_stride`, reads `lists[y]` in the order given and writes
+    /// `out + y * out_stride`. A row equals [`Self::attention_device`] of
+    /// that query over the same keys gathered side by side.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_indexed_device(
+        &self,
+        q: *const f32,
+        q_stride: usize,
+        out: *mut f32,
+        out_stride: usize,
+        pages: &[u64],
+        v_off: usize,
+        page_rows: usize,
+        lists: &[&[u32]],
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), AllpacaError> {
+        let stride = lists.iter().map(|l| l.len()).max().unwrap_or(0);
+        let last = lists.iter().flat_map(|l| l.iter().copied()).max().unwrap_or(0) as usize;
+        if q.is_null()
+            || out.is_null()
+            || stride == 0
+            || lists.iter().any(|l| l.is_empty())
+            || page_rows == 0
+            || last / page_rows >= pages.len()
+            || last > i32::MAX as usize
+            || attn_dpt(head_dim as i32) == 0
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid attention_indexed".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            // One upload: the lists (a row each), the counts, the page table.
+            let rows = lists.len();
+            let counts_at = rows * stride * 4;
+            let table_at = (counts_at + rows * 4).next_multiple_of(8);
+            let need = table_at + pages.len() * 8;
+            let mut host = vec![0u8; need];
+            for (y, list) in lists.iter().enumerate() {
+                // SAFETY: row `y` of the lists and its count lie inside `host`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        list.as_ptr().cast::<u8>(),
+                        host.as_mut_ptr().add(y * stride * 4),
+                        list.len() * 4,
+                    );
+                }
+                host[counts_at + y * 4..counts_at + y * 4 + 4].copy_from_slice(&(list.len() as i32).to_ne_bytes());
+            }
+            // SAFETY: the table lies inside `host`, after the counts.
+            unsafe {
+                std::ptr::copy_nonoverlapping(pages.as_ptr().cast::<u8>(), host.as_mut_ptr().add(table_at), pages.len() * 8);
+            }
+            let mut meta = self.gather_meta.lock().unwrap_or_else(|e| e.into_inner());
+            if meta.as_ref().is_none_or(|m| m.bytes < need) {
+                if let Some(old) = meta.take() {
+                    // Launches that read the old buffer must finish first.
+                    device_synchronize()?;
+                    device_free(old.ptr, old.bytes);
+                }
+                let bytes = need.next_power_of_two().max(1 << 16);
+                *meta = Some(DequantAlloc { ptr: device_malloc(bytes, self.device)?, bytes, n_floats: 0 });
+            }
+            let dev = meta.as_ref().map(|m| m.ptr).unwrap_or(std::ptr::null_mut());
+            memcpy(dev, host.as_ptr(), need, MEMCPY_H2D)?;
+            self.add_h2d(need);
+            self.timed_gpu(DecodeOp::Attention, || {
+                let rc = unsafe {
+                    ffi::allpaca_attention_indexed(
+                        q,
+                        dev.add(table_at).cast(),
+                        dev.cast(),
+                        dev.add(counts_at).cast(),
+                        out,
+                        rows as i32,
+                        n_heads as i32,
+                        n_kv_heads as i32,
+                        head_dim as i32,
+                        q_stride as i32,
+                        out_stride as i32,
+                        stride as i32,
+                        page_rows as i32,
+                        v_off as u64,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "attention_indexed")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = (q_stride, out_stride, v_off, n_heads, n_kv_heads);
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP attention_indexed unavailable".into(),
+            )))
+        }
+    }
+
+    /// Gathers the key and value rows `rows` of a paged KV into `dst_k` and
+    /// `dst_v` (`rows.len()` rows of `row_len` floats each, in the order
+    /// given). Row `r` sits in page `r / page_rows` at slot `r % page_rows`;
+    /// `pages[p]` is the device address of page `p`'s key rows and its value
+    /// rows start `v_off` floats past it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_paged_kv(
+        &self,
+        dst_k: *mut f32,
+        dst_v: *mut f32,
+        pages: &[u64],
+        v_off: usize,
+        rows: &[u32],
+        row_len: usize,
+        page_rows: usize,
+    ) -> Result<(), AllpacaError> {
+        let last = rows.iter().copied().max().unwrap_or(0) as usize;
+        if dst_k.is_null()
+            || dst_v.is_null()
+            || rows.is_empty()
+            || row_len == 0
+            || page_rows == 0
+            || last / page_rows >= pages.len()
+            || rows.len() > i32::MAX as usize
+            || last > i32::MAX as usize
+        {
+            return Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "invalid gather_paged_kv".into(),
+            )));
+        }
+        self.bind()?;
+        #[cfg(all(feature = "hip", allpaca_hip_runtime))]
+        {
+            // One upload: the row numbers, then the page table.
+            let rows_bytes = rows.len() * 4;
+            let table_at = rows_bytes.next_multiple_of(8);
+            let need = table_at + pages.len() * 8;
+            let mut host = vec![0u8; need];
+            // SAFETY: `host` holds `rows_bytes` then, 8-aligned, the table.
+            unsafe {
+                std::ptr::copy_nonoverlapping(rows.as_ptr().cast::<u8>(), host.as_mut_ptr(), rows_bytes);
+                std::ptr::copy_nonoverlapping(pages.as_ptr().cast::<u8>(), host.as_mut_ptr().add(table_at), pages.len() * 8);
+            }
+            let mut meta = self.gather_meta.lock().unwrap_or_else(|e| e.into_inner());
+            if meta.as_ref().is_none_or(|m| m.bytes < need) {
+                if let Some(old) = meta.take() {
+                    // Launches that read the old buffer must finish first.
+                    device_synchronize()?;
+                    device_free(old.ptr, old.bytes);
+                }
+                let bytes = need.next_power_of_two().max(1 << 16);
+                *meta = Some(DequantAlloc { ptr: device_malloc(bytes, self.device)?, bytes, n_floats: 0 });
+            }
+            let dev = meta.as_ref().map(|m| m.ptr).unwrap_or(std::ptr::null_mut());
+            memcpy(dev, host.as_ptr(), need, MEMCPY_H2D)?;
+            self.add_h2d(need);
+            self.timed_gpu(DecodeOp::OtherGpu, || {
+                let rc = unsafe {
+                    ffi::allpaca_gather_paged_kv(
+                        dst_k,
+                        dst_v,
+                        dev.add(table_at).cast(),
+                        dev.cast(),
+                        rows.len() as i32,
+                        row_len as i32,
+                        page_rows as i32,
+                        v_off as u64,
+                        std::ptr::null_mut(),
+                    )
+                };
+                status(rc, "gather_paged_kv")
+            })
+        }
+        #[cfg(not(all(feature = "hip", allpaca_hip_runtime)))]
+        {
+            let _ = v_off;
+            Err(AllpacaError::Degraded(DegradedError::FeatureDisabled(
+                "HIP gather_paged_kv unavailable".into(),
+            )))
+        }
+    }
+
     /// QSA indexer: pools `first..first + n` of `dims.ratio` raw keys each
     /// (`raw`, `dims.dim` floats per token), the mean normed with `gain` and
     /// rotated to the pool's first position, into `pooled` (a row per pool).
@@ -14554,6 +14772,11 @@ impl Drop for HipWorkspace {
                 device_free(d.ptr, d.bytes);
             }
         }
+        if let Ok(mut g) = self.gather_meta.lock() {
+            if let Some(d) = g.take() {
+                device_free(d.ptr, d.bytes);
+            }
+        }
         if let Ok(mut g) = self.moe.lock() {
             if let Some(stage) = g.take() {
                 free_moe_stage(stage);
@@ -14565,6 +14788,154 @@ impl Drop for HipWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three pages of 4 rows, keys then values in each page's buffer, pages
+    /// uploaded out of order: the gathered rows are the host's, in the order
+    /// asked for, and a second call with a longer list reuses the workspace.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn paged_kv_rows_are_gathered_in_the_order_given() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 16).unwrap();
+        let (row_len, page_rows, n_pages) = (24usize, 4usize, 3usize);
+        let key = |row: usize, e: usize| (row * 100 + e) as f32;
+        let value = |row: usize, e: usize| -((row * 100 + e) as f32) - 0.5;
+        // Page p holds rows p * 4 .. p * 4 + 4: keys first, then values.
+        let host: Vec<Vec<f32>> = (0..n_pages)
+            .map(|p| {
+                let rows = p * page_rows..(p + 1) * page_rows;
+                let keys = rows.clone().flat_map(|r| (0..row_len).map(move |e| key(r, e)));
+                keys.chain(rows.flat_map(|r| (0..row_len).map(move |e| value(r, e)))).collect()
+            })
+            .collect();
+        let dev: Vec<DeviceWeights> =
+            [2usize, 0, 1].iter().map(|&p| DeviceWeights::upload(0, &[&host[p]]).unwrap()).collect();
+        let mut pages = vec![0u64; n_pages];
+        for (slot, &p) in [2usize, 0, 1].iter().enumerate() {
+            pages[p] = dev[slot].ptr_at(0) as u64;
+        }
+        let v_off = page_rows * row_len;
+        for rows in [vec![5u32, 0, 11], vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 3, 3]] {
+            let n = rows.len() * row_len;
+            let dst = DeviceWeights::alloc(0, 2 * n * 4).unwrap();
+            let (dst_k, dst_v) = (dst.ptr_at(0).cast_mut(), unsafe { dst.ptr_at(0).add(n) }.cast_mut());
+            ws.gather_paged_kv(dst_k, dst_v, &pages, v_off, &rows, row_len, page_rows).unwrap();
+            let (mut k, mut v) = (vec![0.0f32; n], vec![0.0f32; n]);
+            ws.copy_d2h_f32(dst_k, &mut k).unwrap();
+            ws.copy_d2h_f32(dst_v, &mut v).unwrap();
+            for (i, &row) in rows.iter().enumerate() {
+                for e in 0..row_len {
+                    assert_eq!(k[i * row_len + e], key(row as usize, e), "key row {row} at {i}, float {e}");
+                    assert_eq!(v[i * row_len + e], value(row as usize, e), "value row {row} at {i}, float {e}");
+                }
+            }
+        }
+        // A row past the last page is refused before anything is launched.
+        let dst = DeviceWeights::alloc(0, 2 * row_len * 4).unwrap();
+        let err = ws
+            .gather_paged_kv(dst.ptr_at(0).cast_mut(), dst.ptr_at(0).cast_mut(), &pages, v_off, &[12], row_len, page_rows)
+            .expect_err("row 12 is in no page");
+        assert!(err.to_string().contains("gather_paged_kv"), "{err}");
+    }
+
+    /// Rows that each read their own keys out of a paged KV, in one launch,
+    /// against the same keys gathered and attended one row at a time (what a
+    /// decode step does): the bits must match for every list length around
+    /// the key tile (16), the chunk (128) and several chunks, at each head
+    /// width bucket.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn indexed_attention_rows_equal_gathered_rows_bit_for_bit() {
+        if device_count() == 0 {
+            return;
+        }
+        let ws = HipWorkspace::new(0, 1 << 20, 16).unwrap();
+        let (n_heads, n_kv_heads, page_rows, n_keys) = (6usize, 2usize, 128usize, 700usize);
+        let wave = |i: usize, seed: f32| ((i as f32 * 0.37 + seed).sin() * 1.3 + (i as f32 * 0.011 + seed).cos()) * 0.6;
+        for head_dim in [64usize, 128, 256] {
+            let kv_width = n_kv_heads * head_dim;
+            let q_dim = n_heads * head_dim;
+            let n_pages = n_keys.div_ceil(page_rows);
+            // Page p: its key rows, then its value rows.
+            let host: Vec<Vec<f32>> = (0..n_pages)
+                .map(|p| {
+                    let base = p * page_rows * kv_width;
+                    let keys = (0..page_rows * kv_width).map(|i| wave(base + i, 0.2));
+                    keys.chain((0..page_rows * kv_width).map(|i| wave(base + i, 1.9))).collect()
+                })
+                .collect();
+            let dev: Vec<DeviceWeights> = host.iter().map(|h| DeviceWeights::upload(0, &[h]).unwrap()).collect();
+            let pages: Vec<u64> = dev.iter().map(|d| d.ptr_at(0) as u64).collect();
+            let v_off = page_rows * kv_width;
+            // Ascending subsets of the keys, of these lengths.
+            let lists: Vec<Vec<u32>> = [1usize, 15, 16, 17, 37, 128, 129, 300, 513, 700]
+                .iter()
+                .enumerate()
+                .map(|(y, &len)| {
+                    let mut picked: Vec<u32> = (0..n_keys as u32).collect();
+                    // Drop keys by a fixed stride walk until `len` are left.
+                    let mut at = y * 7 + 3;
+                    while picked.len() > len {
+                        at = (at * 31 + 11) % picked.len();
+                        picked.remove(at);
+                    }
+                    picked
+                })
+                .collect();
+            let rows = lists.len();
+            let q: Vec<f32> = (0..rows * q_dim).map(|i| wave(i, 4.4) * 0.5).collect();
+            let q_d = DeviceWeights::upload(0, &[&q]).unwrap();
+            let out_d = DeviceWeights::alloc(0, rows * q_dim * 4).unwrap();
+            let refs: Vec<&[u32]> = lists.iter().map(Vec::as_slice).collect();
+            ws.attention_indexed_device(
+                q_d.ptr_at(0),
+                q_dim,
+                out_d.ptr_at(0).cast_mut(),
+                q_dim,
+                &pages,
+                v_off,
+                page_rows,
+                &refs,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            )
+            .unwrap();
+            let mut indexed = vec![0.0f32; rows * q_dim];
+            ws.copy_d2h_f32(out_d.ptr_at(0), &mut indexed).unwrap();
+
+            let packed = DeviceWeights::alloc(0, 2 * n_keys * kv_width * 4).unwrap();
+            let (pk, pv) = (packed.ptr_at(0).cast_mut(), unsafe { packed.ptr_at(0).add(n_keys * kv_width) }.cast_mut());
+            let one = DeviceWeights::alloc(0, q_dim * 4).unwrap();
+            for (y, list) in lists.iter().enumerate() {
+                ws.gather_paged_kv(pk, pv, &pages, v_off, list, kv_width, page_rows).unwrap();
+                ws.attention_device(
+                    unsafe { q_d.ptr_at(0).add(y * q_dim) },
+                    pk,
+                    pv,
+                    one.ptr_at(0).cast_mut(),
+                    1,
+                    list.len() as i32,
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    head_dim as i32,
+                    true,
+                )
+                .unwrap();
+                let mut gathered = vec![0.0f32; q_dim];
+                ws.copy_d2h_f32(one.ptr_at(0), &mut gathered).unwrap();
+                assert!(gathered.iter().any(|v| *v != 0.0), "row {y} at head_dim {head_dim} attended nothing");
+                let differ = gathered
+                    .iter()
+                    .zip(&indexed[y * q_dim..(y + 1) * q_dim])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(differ, 0, "{} keys at head_dim {head_dim}: {differ} of {q_dim} floats differ", list.len());
+            }
+        }
+    }
 
     /// Q4_K bytes with sane super-block scales, for the int8 GEMV path.
     fn q4_k_weights(n: usize, k: usize, seed: usize) -> Vec<u8> {
