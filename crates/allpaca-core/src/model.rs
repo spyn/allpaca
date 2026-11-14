@@ -10402,6 +10402,20 @@ impl TinyModel {
                     buf.packed_v,
                     buf.max_kv,
                 )?;
+                if let Some(dump) = crate::lsa_dump::active() {
+                    dump.capture(
+                        layer_idx,
+                        pos,
+                        1,
+                        n_kv,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        &|_, out| hip.copy_d2h_f32(buf.q, out),
+                        &|first, out| hip.copy_d2h_f32(unsafe { packed_k.add(first * kv_dim) }, out),
+                        &|first, out| hip.copy_d2h_f32(unsafe { packed_v.add(first * kv_dim) }, out),
+                    )?;
+                }
                 if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
                     let mut mask = vec![1u8; n_kv];
                     let start = n_kv.saturating_sub(cfg.sliding_window);
@@ -11216,6 +11230,20 @@ impl TinyModel {
                         buf.packed_v,
                         buf.max_kv,
                     )?;
+                    if let Some(dump) = crate::lsa_dump::active() {
+                        dump.capture(
+                            layer_idx,
+                            start_pos,
+                            n_tok,
+                            n_kv,
+                            al.n_heads,
+                            al.n_kv_heads,
+                            al.head_dim,
+                            &|row, out| hip.copy_d2h_f32(buf.q_row(r0 + row, q_stride), out),
+                            &|first, out| hip.copy_d2h_f32(unsafe { packed_k.add(first * al.kv_dim) }, out),
+                            &|first, out| hip.copy_d2h_f32(unsafe { packed_v.add(first * al.kv_dim) }, out),
+                        )?;
+                    }
                     if cfg.layer_is_swa(layer_idx) && cfg.sliding_window > 0 {
                         let mut mask = vec![0u8; n_tok.saturating_mul(n_kv)];
                         for t in 0..n_tok {

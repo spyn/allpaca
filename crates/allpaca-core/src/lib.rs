@@ -37,6 +37,8 @@ mod kv_radix;
 mod kv_tier;
 mod layer_split;
 mod logits_ring;
+pub mod lsa;
+mod lsa_dump;
 mod memory_tier;
 mod micro_batch;
 mod modality;
