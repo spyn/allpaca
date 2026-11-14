@@ -83,6 +83,11 @@ pub struct StatsSnapshot {
     pub tree_gpu_verifies: u64,
     /// Linear draft-span verifies that ran one Target Model forward over the proposed tokens.
     pub linear_packed_verifies: u64,
+    /// Attention rows (one per layer and token) that read a selection of
+    /// their keys under `experimental.lsa`. 0 with the option off, and while
+    /// every context is under the budget.
+    #[serde(default)]
+    pub lsa_sparse_rows: u64,
     /// Next-span Draft Model proposes that were reused after overlapping packed verify.
     #[serde(default)]
     pub draft_ahead_hits: u64,

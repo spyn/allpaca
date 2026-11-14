@@ -591,6 +591,17 @@ pub struct ExperimentalSection {
     pub route_tail_skip_rank: u32,
     pub row_variant_kernels: bool,
     pub chunked_gdn: bool,
+    /// Latent sparse attention (LSA, flat search): past `4 + lsa_top_k + 512`
+    /// keys a full-attention layer reads only the sink, the window and the
+    /// `lsa_top_k` keys its index picks. Lossy. Needs `lsa_map`. See the
+    /// `[experimental]` section of `allpaca.example.toml`.
+    pub lsa: bool,
+    /// Long-range keys a query reads (the paper's k). A multiple of 4, at
+    /// least 4; the index picks `lsa_top_k / 4` buckets.
+    pub lsa_top_k: u32,
+    /// The model's index maps (safetensors, `<layer>.W_Q_idx` and
+    /// `<layer>.W_K_idx` per full-attention layer).
+    pub lsa_map: Option<PathBuf>,
 }
 
 impl Default for ExperimentalSection {
@@ -601,6 +612,9 @@ impl Default for ExperimentalSection {
             route_tail_skip_rank: 7,
             row_variant_kernels: false,
             chunked_gdn: false,
+            lsa: false,
+            lsa_top_k: 4096,
+            lsa_map: None,
         }
     }
 }
@@ -621,13 +635,16 @@ impl ExperimentalSection {
         if self.chunked_gdn {
             out.push("chunked_gdn");
         }
+        if self.lsa {
+            out.push("lsa");
+        }
         out
     }
 
     /// Exactness of a run with these options at `temperature`. Lossy wins over
     /// distribution-exact; rejection sampling keeps greedy decoding exact.
     pub fn exactness(&self, temperature: f32) -> ExactnessLevel {
-        if self.route_tail_skip || self.row_variant_kernels || self.chunked_gdn {
+        if self.route_tail_skip || self.row_variant_kernels || self.chunked_gdn || self.lsa {
             ExactnessLevel::Lossy
         } else if self.rejection_sampling && temperature > 0.0 {
             ExactnessLevel::DistributionExact
@@ -1103,6 +1120,9 @@ mod tests {
         assert_eq!(defaults.experimental.route_tail_skip_rank, 7);
         assert!(!defaults.experimental.row_variant_kernels);
         assert!(!defaults.experimental.chunked_gdn);
+        assert!(!defaults.experimental.lsa);
+        assert_eq!(defaults.experimental.lsa_top_k, 4096);
+        assert_eq!(defaults.experimental.lsa_map, None);
         assert_eq!(defaults.exactness(), ExactnessLevel::Exact);
         assert!(defaults.experimental.enabled_names().is_empty());
 
@@ -1134,6 +1154,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dist.exactness(), ExactnessLevel::DistributionExact);
+    }
+
+    #[test]
+    fn lsa_is_lossy_and_named_when_on() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [sampling]
+            temperature = 0.0
+            [experimental]
+            lsa = true
+            lsa_top_k = 2048
+            lsa_map = "maps/qwen38.safetensors"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.experimental.lsa_top_k, 2048);
+        assert_eq!(cfg.experimental.lsa_map.as_deref(), Some(Path::new("maps/qwen38.safetensors")));
+        assert_eq!(cfg.exactness(), ExactnessLevel::Lossy);
+        assert_eq!(cfg.experimental.enabled_names(), ["lsa"]);
     }
 
     #[test]

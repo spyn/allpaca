@@ -73,6 +73,7 @@ pub fn sample(
     rng: &mut StdRng,
 ) -> u32 {
     trace_top2(logits);
+    dump_logits(logits);
     let (candidates, draws) = softmax_inner(logits, mask, params);
     if !draws {
         return candidates.first().map(|(id, _)| *id).unwrap_or(0);
@@ -98,6 +99,31 @@ fn trace_top2(logits: &[f32]) {
         }
     }
     eprintln!("logit_trace {} {:.6} {} {:.6}", a.0, a.1, b.0, b.1);
+}
+
+/// `ALLPACA_LOGITS_DUMP=<file>`: append the logits of every sampled step to
+/// the file as little-endian f32 (a vocabulary per step), to compare two
+/// runs' distributions over the same tokens (KL of an experimental option
+/// against the exact run). Off by default.
+fn dump_logits(logits: &[f32]) {
+    use std::io::Write;
+    static FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let file = FILE.get_or_init(|| {
+        let path = std::env::var_os("ALLPACA_LOGITS_DUMP")?;
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(std::sync::Mutex::new(file)),
+            Err(e) => {
+                tracing::warn!("ALLPACA_LOGITS_DUMP: cannot open {}: {e}", std::path::Path::new(&path).display());
+                None
+            }
+        }
+    });
+    if let Some(file) = file {
+        let bytes: Vec<u8> = logits.iter().flat_map(|l| l.to_le_bytes()).collect();
+        if let Err(e) = file.lock().unwrap_or_else(|e| e.into_inner()).write_all(&bytes) {
+            tracing::warn!("ALLPACA_LOGITS_DUMP: {e}");
+        }
+    }
 }
 
 /// Draw the next token. When `q` is a non-empty draft distribution and

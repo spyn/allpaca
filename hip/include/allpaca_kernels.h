@@ -439,6 +439,26 @@ int allpaca_deinterleave_q_gate(const float *q_full, float *q, float *gate, int3
 int allpaca_gather_rows(float *dst, const float *src, const int32_t *rows, int32_t n,
                         int32_t row_len, allpaca_stream_t stream);
 
+/* dst_k[i, :] and dst_v[i, :] = key and value row rows[i] of a paged KV, for
+ * n rows of row_len floats: the row sits in page rows[i] / page_rows at slot
+ * rows[i] % page_rows; pages[page] is the address of that page's key rows
+ * and its value rows start v_off floats past it. pages and rows are device
+ * buffers. */
+int allpaca_gather_paged_kv(float *dst_k, float *dst_v, const uint64_t *pages, const int32_t *rows, int32_t n,
+                            int32_t row_len, int32_t page_rows, uint64_t v_off, allpaca_stream_t stream);
+
+/* Attention of n_rows queries that each read their own list of keys out of a
+ * paged KV (see allpaca_gather_paged_kv for the paging): row y is the query
+ * q[y * q_stride], reads the key positions lists[y * list_stride + t] for
+ * t < counts[y] in that order, and writes out[y * out_stride]. A row equals
+ * allpaca_attention of that query over the same keys gathered side by side.
+ * pages, lists and counts are device buffers. ALLPACA_ERR_INVALID for a
+ * head_dim past the tiled kernels (allpaca_attn_dpt == 0). */
+int allpaca_attention_indexed(const float *q, const uint64_t *pages, const int32_t *lists, const int32_t *counts,
+                              float *out, int32_t n_rows, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim,
+                              int32_t q_stride, int32_t out_stride, int32_t list_stride, int32_t page_rows,
+                              uint64_t v_off, allpaca_stream_t stream);
+
 /* QSA indexer: pools [first, first + n) of `ratio` raw keys each (dim
  * floats per key), their mean normed with `gain` and rotated to the pool's
  * first position, into pooled[pool * dim]. */

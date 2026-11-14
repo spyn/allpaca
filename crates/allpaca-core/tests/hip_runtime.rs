@@ -1728,6 +1728,13 @@ fn write_packed_f16_gguf_with_rope_dims(path: &std::path::Path, rope_dims: u32) 
 /// and 40 words so a prompt gives a wide prefill.
 #[cfg(feature = "hip")]
 fn write_varied_f16_llama(path: &std::path::Path) {
+    write_varied_f16_llama_rope(path, 0);
+}
+
+/// [`write_varied_f16_llama`] whose heads rotate only their first
+/// `rope_dims` dims (0: every dim, as the file without the key).
+#[cfg(feature = "hip")]
+fn write_varied_f16_llama_rope(path: &std::path::Path, rope_dims: u32) {
     use allpaca_gguf::{write_gguf_quant, GgufValue, GgufWriteQuantTensor, GgufWriteTensor};
     use std::collections::HashMap;
 
@@ -1750,6 +1757,9 @@ fn write_varied_f16_llama(path: &std::path::Path) {
     meta.insert("llama.attention.head_count".into(), GgufValue::Uint32(n_heads as u32));
     meta.insert("llama.attention.head_count_kv".into(), GgufValue::Uint32(n_kv_heads as u32));
     meta.insert("llama.feed_forward_length".into(), GgufValue::Uint32(ff as u32));
+    if rope_dims > 0 {
+        meta.insert("llama.rope.dimension_count".into(), GgufValue::Uint32(rope_dims));
+    }
     meta.insert("tokenizer.ggml.model".into(), GgufValue::String("wordlevel".into()));
     let mut tokens = vec![
         GgufValue::String("<unk>".into()),
@@ -8939,4 +8949,255 @@ fn hip_new_gguf_types_match_cpu_greedy() {
         assert!(stats.gpu_forwards > 0, "{ty:?} must run on the GPU; stats={stats:?}");
         assert_eq!(hip_ids, cpu_ids, "{ty:?}: HIP greedy tokens must equal CPU");
     }
+}
+
+/// Latent sparse attention tests (`experimental.lsa`): the two-layer varied
+/// llama with a 16-dim rotated prefix (head_dim 64, so 48 position-free dims
+/// a key head) and random index maps of 8 dims. With a budget of 4 long-range
+/// keys a row is sparse past 4 + 4 + 512 = 520 keys.
+#[cfg(feature = "hip")]
+fn lsa_test_dir(tag: &str) -> std::path::PathBuf {
+    // Two folders below temp, as the WMMA tests (sidecar discovery).
+    let dir = std::env::temp_dir()
+        .join(format!("allpaca_lsa_{tag}_{}", std::process::id()))
+        .join("model");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(feature = "hip")]
+fn lsa_engine_config(dir: &std::path::Path, lsa: bool) -> Config {
+    use allpaca_safetensors::{write_safetensors, SafetensorsDtype, SafetensorsWriteTensor};
+    let target = dir.join("lsa_target.gguf");
+    let map = dir.join("lsa_map.safetensors");
+    if !target.exists() {
+        write_varied_f16_llama_rope(&target, 16);
+        let (key_dim, index_dim) = (48usize, 8usize);
+        let mut seed = 0x15a_u64;
+        let mut values = || -> Vec<f32> {
+            (0..key_dim * index_dim)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+                })
+                .collect()
+        };
+        let data: Vec<(String, Vec<f32>)> = (0..2)
+            .flat_map(|layer| [format!("{layer}.W_Q_idx"), format!("{layer}.W_K_idx")])
+            .map(|name| (name, values()))
+            .collect();
+        let tensors: Vec<SafetensorsWriteTensor> = data
+            .iter()
+            .map(|(name, data)| SafetensorsWriteTensor {
+                name: name.clone(),
+                dims: vec![key_dim as u64, index_dim as u64],
+                dtype: SafetensorsDtype::F32,
+                data,
+            })
+            .collect();
+        write_safetensors(&map, &tensors).unwrap();
+    }
+    let mut cfg = hip_7b_config(target);
+    cfg.kv.page_tokens = 16;
+    cfg.kv.vram_bytes = 64 * 1024 * 1024;
+    cfg.kv.dram_bytes = 64 * 1024 * 1024;
+    cfg.experimental.lsa = lsa;
+    cfg.experimental.lsa_top_k = 4;
+    cfg.experimental.lsa_map = Some(map);
+    cfg
+}
+
+/// `n` words of the varied llama's vocabulary, never the same run twice.
+#[cfg(feature = "hip")]
+fn lsa_prompt(n: usize, salt: usize) -> String {
+    (0..n)
+        .map(|i| format!("w{}", 3 + (i * 7 + i / 5 * 3 + i / 41 * 11 + salt) % 37))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Greedy tokens and stats of one fresh engine; `None` without a HIP device.
+#[cfg(feature = "hip")]
+fn lsa_generate(cfg: Config, prompt: &str, max_tokens: usize) -> Option<(Vec<u32>, allpaca_types::StatsSnapshot)> {
+    let engine = Engine::new(cfg).expect("the varied llama with index maps must load");
+    if hip_gpus(&engine).is_empty() {
+        return None;
+    }
+    let out = engine.generate(prompt, greedy(max_tokens)).expect("generate");
+    Some((out.token_ids, engine.stats()))
+}
+
+/// Off by default: no row is sparse, and the tokens are those of a run that
+/// never heard of the option. On, rows past the budget are sparse in the
+/// prompt forward and in decode, and a short prompt changes nothing.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_lsa_is_off_by_default_and_sparse_only_past_its_budget() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let dir = lsa_test_dir("budget");
+    assert!(!Config::compiled_defaults().experimental.lsa);
+    let long = lsa_prompt(600, 0);
+    let Some((_, off)) = lsa_generate(lsa_engine_config(&dir, false), &long, 8) else {
+        return;
+    };
+    assert_eq!(off.lsa_sparse_rows, 0, "rows were sparse with the option off");
+    let (_, on) = lsa_generate(lsa_engine_config(&dir, true), &long, 8).unwrap();
+    // Two layers; the prompt's rows past position 519 and every decoded one.
+    assert!(
+        on.lsa_sparse_rows >= 2 * (600 - 520 + 7),
+        "{} sparse rows for a 600-word prompt and 8 tokens",
+        on.lsa_sparse_rows
+    );
+    let short = lsa_prompt(200, 0);
+    let (dense, _) = lsa_generate(lsa_engine_config(&dir, false), &short, 16).unwrap();
+    let (same, stats) = lsa_generate(lsa_engine_config(&dir, true), &short, 16).unwrap();
+    assert_eq!(stats.lsa_sparse_rows, 0, "a 216-key context is under the budget");
+    assert_eq!(same, dense, "under the budget the option must not change a token");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// What a row reads depends on its position and its sequence alone: the
+/// tokens are the same whether the prompt goes through in chunks of 512, 64
+/// or 7 rows, over pages of 16 or 1024 keys, and whether a position is a
+/// prompt row or a decoded one.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_lsa_tokens_do_not_depend_on_chunks_pages_or_prefill_vs_decode() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let dir = lsa_test_dir("rows");
+    let prompt = lsa_prompt(640, 5);
+    let Some((base, stats)) = lsa_generate(lsa_engine_config(&dir, true), &prompt, 24) else {
+        return;
+    };
+    assert!(stats.lsa_sparse_rows > 0, "no sparse row; stats={stats:?}");
+    for (chunk, page) in [(64usize, 16u32), (7, 16), (512, 1024), (64, 1024)] {
+        let mut cfg = lsa_engine_config(&dir, true);
+        cfg.prefill.chunk_tokens = chunk;
+        cfg.kv.page_tokens = page;
+        let (tokens, _) = lsa_generate(cfg, &prompt, 24).unwrap();
+        assert_eq!(tokens, base, "prefill chunks of {chunk} over pages of {page} changed the tokens");
+    }
+    // The first 12 generated tokens as prompt rows: the next 12 must follow.
+    let words: Vec<String> = base[..12].iter().map(|t| format!("w{t}")).collect();
+    if base[..12].iter().all(|t| *t >= 3) {
+        let longer = format!("{prompt} {}", words.join(" "));
+        let (tail, _) = lsa_generate(lsa_engine_config(&dir, true), &longer, 12).unwrap();
+        assert_eq!(tail, base[12..], "decoded rows fed back as prompt rows changed what follows");
+    }
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// With the option on, speculative output (the model as its own draft, so
+/// verify spans pack several rows and some are rejected and rewound) equals
+/// plain greedy output.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_lsa_speculative_matches_plain() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let dir = lsa_test_dir("spec");
+    let prompt = lsa_prompt(1000, 9);
+    let Some((plain, _)) = lsa_generate(lsa_engine_config(&dir, true), &prompt, 80) else {
+        return;
+    };
+    let draft = dir.join("lsa_draft.gguf");
+    // Another seed: a draft that disagrees now and then, so spans rewind.
+    write_varied_f16_llama_rope(&draft, 16);
+    for ngram in [false, true] {
+        let mut cfg = lsa_engine_config(&dir, true);
+        cfg.speculative.enabled = true;
+        cfg.speculative.min_depth = 2;
+        cfg.speculative.max_depth = 4;
+        cfg.features.tree_speculation = Some(false);
+        if ngram {
+            cfg.speculative.providers = vec![allpaca_types::DraftProviderKind::Ngram];
+        } else {
+            cfg.model.draft_path = Some(draft.clone());
+            cfg.features.draft_model_speculation = Some(true);
+            cfg.features.ngram_speculation = Some(false);
+        }
+        let (spec, stats) = lsa_generate(cfg, &prompt, 80).unwrap();
+        assert!(stats.lsa_sparse_rows > 0, "no sparse row; stats={stats:?}");
+        if !ngram {
+            assert!(stats.linear_packed_verifies > 0, "the draft must pack verify spans; stats={stats:?}");
+        }
+        assert_eq!(spec, plain, "spec != no-spec with experimental.lsa on (ngram={ngram})");
+    }
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// With the option on, requests decoded side by side (batched ticks and
+/// not) give what each gives alone.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_lsa_concurrent_matches_solo() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let dir = lsa_test_dir("conc");
+    let prompts = [lsa_prompt(600, 1), lsa_prompt(700, 2), lsa_prompt(90, 3)];
+    let prompts: Vec<&str> = prompts.iter().map(String::as_str).collect();
+    for batch_decode in [true, false] {
+        let mut cfg = lsa_engine_config(&dir, true);
+        cfg.engine.max_active_requests = 3;
+        cfg.engine.batch_decode = batch_decode;
+        let engine = Engine::new(cfg).expect("the varied llama with index maps must load");
+        if hip_gpus(&engine).is_empty() {
+            return;
+        }
+        let params = greedy(24);
+        let solo: Vec<Vec<u32>> = prompts.iter().map(|p| poll_concurrently(&engine, &[p], &params).remove(0)).collect();
+        let together = poll_concurrently(&engine, &prompts, &params);
+        for i in 0..prompts.len() {
+            assert_eq!(together[i], solo[i], "request {i} diverged when run concurrently (batch_decode={batch_decode})");
+        }
+        let stats = engine.stats();
+        assert!(stats.lsa_sparse_rows > 0, "no sparse row; stats={stats:?}");
+        assert_eq!(
+            stats.batched_decode_steps > 0,
+            batch_decode,
+            "batched forwards must run exactly when batch_decode is on; stats={stats:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// The option is refused where its selection could differ between paths.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_lsa_is_refused_without_a_map_a_partial_rotation_or_a_local_gpu() {
+    if allpaca_hip::device_count() == 0 {
+        eprintln!("skip: no HIP device");
+        return;
+    }
+    let dir = lsa_test_dir("refuse");
+    let refused = |cfg: Config| match Engine::new(cfg) {
+        Ok(_) => panic!("the engine loaded"),
+        Err(e) => e.to_string(),
+    };
+    let mut no_map = lsa_engine_config(&dir, true);
+    no_map.experimental.lsa_map = None;
+    assert!(refused(no_map).contains("lsa_map"));
+    let mut cpu = lsa_engine_config(&dir, true);
+    cpu.engine.cpu_only = true;
+    assert!(refused(cpu).contains("local HIP"));
+    // Every dim of a head rotates: nothing is position-free to index.
+    let full = dir.join("lsa_full_rope.gguf");
+    write_varied_f16_llama_rope(&full, 0);
+    let mut full_rope = lsa_engine_config(&dir, true);
+    full_rope.model.path = Some(full);
+    assert!(refused(full_rope).contains("position-free"));
+    let mut odd = lsa_engine_config(&dir, true);
+    odd.experimental.lsa_top_k = 6;
+    assert!(refused(odd).contains("multiple of 4"));
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
