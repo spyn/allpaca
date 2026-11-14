@@ -206,11 +206,13 @@ route_tail_skip_rank = 7
 #   ~30k       xeres     418  -> 335               81-86 -> 79-82
 #   ~30k       shodan    578  -> 497               123.1 -> 115.4
 #   ~122k      shodan    4350 -> 2052              183.7 -> 119.7
+#   ~248k      shodan    14634 -> 4274             268.6 -> 125.6
 # Quality on those prompts: a sentence hidden at 10%, 50% and 90% of a ~30k
-# prompt, and at 50% of a ~122k one, was quoted back by both; over the 27 to
-# 81 steps where both runs had produced the same text, the KL of LSA's
-# next-token distribution against full attention's was 0.005-0.007 nats per
-# token at ~30k and 0.015 at ~122k, and the top token agreed on all but the
+# prompt, and at 50% of a ~122k and a ~248k one, was quoted back by both;
+# over the 27 to 81 steps where both runs had produced the same text, the KL
+# of LSA's next-token distribution against full attention's was 0.005-0.007
+# nats per token at ~30k, 0.015 at ~122k and 0.027 at ~248k (the loss grows
+# with the context), and the top token agreed on all but the
 # step where the texts part. That is one book and one kind of question:
 # check your own prompts. Below ~15k tokens it gains nothing.
 
